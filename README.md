@@ -39,12 +39,12 @@ Create an external library for the target user in Immich. The library's import p
 
 ```
 /external_library/
-  donncha/          # Source user's actual photos
+  user_a/           # Source user's actual photos
     photo1.jpg
     photo2.jpg
-  jacinta/          # Target user's symlinks
-    photo1.jpg -> ../donncha/photo1.jpg
-    photo2.jpg -> ../donncha/photo2.jpg
+  user_b/           # Target user's symlinks
+    photo1.jpg -> ../user_a/photo1.jpg
+    photo2.jpg -> ../user_a/photo2.jpg
 ```
 
 ### 3. Get the required UUIDs
@@ -80,8 +80,8 @@ SOURCE_USER_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
 TARGET_USER_ID=yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy
 TARGET_LIBRARY_ID=zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz
 
-SHARED_PATH_PREFIX=/external_library/donncha/
-TARGET_PATH_PREFIX=/external_library/jacinta/
+SHARED_PATH_PREFIX=/external_library/user_a/
+TARGET_PATH_PREFIX=/external_library/user_b/
 ```
 
 ### 5. Add to your Immich Docker Compose
@@ -133,8 +133,8 @@ The sidecar will:
 | `SOURCE_USER_ID` | *(required)* | UUID of the source user |
 | `TARGET_USER_ID` | *(required)* | UUID of the target user |
 | `TARGET_LIBRARY_ID` | *(required)* | UUID of the target user's external library |
-| `SHARED_PATH_PREFIX` | *(required)* | Path prefix for source assets (e.g., `/external_library/donncha/`) |
-| `TARGET_PATH_PREFIX` | | Path prefix for target assets (e.g., `/external_library/jacinta/`) |
+| `SHARED_PATH_PREFIX` | *(required)* | Path prefix for source assets (e.g., `/external_library/user_a/`) |
+| `TARGET_PATH_PREFIX` | | Path prefix for target assets (e.g., `/external_library/user_b/`) |
 | `SYNC_INTERVAL_SECONDS` | `60` | Seconds between sync cycles |
 | `SCAN_INTERVAL_SECONDS` | `300` | Seconds between library scans |
 | `LOG_LEVEL` | `INFO` | Logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
