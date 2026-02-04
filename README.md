@@ -51,19 +51,11 @@ Create an external library for the target user in Immich. The library's import p
 
 ### 3. Get the required UUIDs
 
-You need three UUIDs from Immich. The easiest way is via the Immich API:
+You need three UUIDs from Immich: the source user ID, target user ID, and target user's external library ID.
 
-```bash
-# List all users (admin API key required)
-curl -s http://localhost:2283/api/users \
-  -H 'x-api-key: YOUR_KEY' | python3 -m json.tool
+**User IDs:** In the Immich web UI, go to **Administration > Users** and click on a username. The UUID appears in the URL: `/admin/users/{UUID}`.
 
-# List libraries for a user
-curl -s http://localhost:2283/api/libraries \
-  -H 'x-api-key: YOUR_KEY' | python3 -m json.tool
-```
-
-Note the source user ID, target user ID, and target user's external library ID.
+**Library ID:** In the Immich web UI, go to **Administration > External Libraries** and click on the target user's external library. The UUID appears in the URL: `/admin/library-management/{UUID}`.
 
 ### 4. Configure environment
 
