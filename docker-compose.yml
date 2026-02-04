@@ -1,0 +1,41 @@
+# Add this service to your existing Immich docker-compose.yml,
+# or use `docker compose -f docker-compose.yml -f immich-shared-library/docker-compose.yml up`
+
+services:
+  immich-shared-library:
+    build: .
+    env_file: .env
+    environment:
+      DB_HOSTNAME: database
+      DB_PORT: 5432
+      DB_USERNAME: postgres
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_DATABASE_NAME: immich
+
+      IMMICH_API_URL: http://immich_server:2283
+      IMMICH_API_KEY: ${FACE_SYNC_API_KEY}
+
+      SYNC_INTERVAL_SECONDS: 60
+      SCAN_INTERVAL_SECONDS: 300
+
+      SOURCE_USER_ID: ${SOURCE_USER_ID}
+      TARGET_USER_ID: ${TARGET_USER_ID}
+      TARGET_LIBRARY_ID: ${TARGET_LIBRARY_ID}
+      SHARED_PATH_PREFIX: ${SHARED_PATH_PREFIX}
+
+      LOG_LEVEL: INFO
+    volumes:
+      - upload:/usr/src/app/upload
+    depends_on:
+      - database
+      - immich-server
+    restart: always
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  upload:
+    external: true

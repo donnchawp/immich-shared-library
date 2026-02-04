@@ -1,0 +1,19 @@
+[project]
+name = "immich-shared-library"
+version = "0.1.0"
+description = "Sidecar service for sharing Immich libraries between users without duplicate ML processing"
+requires-python = ">=3.11"
+dependencies = [
+    "asyncpg>=0.29.0",
+    "httpx>=0.27.0",
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
