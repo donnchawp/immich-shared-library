@@ -29,7 +29,6 @@ os.environ.setdefault("TARGET_LIBRARY_ID", "96fe97d6-2b3a-48fd-810b-265dc190b39d
 os.environ.setdefault("SHARED_PATH_PREFIX", "/external_library/donncha/")
 os.environ.setdefault("TARGET_PATH_PREFIX", "/external_library/jacinta/")
 os.environ.setdefault("SYNC_INTERVAL_SECONDS", "9999")
-os.environ.setdefault("SCAN_INTERVAL_SECONDS", "9999")
 os.environ.setdefault("LOG_LEVEL", "DEBUG")
 
 import logging

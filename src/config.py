@@ -12,7 +12,6 @@ class Settings(BaseSettings):
     immich_api_key: str = ""
 
     sync_interval_seconds: int = 60
-    scan_interval_seconds: int = 300
 
     source_user_id: str = ""
     target_user_id: str = ""

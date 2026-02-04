@@ -6,7 +6,6 @@ from src.config import settings
 from src.db import close_pool, execute, init_pool
 from src.health import start_health_server, stop_health_server
 from src.immich_api import ImmichAPI
-from src.scan_manager import ScanManager
 from src.sync_engine import run_full_sync
 
 logger = logging.getLogger(__name__)
@@ -63,16 +62,6 @@ async def sync_loop() -> None:
         await asyncio.sleep(settings.sync_interval_seconds)
 
 
-async def scan_loop(scan_manager: ScanManager) -> None:
-    """Periodically trigger library scans for non-target libraries."""
-    while True:
-        try:
-            await scan_manager.scan_all_except_target()
-        except Exception:
-            logger.exception("Error in scan loop")
-        await asyncio.sleep(settings.scan_interval_seconds)
-
-
 async def wait_for_immich(api: ImmichAPI, max_retries: int = 30, delay: float = 10.0) -> None:
     """Wait for the Immich server to become available."""
     for i in range(max_retries):
@@ -99,10 +88,9 @@ async def main() -> None:
     logger.info("Target user: %s", settings.target_user_id)
     logger.info("Target library: %s", settings.target_library_id)
     logger.info("Shared path prefix: %s", settings.shared_path_prefix)
-    logger.info("Sync interval: %ds, Scan interval: %ds", settings.sync_interval_seconds, settings.scan_interval_seconds)
+    logger.info("Sync interval: %ds", settings.sync_interval_seconds)
 
     api = ImmichAPI()
-    scan_manager = ScanManager(api)
 
     # Wait for Immich to be ready
     await wait_for_immich(api)
@@ -115,11 +103,7 @@ async def main() -> None:
     await start_health_server()
 
     try:
-        # Run sync and scan loops concurrently
-        await asyncio.gather(
-            sync_loop(),
-            scan_loop(scan_manager),
-        )
+        await sync_loop()
     except asyncio.CancelledError:
         logger.info("Shutting down...")
     finally:

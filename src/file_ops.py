@@ -5,8 +5,6 @@ from uuid import UUID
 
 logger = logging.getLogger(__name__)
 
-UPLOAD_DIR = Path("/usr/src/app/upload")
-
 
 def hardlink_asset_files(
     source_user_id: UUID,

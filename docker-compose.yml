@@ -17,7 +17,6 @@ services:
       IMMICH_API_KEY: ${IMMICH_API_KEY}
 
       SYNC_INTERVAL_SECONDS: ${SYNC_INTERVAL_SECONDS:-60}
-      SCAN_INTERVAL_SECONDS: ${SCAN_INTERVAL_SECONDS:-300}
 
       SOURCE_USER_ID: ${SOURCE_USER_ID}
       TARGET_USER_ID: ${TARGET_USER_ID}
@@ -27,9 +26,9 @@ services:
 
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     volumes:
-      # Must match Immich's upload and external library mounts
-      - ${IMMICH_DATA_DIR}:/data
-      - ${EXTERNAL_LIBRARY_DIR}:/external_library
+      # Must match Immich's upload and external library mounts (both host path and container path)
+      - ${UPLOAD_LOCATION}:${UPLOAD_LOCATION_MOUNT:-/usr/src/app/upload}
+      - ${EXTERNAL_LIBRARY_DIR}:${EXTERNAL_LIBRARY_MOUNT:-/external_library}
     networks:
       - immich
     restart: always

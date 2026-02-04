@@ -69,7 +69,7 @@ Edit `.env`:
 DB_PASSWORD=postgres
 
 # Host paths to Immich's data directories
-IMMICH_DATA_DIR=../immich-app/library
+UPLOAD_LOCATION=../immich-app/library
 EXTERNAL_LIBRARY_DIR=../immich-app/external_library
 
 IMMICH_API_KEY=your-immich-api-key
@@ -83,9 +83,20 @@ SHARED_PATH_PREFIX=/external_library/user_a/shared/
 TARGET_PATH_PREFIX=/external_library/user_b/shared/
 ```
 
-### 5. Disable Immich's global auto-scan
+### 5. Configure Immich library watching
 
-In Immich's **Administration > Settings > External Library**, disable the periodic scan: "Library Watching" and "Periodic Scanning". The sidecar takes over scanning for all libraries except the target library, which should only receive pre-populated assets.
+In Immich's **Administration > Settings > External Library**, enable **Library Watching** so Immich automatically detects new files added to the source library.
+
+To prevent Immich from independently processing the target user's symlinked files, set an exclusion pattern on the target library that excludes everything:
+
+```bash
+curl -X PUT "http://localhost:2283/api/libraries/TARGET_LIBRARY_ID" \
+  -H "x-api-key: YOUR_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"exclusionPatterns": ["**/*"]}'
+```
+
+This way Immich watches the source library for new files but ignores the target library entirely. The sidecar handles the target library by writing asset records directly to the database.
 
 ### 6. Start the sidecar
 
@@ -95,19 +106,18 @@ The sidecar runs as a standalone compose project that connects to Immich's Docke
 docker compose up -d
 ```
 
-The `IMMICH_DATA_DIR` and `EXTERNAL_LIBRARY_DIR` in `.env` must point to the same host directories that Immich mounts (typically `./library` and `./external_library` in your Immich directory). Hardlinks require the same filesystem.
+The `UPLOAD_LOCATION` and `EXTERNAL_LIBRARY_DIR` in `.env` must point to the same host directories that Immich mounts (typically `./library` and `./external_library` in your Immich directory). Hardlinks require the same filesystem.
 
 The sidecar will:
 - Wait for the Immich server to become available
 - Create its tracking tables (`_face_sync_asset_map`, `_face_sync_person_map`)
 - Run a sync cycle every 60 seconds (configurable via `SYNC_INTERVAL_SECONDS`)
-- Trigger library scans every 300 seconds (configurable via `SCAN_INTERVAL_SECONDS`)
 
 ## Configuration Reference
 
 | Variable | Default | Description |
 |---|---|---|
-| `IMMICH_DATA_DIR` | *(required)* | Host path to Immich's upload/data directory (e.g., `../immich-app/library`) |
+| `UPLOAD_LOCATION` | *(required)* | Host path to Immich's upload/data directory (e.g., `../immich-app/library`) |
 | `EXTERNAL_LIBRARY_DIR` | *(required)* | Host path to the external library directory (e.g., `../immich-app/external_library`) |
 | `DB_PASSWORD` | `postgres` | PostgreSQL password (same as Immich) |
 | `DB_USERNAME` | `postgres` | PostgreSQL username |
@@ -119,7 +129,6 @@ The sidecar will:
 | `SHARED_PATH_PREFIX` | *(required)* | Path prefix for source assets as seen inside the Immich container (e.g., `/external_library/user_a/shared/`) |
 | `TARGET_PATH_PREFIX` | | Path prefix for target assets as seen inside the Immich container (e.g., `/external_library/user_b/shared/`) |
 | `SYNC_INTERVAL_SECONDS` | `60` | Seconds between sync cycles |
-| `SCAN_INTERVAL_SECONDS` | `300` | Seconds between library scans |
 | `LOG_LEVEL` | `INFO` | Logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
 
 ## How the Sync Works
@@ -190,8 +199,7 @@ src/
   file_ops.py      — Hardlink creation and removal
   db.py            — asyncpg connection pool and transaction helpers
   config.py        — Pydantic Settings for environment variables
-  immich_api.py    — Immich REST API client
-  scan_manager.py  — Selective library scanning
+  immich_api.py    — Immich REST API client (health check)
   health.py        — TCP health check server
 ```
 
