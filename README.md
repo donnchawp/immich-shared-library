@@ -84,7 +84,7 @@ TARGET_PATH_PREFIX=/external_library/user_b/shared/
 
 ### 5. Disable Immich's global auto-scan
 
-In Immich's **Administration > Settings > Library**, disable the periodic scan. The sidecar takes over scanning for all libraries except the target library, which should only receive pre-populated assets.
+In Immich's **Administration > Settings > External Library**, disable the periodic scan: "Library Watching" and "Periodic Scanning". The sidecar takes over scanning for all libraries except the target library, which should only receive pre-populated assets.
 
 ### 6. Start the sidecar
 
