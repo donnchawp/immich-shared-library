@@ -1,34 +1,37 @@
-# Add this service to your existing Immich docker-compose.yml,
-# or use `docker compose -f docker-compose.yml -f immich-shared-library/docker-compose.yml up`
+# Run with: docker compose up -d
+# Requires the Immich stack to be running (connects to its network)
 
 services:
   immich-shared-library:
     build: .
+    container_name: immich_shared_library
     env_file: .env
     environment:
-      DB_HOSTNAME: database
+      DB_HOSTNAME: immich_postgres
       DB_PORT: 5432
-      DB_USERNAME: postgres
+      DB_USERNAME: ${DB_USERNAME:-postgres}
       DB_PASSWORD: ${DB_PASSWORD}
-      DB_DATABASE_NAME: immich
+      DB_DATABASE_NAME: ${DB_DATABASE_NAME:-immich}
 
       IMMICH_API_URL: http://immich_server:2283
-      IMMICH_API_KEY: ${FACE_SYNC_API_KEY}
+      IMMICH_API_KEY: ${IMMICH_API_KEY}
 
-      SYNC_INTERVAL_SECONDS: 60
-      SCAN_INTERVAL_SECONDS: 300
+      SYNC_INTERVAL_SECONDS: ${SYNC_INTERVAL_SECONDS:-60}
+      SCAN_INTERVAL_SECONDS: ${SCAN_INTERVAL_SECONDS:-300}
 
       SOURCE_USER_ID: ${SOURCE_USER_ID}
       TARGET_USER_ID: ${TARGET_USER_ID}
       TARGET_LIBRARY_ID: ${TARGET_LIBRARY_ID}
       SHARED_PATH_PREFIX: ${SHARED_PATH_PREFIX}
+      TARGET_PATH_PREFIX: ${TARGET_PATH_PREFIX}
 
-      LOG_LEVEL: INFO
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
     volumes:
-      - upload:/usr/src/app/upload
-    depends_on:
-      - database
-      - immich-server
+      # Must match Immich's upload and external library mounts
+      - ${IMMICH_DATA_DIR}:/data
+      - ${EXTERNAL_LIBRARY_DIR}:/external_library
+    networks:
+      - immich
     restart: always
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080')"]
@@ -36,6 +39,7 @@ services:
       timeout: 5s
       retries: 3
 
-volumes:
-  upload:
+networks:
+  immich:
     external: true
+    name: immich_default

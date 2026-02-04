@@ -76,7 +76,11 @@ Edit `.env`:
 ```env
 DB_PASSWORD=postgres
 
-FACE_SYNC_API_KEY=your-immich-api-key
+# Host paths to Immich's data directories
+IMMICH_DATA_DIR=../immich-app/library
+EXTERNAL_LIBRARY_DIR=../immich-app/external_library
+
+IMMICH_API_KEY=your-immich-api-key
 
 SOURCE_USER_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
 TARGET_USER_ID=yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy
@@ -86,34 +90,19 @@ SHARED_PATH_PREFIX=/external_library/user_a/shared/
 TARGET_PATH_PREFIX=/external_library/user_b/shared/
 ```
 
-### 5. Add to your Immich Docker Compose
-
-**Option A:** Merge into your existing `docker-compose.yml`:
-
-Copy the service definition from this project's `docker-compose.yml` into your Immich compose file. Make sure the `upload` volume name matches your Immich setup. If Immich uses a bind mount (e.g., `./library:/data`), update the volume in the sidecar service to match:
-
-```yaml
-volumes:
-  - ./library:/data
-```
-
-**Option B:** Use multiple compose files:
-
-```bash
-docker compose -f docker-compose.yml -f /path/to/immich-shared-library/docker-compose.yml up -d
-```
-
-The sidecar must be on the same Docker network as the Immich database and server containers, and must mount the same upload volume (hardlinks require the same filesystem).
-
-### 6. Disable Immich's global auto-scan
+### 5. Disable Immich's global auto-scan
 
 In Immich's **Administration > Settings > Library**, disable the periodic scan. The sidecar takes over scanning for all libraries except the target library, which should only receive pre-populated assets.
 
-### 7. Start the sidecar
+### 6. Start the sidecar
+
+The sidecar runs as a standalone compose project that connects to Immich's Docker network. From this directory:
 
 ```bash
-docker compose up -d immich-shared-library
+docker compose up -d
 ```
+
+The `IMMICH_DATA_DIR` and `EXTERNAL_LIBRARY_DIR` in `.env` must point to the same host directories that Immich mounts (typically `./library` and `./external_library` in your Immich directory). Hardlinks require the same filesystem.
 
 The sidecar will:
 - Wait for the Immich server to become available
@@ -125,12 +114,11 @@ The sidecar will:
 
 | Variable | Default | Description |
 |---|---|---|
-| `DB_HOSTNAME` | `localhost` | PostgreSQL hostname |
-| `DB_PORT` | `5432` | PostgreSQL port |
+| `IMMICH_DATA_DIR` | *(required)* | Host path to Immich's upload/data directory (e.g., `../immich-app/library`) |
+| `EXTERNAL_LIBRARY_DIR` | *(required)* | Host path to the external library directory (e.g., `../immich-app/external_library`) |
+| `DB_PASSWORD` | `postgres` | PostgreSQL password (same as Immich) |
 | `DB_USERNAME` | `postgres` | PostgreSQL username |
-| `DB_PASSWORD` | `postgres` | PostgreSQL password |
 | `DB_DATABASE_NAME` | `immich` | PostgreSQL database name |
-| `IMMICH_API_URL` | `http://immich_server:2283` | Immich server URL |
 | `IMMICH_API_KEY` | *(required)* | Immich API key |
 | `SOURCE_USER_ID` | *(required)* | UUID of the source user |
 | `TARGET_USER_ID` | *(required)* | UUID of the target user |
