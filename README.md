@@ -83,22 +83,31 @@ SHARED_PATH_PREFIX=/external_library/user_a/shared/
 TARGET_PATH_PREFIX=/external_library/user_b/shared/
 ```
 
-### 5. Configure Immich library watching
+### 5. Configure the target external library
 
-In Immich's **Administration > Settings > External Library**, enable **Library Watching** so Immich automatically detects new files added to the source library.
+The target user's external library contains symlinks to the source user's shared photos. Immich must **not** scan or watch this library — if it does, it will create its own asset records and run ML processing independently, defeating the purpose of the sidecar.
 
-To prevent Immich from independently processing the target user's symlinked files, set an exclusion pattern on the target library that excludes everything:
+Add an exclusion pattern to the target library that tells Immich to ignore all files:
 
-```bash
-curl -X PUT "http://localhost:2283/api/libraries/TARGET_LIBRARY_ID" \
-  -H "x-api-key: YOUR_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"exclusionPatterns": ["**/*"]}'
-```
+1. Go to **Administration > External Libraries**
+2. Click on the target user's external library
+3. Add `**/*` as an exclusion pattern and save
 
-This way Immich watches the source library for new files but ignores the target library entirely. The sidecar handles the target library by writing asset records directly to the database.
+The sidecar bypasses library scanning entirely by writing asset records directly to the database. Immich sees the target user's assets because they exist in the `asset` table, not because it scanned the filesystem.
 
-### 6. Start the sidecar
+### 6. Enable library watching
+
+In Immich's **Administration > Settings > External Library**, enable **Library Watching**. This uses filesystem events (inotify) to detect new files added to any external library. Because the target library has the `**/*` exclusion pattern, Immich will ignore file events in that library.
+
+When a new file is added to the source user's external library, Immich will automatically detect it, create an asset record, and run ML processing (metadata extraction, face detection, CLIP embedding). Once processing completes, the sidecar picks it up on the next sync cycle.
+
+> **Note:** The sidecar does not trigger library scans itself. It relies on Immich's library watching (or manual scans) to discover new source files. If library watching doesn't work in your environment (e.g., network drives), you can trigger scans manually after adding files:
+> ```bash
+> curl -X POST "http://localhost:2283/api/libraries/SOURCE_LIBRARY_ID/scan" \
+>   -H "x-api-key: YOUR_KEY"
+> ```
+
+### 7. Start the sidecar
 
 The sidecar runs as a standalone compose project that connects to Immich's Docker network. From this directory:
 
