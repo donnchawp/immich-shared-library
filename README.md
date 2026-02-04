@@ -1,4 +1,4 @@
-# immich-shared-library
+# Immich Shared Library
 
 A Docker sidecar service that syncs a subset of [Immich](https://immich.app/) photos from one user to another — without duplicating ML processing.
 
