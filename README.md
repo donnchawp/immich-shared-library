@@ -78,6 +78,7 @@ SOURCE_USER_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
 TARGET_USER_ID=yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy
 TARGET_LIBRARY_ID=zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz
 
+# Path prefixes as seen inside the Immich container (not on the host)
 SHARED_PATH_PREFIX=/external_library/user_a/shared/
 TARGET_PATH_PREFIX=/external_library/user_b/shared/
 ```
@@ -115,8 +116,8 @@ The sidecar will:
 | `SOURCE_USER_ID` | *(required)* | UUID of the source user |
 | `TARGET_USER_ID` | *(required)* | UUID of the target user |
 | `TARGET_LIBRARY_ID` | *(required)* | UUID of the target user's external library |
-| `SHARED_PATH_PREFIX` | *(required)* | Path prefix for source assets (e.g., `/external_library/user_a/shared/`) |
-| `TARGET_PATH_PREFIX` | | Path prefix for target assets (e.g., `/external_library/user_b/shared/`) |
+| `SHARED_PATH_PREFIX` | *(required)* | Path prefix for source assets as seen inside the Immich container (e.g., `/external_library/user_a/shared/`) |
+| `TARGET_PATH_PREFIX` | | Path prefix for target assets as seen inside the Immich container (e.g., `/external_library/user_b/shared/`) |
 | `SYNC_INTERVAL_SECONDS` | `60` | Seconds between sync cycles |
 | `SCAN_INTERVAL_SECONDS` | `300` | Seconds between library scans |
 | `LOG_LEVEL` | `INFO` | Logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
