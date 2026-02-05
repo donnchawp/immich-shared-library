@@ -73,9 +73,30 @@ async def get_or_create_target_person(
 ) -> UUID | None:
     """Find or create a mirrored person for User B.
 
+    Uses an advisory lock on the source person ID to prevent duplicate person
+    creation from concurrent transactions.
+
     Returns the target person ID, or None if source person doesn't exist.
     """
-    # Check if we already have a mapping
+    # Check if we already have a mapping (fast path, no lock needed)
+    existing = await conn.fetchrow(
+        """
+        SELECT target_person_id FROM _face_sync_person_map
+        WHERE source_person_id = $1 AND target_user_id = $2
+        """,
+        source_person_id,
+        UUID(settings.target_user_id),
+    )
+    if existing:
+        return existing["target_person_id"]
+
+    # Serialize person creation for this source person to prevent orphan duplicates
+    await conn.execute(
+        "SELECT pg_advisory_xact_lock(hashtext($1::text))",
+        str(source_person_id),
+    )
+
+    # Re-check after acquiring lock (another transaction may have created it)
     existing = await conn.fetchrow(
         """
         SELECT target_person_id FROM _face_sync_person_map
@@ -127,6 +148,7 @@ async def get_or_create_target_person(
         """
         INSERT INTO _face_sync_person_map (source_person_id, target_person_id, source_user_id, target_user_id)
         VALUES ($1, $2, $3, $4)
+        ON CONFLICT (source_person_id, target_user_id) DO NOTHING
         """,
         source_person_id,
         target_person_id,

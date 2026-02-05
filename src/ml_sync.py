@@ -34,42 +34,31 @@ async def sync_faces_for_asset(
     for face in source_faces:
         source_face_id = face["id"]
 
-        # Skip if we already have a face on the target asset with matching bounding box
-        already_exists = await conn.fetchval(
-            """
-            SELECT EXISTS(
-                SELECT 1 FROM asset_face
-                WHERE "assetId" = $1
-                  AND "boundingBoxX1" = $2
-                  AND "boundingBoxY1" = $3
-                  AND "boundingBoxX2" = $4
-                  AND "boundingBoxY2" = $5
-            )
-            """,
-            target_asset_id,
-            face["boundingBoxX1"],
-            face["boundingBoxY1"],
-            face["boundingBoxX2"],
-            face["boundingBoxY2"],
-        )
-        if already_exists:
-            continue
-
         # Get or create mirrored person
         target_person_id = None
         if face["personId"] is not None:
             target_person_id = await get_or_create_target_person(conn, face["personId"])
 
-        # Create face record for target asset
+        # Insert face record only if no matching bounding box exists on the target asset
+        # (atomic check-and-insert to avoid TOCTOU race)
         target_face_id = uuid4()
-        await conn.execute(
+        result = await conn.execute(
             """
             INSERT INTO asset_face (
                 id, "assetId", "personId",
                 "imageWidth", "imageHeight",
                 "boundingBoxX1", "boundingBoxY1", "boundingBoxX2", "boundingBoxY2",
                 "sourceType", "isVisible"
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            )
+            SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11
+            WHERE NOT EXISTS (
+                SELECT 1 FROM asset_face
+                WHERE "assetId" = $2
+                  AND "boundingBoxX1" = $6
+                  AND "boundingBoxY1" = $7
+                  AND "boundingBoxX2" = $8
+                  AND "boundingBoxY2" = $9
+            )
             """,
             target_face_id,
             target_asset_id,
@@ -83,6 +72,8 @@ async def sync_faces_for_asset(
             face["sourceType"],
             face["isVisible"],
         )
+        if result == "INSERT 0 0":
+            continue
 
         # Copy face embedding
         await conn.execute(

@@ -79,18 +79,15 @@ async def sync_asset(conn: asyncpg.Connection, source: asyncpg.Record) -> UUID |
     )
     if existing is not None:
         # Already synced but mapping was lost (crash recovery) — re-create mapping
-        has_mapping = await conn.fetchval(
-            "SELECT EXISTS(SELECT 1 FROM _face_sync_asset_map WHERE source_asset_id = $1)",
-            source_id,
+        result = await conn.execute(
+            """
+            INSERT INTO _face_sync_asset_map (source_asset_id, target_asset_id, source_user_id, target_user_id, synced_at)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (source_asset_id) DO NOTHING
+            """,
+            source_id, existing, UUID(settings.source_user_id), target_user_id, now,
         )
-        if not has_mapping:
-            await conn.execute(
-                """
-                INSERT INTO _face_sync_asset_map (source_asset_id, target_asset_id, source_user_id, target_user_id, synced_at)
-                VALUES ($1, $2, $3, $4, $5)
-                """,
-                source_id, existing, UUID(settings.source_user_id), target_user_id, now,
-            )
+        if result == "INSERT 0 1":
             logger.info("Recovered mapping for existing asset %s -> %s", source_id, existing)
         return existing
 
