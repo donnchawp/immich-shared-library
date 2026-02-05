@@ -11,11 +11,15 @@ async def start_health_server(port: int = 8080) -> None:
     global _server
 
     async def handle(reader: StreamReader, writer: StreamWriter) -> None:
-        await reader.read(1024)
-        response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nOK"
-        writer.write(response.encode())
-        await writer.drain()
-        writer.close()
+        try:
+            await asyncio.wait_for(reader.read(1024), timeout=5.0)
+            response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nOK"
+            writer.write(response.encode())
+            await writer.drain()
+        except (asyncio.TimeoutError, ConnectionError):
+            pass
+        finally:
+            writer.close()
 
     _server = await asyncio.start_server(handle, "0.0.0.0", port)
     logger.info("Health check server listening on port %d", port)
