@@ -4,7 +4,19 @@ A Docker sidecar service that syncs a subset of [Immich](https://immich.app/) ph
 
 ## The Problem
 
-Immich's partner sharing is all-or-nothing: you share your entire library or nothing. The common workaround (symlinking external libraries) makes both users' assets visible, but Immich runs face detection, face recognition, and CLIP embedding for each user independently — doubling all ML work.
+Immich's partner sharing is all-or-nothing: you share your entire library or nothing. The common workaround is symlinking an external library directory so both users point at the same photos. This works — both users see the photos — but Immich processes each user's assets independently through the full ML pipeline:
+
+| Per-asset work | Symlink only | With sidecar |
+|---|---|---|
+| Metadata extraction (EXIF) | 2x | 1x (copied) |
+| Thumbnail generation | 2x | 1x (hardlinked) |
+| CLIP embedding (smart search) | 2x (GPU) | 1x (copied) |
+| Face detection | 2x (GPU) | 1x (copied) |
+| Face recognition | 2x (GPU) | 1x (copied) |
+| Person clustering | Independent per user | Mirrored from source |
+| Person names | Must name separately | Synced automatically |
+
+With 1,000 shared photos, the symlink approach queues 5,000+ extra ML jobs (metadata, thumbnails, CLIP, face detection, face recognition) that produce identical results. Each user also gets independent person clusters, so you'd need to name each person twice — and the clusters may group faces differently.
 
 ## How It Works
 
@@ -12,12 +24,11 @@ This sidecar connects directly to Immich's PostgreSQL database and, for each sha
 
 1. Creates a target asset record with remapped file paths
 2. Copies EXIF metadata, CLIP embeddings, face detection results, and face recognition data
-3. Hardlinks thumbnail/preview files (zero extra disk space)
+3. Hardlinks thumbnail and preview files (zero extra disk space)
 4. Creates mirrored person records with hardlinked face thumbnails
+5. Pre-populates job status so Immich skips all ML processing for these assets
 
-Because Immich skips ML processing for assets that already have results, the target user's assets appear instantly with full search, face recognition, and timeline support — no ML queue, no GPU time.
-
-The sidecar runs continuously, syncing new assets, propagating person name changes, and cleaning up deletions.
+The target user's assets appear instantly with full search, face recognition, and timeline support — no ML queue, no GPU time. The sidecar runs continuously, syncing new assets, propagating person name changes, and cleaning up deletions.
 
 ## Prerequisites
 
