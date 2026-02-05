@@ -3,7 +3,23 @@ import os
 from pathlib import Path
 from uuid import UUID
 
+from src.config import settings
+
 logger = logging.getLogger(__name__)
+
+
+def validate_path_within_upload(path: Path) -> None:
+    """Raise ValueError if path resolves outside the upload directory.
+
+    Uses os.path.normpath to collapse '..' components without requiring
+    the path to exist on disk, then checks containment.
+    """
+    normalized = Path(os.path.normpath(path))
+    base = Path(os.path.normpath(settings.upload_location_mount))
+    if not normalized.is_relative_to(base):
+        raise ValueError(
+            f"Path {path} normalizes to {normalized}, which is outside {base}"
+        )
 
 
 def hardlink_asset_files(
@@ -20,12 +36,26 @@ def hardlink_asset_files(
     result = []
     for f in source_files:
         source_path = Path(f["path"])
+
+        try:
+            validate_path_within_upload(source_path)
+        except ValueError:
+            logger.error("Source path escapes upload directory: %s", source_path)
+            continue
+
         if not source_path.exists():
             logger.warning("Source file does not exist: %s", source_path)
             continue
 
         # Replace source user/asset IDs in path with target IDs
         target_path = _remap_path(source_path, source_user_id, target_user_id, source_asset_id, target_asset_id)
+
+        try:
+            validate_path_within_upload(target_path)
+        except ValueError:
+            logger.error("Target path escapes upload directory: %s", target_path)
+            continue
+
         target_path.parent.mkdir(parents=True, exist_ok=True)
 
         if target_path.exists():
@@ -52,6 +82,11 @@ def remove_hardlinks(target_files: list[str]) -> None:
     """Remove hardlinked files for a target asset."""
     for path_str in target_files:
         path = Path(path_str)
+        try:
+            validate_path_within_upload(path)
+        except ValueError:
+            logger.error("Refusing to delete path outside upload directory: %s", path)
+            continue
         if path.exists():
             try:
                 path.unlink()

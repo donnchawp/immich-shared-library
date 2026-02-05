@@ -19,6 +19,8 @@ class Settings(BaseSettings):
     shared_path_prefix: str = ""
     target_path_prefix: str = ""
 
+    upload_location_mount: str = "/usr/src/app/upload"
+
     log_level: str = "INFO"
 
     @property

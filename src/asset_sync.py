@@ -1,4 +1,5 @@
 import logging
+import os
 from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
@@ -14,11 +15,19 @@ def _remap_asset_path(source_path: str) -> str:
     """Remap an asset's originalPath from the source prefix to the target prefix.
 
     e.g., /external_library/donncha/photo.jpg -> /external_library/jacinta/photo.jpg
+    Normalizes the result to collapse any '..' components.
     """
     if settings.target_path_prefix and settings.shared_path_prefix:
         if source_path.startswith(settings.shared_path_prefix):
-            return settings.target_path_prefix + source_path[len(settings.shared_path_prefix):]
-    return source_path
+            remapped = settings.target_path_prefix + source_path[len(settings.shared_path_prefix):]
+            normalized = os.path.normpath(remapped)
+            if not normalized.startswith(settings.target_path_prefix):
+                raise ValueError(
+                    f"Remapped path {remapped} normalizes to {normalized}, "
+                    f"which escapes target prefix {settings.target_path_prefix}"
+                )
+            return normalized
+    return os.path.normpath(source_path)
 
 
 async def get_unsynced_source_assets(conn: asyncpg.Connection) -> list[asyncpg.Record]:

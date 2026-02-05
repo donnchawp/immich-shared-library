@@ -6,6 +6,7 @@ from uuid import UUID, uuid4
 import asyncpg
 
 from src.config import settings
+from src.file_ops import validate_path_within_upload
 
 logger = logging.getLogger(__name__)
 
@@ -25,19 +26,31 @@ def _hardlink_person_thumbnail(
     if not source_thumbnail_path:
         return ""
 
+    upload_base = Path(settings.upload_location_mount)
     source = Path(source_thumbnail_path)
+
+    try:
+        validate_path_within_upload(source)
+    except ValueError:
+        logger.error("Source person thumbnail escapes upload directory: %s", source)
+        return ""
+
     if not source.exists():
         logger.warning("Source person thumbnail does not exist: %s", source)
         return ""
 
     # Build target path using target user ID and target person ID
-    # Source: /data/thumbs/{userId}/{h1}/{h2}/{personId}.jpeg
-    # parent chain: file -> h2 -> h1 -> userId -> thumbs
+    # Use upload_base instead of traversing parent directories (avoids depth assumptions)
     pid = str(target_person_id)
     ext = source.suffix  # .jpeg
-    thumbs_dir = source.parent.parent.parent.parent  # /data/thumbs
-    target_dir = thumbs_dir / str(target_user_id) / pid[:2] / pid[2:4]
+    target_dir = upload_base / "thumbs" / str(target_user_id) / pid[:2] / pid[2:4]
     target = target_dir / f"{pid}{ext}"
+
+    try:
+        validate_path_within_upload(target)
+    except ValueError:
+        logger.error("Target person thumbnail escapes upload directory: %s", target)
+        return ""
 
     target_dir.mkdir(parents=True, exist_ok=True)
 
