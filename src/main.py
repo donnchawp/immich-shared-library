@@ -90,7 +90,7 @@ def validate_config() -> bool:
         ("target_user_id", settings.target_user_id),
         ("target_library_id", settings.target_library_id),
         ("shared_path_prefix", settings.shared_path_prefix),
-        ("immich_api_key", settings.immich_api_key),
+        ("immich_api_key", settings.immich_api_key.get_secret_value()),
     ]
     missing = [name for name, val in required if not val]
     if missing:

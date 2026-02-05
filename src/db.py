@@ -18,7 +18,7 @@ async def init_pool() -> asyncpg.Pool:
             host=settings.db_hostname,
             port=settings.db_port,
             user=settings.db_username,
-            password=settings.db_password,
+            password=settings.db_password.get_secret_value(),
             database=settings.db_database_name,
             min_size=2,
             max_size=10,

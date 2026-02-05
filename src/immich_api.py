@@ -12,7 +12,7 @@ class ImmichAPI:
         self._base_url = settings.immich_api_url.rstrip("/")
         self._client = httpx.AsyncClient(
             headers={
-                "x-api-key": settings.immich_api_key,
+                "x-api-key": settings.immich_api_key.get_secret_value(),
                 "Accept": "application/json",
             },
             timeout=30,
