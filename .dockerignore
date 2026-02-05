@@ -1,0 +1,11 @@
+.env
+.env.*
+.git/
+.venv/
+__pycache__/
+*.pyc
+whats-next.md
+CLAUDE.md
+
+test_sync.py
+test.env
