@@ -11,15 +11,25 @@ logger = logging.getLogger(__name__)
 def validate_path_within_upload(path: Path) -> None:
     """Raise ValueError if path resolves outside the upload directory.
 
-    Uses os.path.normpath to collapse '..' components without requiring
-    the path to exist on disk, then checks containment.
+    Two checks:
+    1. Normalizes with os.path.normpath to collapse '..' (works for paths that don't exist yet).
+    2. If the path exists on disk, resolves symlinks and verifies the real target is still
+       within the upload directory. Symlinked directories are allowed as long as they point
+       somewhere within the upload mount.
     """
-    normalized = Path(os.path.normpath(path))
     base = Path(os.path.normpath(settings.upload_location_mount))
+    normalized = Path(os.path.normpath(path))
     if not normalized.is_relative_to(base):
         raise ValueError(
             f"Path {path} normalizes to {normalized}, which is outside {base}"
         )
+    if path.exists():
+        resolved = path.resolve()
+        resolved_base = Path(settings.upload_location_mount).resolve()
+        if not resolved.is_relative_to(resolved_base):
+            raise ValueError(
+                f"Path {path} resolves via symlink to {resolved}, which is outside {resolved_base}"
+            )
 
 
 def hardlink_asset_files(
