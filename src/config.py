@@ -24,12 +24,5 @@ class Settings(BaseSettings):
 
     log_level: str = "INFO"
 
-    @property
-    def dsn(self) -> str:
-        return (
-            f"postgresql://{self.db_username}:{self.db_password.get_secret_value()}"
-            f"@{self.db_hostname}:{self.db_port}/{self.db_database_name}"
-        )
-
 
 settings = Settings()
