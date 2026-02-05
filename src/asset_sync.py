@@ -30,8 +30,13 @@ def _remap_asset_path(source_path: str) -> str:
     return os.path.normpath(source_path)
 
 
-async def get_unsynced_source_assets(conn: asyncpg.Connection) -> list[asyncpg.Record]:
-    """Find fully-processed source assets in the shared directory that haven't been synced yet."""
+async def get_unsynced_source_assets(
+    conn: asyncpg.Connection, limit: int = 500
+) -> list[asyncpg.Record]:
+    """Find fully-processed source assets in the shared directory that haven't been synced yet.
+
+    Returns up to `limit` assets per call to avoid loading an entire library into memory.
+    """
     return await conn.fetch(
         """
         SELECT a.*
@@ -47,9 +52,11 @@ async def get_unsynced_source_assets(conn: asyncpg.Connection) -> list[asyncpg.R
             SELECT 1 FROM _face_sync_asset_map m
             WHERE m.source_asset_id = a.id
           )
+        LIMIT $3
         """,
         UUID(settings.source_user_id),
         settings.shared_path_prefix,
+        limit,
     )
 
 

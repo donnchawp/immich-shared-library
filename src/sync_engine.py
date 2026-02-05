@@ -23,16 +23,19 @@ async def run_full_sync() -> dict:
         "persons_cleaned": 0,
     }
 
-    # Phase 1: Sync new assets
-    async with transaction() as conn:
-        source_assets = await get_unsynced_source_assets(conn)
-        for source in source_assets:
-            target_id = await sync_asset(conn, source)
-            if target_id is not None:
-                stats["assets_synced"] += 1
-                # Sync faces for this newly created asset
-                face_count = await sync_faces_for_asset(conn, source["id"], target_id)
-                stats["faces_synced"] += face_count
+    # Phase 1: Sync new assets (in batches to limit memory usage)
+    while True:
+        async with transaction() as conn:
+            source_assets = await get_unsynced_source_assets(conn)
+            for source in source_assets:
+                target_id = await sync_asset(conn, source)
+                if target_id is not None:
+                    stats["assets_synced"] += 1
+                    # Sync faces for this newly created asset
+                    face_count = await sync_faces_for_asset(conn, source["id"], target_id)
+                    stats["faces_synced"] += face_count
+        if len(source_assets) < 500:
+            break
 
     # Phase 2: Incremental face sync (catch new/updated faces on existing assets)
     async with transaction() as conn:
