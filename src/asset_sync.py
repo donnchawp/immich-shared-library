@@ -194,8 +194,17 @@ async def _copy_exif(conn: asyncpg.Connection, source_id: UUID, target_id: UUID)
     if exif is None:
         return
 
-    # Build column list excluding assetId (we substitute our own)
-    cols = [k for k in exif.keys() if k not in ("assetId", "updatedAt", "updateId")]
+    # Hardcoded allowlist of EXIF columns to copy (excludes assetId, updatedAt, updateId)
+    cols = [
+        "make", "model", "exifImageWidth", "exifImageHeight", "fileSizeInByte",
+        "orientation", "dateTimeOriginal", "modifyDate", "lensModel", "fNumber",
+        "focalLength", "iso", "latitude", "longitude", "city", "state", "country",
+        "description", "fps", "exposureTime", "livePhotoCID", "timeZone",
+        "projectionType", "profileDescription", "colorspace", "bitsPerSample",
+        "autoStackId", "rating", "tags", "lockedProperties",
+    ]
+    # Filter to only columns present in this row (forward-compatible if Immich removes a column)
+    cols = [c for c in cols if c in exif]
     col_names = ', '.join(f'"{c}"' for c in cols)
     placeholders = ', '.join(f'${i + 2}' for i in range(len(cols)))
 
