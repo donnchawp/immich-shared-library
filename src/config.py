@@ -1,3 +1,4 @@
+from pydantic import Field
 from pydantic_settings import BaseSettings
 
 
@@ -11,7 +12,7 @@ class Settings(BaseSettings):
     immich_api_url: str = "http://immich_server:2283"
     immich_api_key: str = ""
 
-    sync_interval_seconds: int = 60
+    sync_interval_seconds: int = Field(default=60, ge=5)
 
     source_user_id: str = ""
     target_user_id: str = ""
