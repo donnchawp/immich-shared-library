@@ -5,10 +5,7 @@ WORKDIR /app
 COPY pyproject.toml .
 COPY src/ src/
 
-RUN pip install --no-cache-dir . && \
-    useradd -r -s /usr/sbin/nologin appuser
-
-USER appuser
+RUN pip install --no-cache-dir .
 
 EXPOSE 8080
 

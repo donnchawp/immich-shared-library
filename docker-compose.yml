@@ -5,6 +5,8 @@ services:
   immich-shared-library:
     build: .
     container_name: immich_shared_library
+    # Set PUID/PGID in .env to match file ownership (defaults to root, matching Immich)
+    user: "${PUID:-0}:${PGID:-0}"
     env_file: .env
     environment:
       DB_HOSTNAME: immich_postgres
