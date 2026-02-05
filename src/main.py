@@ -2,8 +2,10 @@ import asyncio
 import logging
 import sys
 
+from uuid import UUID
+
 from src.config import settings
-from src.db import close_pool, execute, init_pool
+from src.db import close_pool, execute, fetch_one, init_pool
 from src.health import start_health_server, stop_health_server
 from src.immich_api import ImmichAPI
 from src.sync_engine import run_full_sync
@@ -34,6 +36,44 @@ async def ensure_tracking_tables() -> None:
         )
     """)
     logger.info("Tracking tables ready")
+
+
+async def validate_user_and_library_ids() -> None:
+    """Validate that configured user and library IDs exist in Immich and are correctly associated.
+
+    Raises RuntimeError if validation fails.
+    """
+    source_uid = UUID(settings.source_user_id)
+    target_uid = UUID(settings.target_user_id)
+    target_lid = UUID(settings.target_library_id)
+
+    if source_uid == target_uid:
+        raise RuntimeError("source_user_id and target_user_id must be different")
+
+    source_user = await fetch_one(
+        'SELECT id FROM "user" WHERE id = $1 AND "deletedAt" IS NULL', source_uid
+    )
+    if source_user is None:
+        raise RuntimeError(f"source_user_id {source_uid} not found or deleted in Immich")
+
+    target_user = await fetch_one(
+        'SELECT id FROM "user" WHERE id = $1 AND "deletedAt" IS NULL', target_uid
+    )
+    if target_user is None:
+        raise RuntimeError(f"target_user_id {target_uid} not found or deleted in Immich")
+
+    library = await fetch_one(
+        'SELECT id, "ownerId" FROM library WHERE id = $1 AND "deletedAt" IS NULL', target_lid
+    )
+    if library is None:
+        raise RuntimeError(f"target_library_id {target_lid} not found or deleted in Immich")
+    if library["ownerId"] != target_uid:
+        raise RuntimeError(
+            f"target_library_id {target_lid} belongs to user {library['ownerId']}, "
+            f"not target_user_id {target_uid}"
+        )
+
+    logger.info("Configuration validated: users and library exist and are correctly associated")
 
 
 def validate_config() -> bool:
@@ -98,6 +138,7 @@ async def main() -> None:
     # Initialize database
     await init_pool()
     await ensure_tracking_tables()
+    await validate_user_and_library_ids()
 
     # Start health check server
     await start_health_server()
