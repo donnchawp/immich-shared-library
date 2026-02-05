@@ -6,7 +6,7 @@ from uuid import UUID, uuid4
 import asyncpg
 
 from src.config import settings
-from src.file_ops import hardlink_asset_files
+from src.file_ops import hardlink_asset_files, remove_hardlinks
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +96,7 @@ async def sync_asset(conn: asyncpg.Connection, source: asyncpg.Record) -> UUID |
 
     # Use a savepoint so failure rolls back only this asset, not the whole transaction
     savepoint = await conn.execute("SAVEPOINT sync_asset")
+    created_files: list[str] = []
     try:
         # 1. Insert asset record
         await conn.execute(
@@ -146,7 +147,7 @@ async def sync_asset(conn: asyncpg.Connection, source: asyncpg.Record) -> UUID |
         await _copy_exif(conn, source_id, target_id)
 
         # 3. Hardlink thumbnails/previews and create asset_files records
-        await _sync_asset_files(conn, source_id, target_id, source["ownerId"])
+        created_files = await _sync_asset_files(conn, source_id, target_id, source["ownerId"])
 
         # 4. Set job status to mark as fully processed
         await conn.execute(
@@ -189,10 +190,12 @@ async def sync_asset(conn: asyncpg.Connection, source: asyncpg.Record) -> UUID |
 
     except asyncpg.UniqueViolationError:
         await conn.execute("ROLLBACK TO SAVEPOINT sync_asset")
+        remove_hardlinks(created_files)
         logger.warning("Skipping asset %s: duplicate checksum for target user", source_id)
         return None
     except Exception:
         await conn.execute("ROLLBACK TO SAVEPOINT sync_asset")
+        remove_hardlinks(created_files)
         logger.exception("Failed to sync asset %s", source_id)
         return None
 
@@ -229,14 +232,17 @@ async def _sync_asset_files(
     source_id: UUID,
     target_id: UUID,
     source_user_id: UUID,
-) -> None:
-    """Hardlink source asset files and create records for target asset."""
+) -> list[str]:
+    """Hardlink source asset files and create records for target asset.
+
+    Returns the list of created target file paths (for rollback cleanup).
+    """
     files = await conn.fetch(
         'SELECT id, "assetId", type, path, "isEdited", "isProgressive" FROM asset_file WHERE "assetId" = $1',
         source_id,
     )
     if not files:
-        return
+        return []
 
     source_files = [
         {"type": f["type"], "path": f["path"], "is_edited": f["isEdited"], "is_progressive": f["isProgressive"]}
@@ -264,3 +270,5 @@ async def _sync_asset_files(
             nf["is_edited"],
             nf["is_progressive"],
         )
+
+    return [nf["path"] for nf in new_files]
