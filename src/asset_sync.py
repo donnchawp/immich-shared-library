@@ -52,6 +52,10 @@ async def get_unsynced_source_assets(
             SELECT 1 FROM _face_sync_asset_map m
             WHERE m.source_asset_id = a.id
           )
+          AND NOT EXISTS (
+            SELECT 1 FROM _face_sync_skipped s
+            WHERE s.source_asset_id = a.id
+          )
         LIMIT $3
         """,
         UUID(settings.source_user_id),
@@ -195,6 +199,14 @@ async def sync_asset(conn: asyncpg.Connection, source: asyncpg.Record) -> UUID |
     except asyncpg.UniqueViolationError:
         await conn.execute("ROLLBACK TO SAVEPOINT sync_asset")
         remove_hardlinks(created_files)
+        await conn.execute(
+            """
+            INSERT INTO _face_sync_skipped (source_asset_id, reason)
+            VALUES ($1, 'duplicate_checksum')
+            ON CONFLICT (source_asset_id) DO NOTHING
+            """,
+            source_id,
+        )
         logger.warning("Skipping asset %s: duplicate checksum for target user", source_id)
         return None
     except Exception:

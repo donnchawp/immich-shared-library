@@ -35,6 +35,13 @@ async def ensure_tracking_tables() -> None:
             UNIQUE (source_person_id, target_user_id)
         )
     """)
+    await execute("""
+        CREATE TABLE IF NOT EXISTS _face_sync_skipped (
+            source_asset_id UUID PRIMARY KEY,
+            reason TEXT NOT NULL,
+            skipped_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
     logger.info("Tracking tables ready")
 
 
