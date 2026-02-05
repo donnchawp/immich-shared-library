@@ -179,28 +179,25 @@ pip install -e .
 
 ### Running Against a Local Immich Instance
 
-The test script `test_sync.py` runs a single sync cycle with hardcoded config. Since the Immich PostgreSQL container doesn't expose port 5432 by default, tests must run inside a Docker container on the Immich network:
+The test script `test_sync.py` runs a single sync cycle against a local Immich instance. It reads configuration from a `test.env` file:
+
+```bash
+cp test.env.example test.env
+# Edit test.env with your Immich API key, user IDs, and library ID
+```
+
+Since the Immich PostgreSQL container doesn't expose port 5432 by default, tests must run inside a Docker container on the Immich network:
 
 ```bash
 docker run --rm --network immich_default \
   -v $(pwd):/app \
   -v /path/to/immich-app/library:/data \
   -v /path/to/immich-app/external_library:/external_library \
-  -e DB_HOSTNAME=<postgres-container-ip> \
-  -e DB_PORT=5432 -e DB_USERNAME=postgres -e DB_PASSWORD=postgres \
-  -e DB_DATABASE_NAME=immich \
-  -e IMMICH_API_URL=http://immich_server:2283 \
-  -e IMMICH_API_KEY=<your-key> \
-  -e SOURCE_USER_ID=<uuid> -e TARGET_USER_ID=<uuid> \
-  -e TARGET_LIBRARY_ID=<uuid> \
-  -e SHARED_PATH_PREFIX=/external_library/source_user/ \
-  -e TARGET_PATH_PREFIX=/external_library/target_user/ \
-  -e LOG_LEVEL=DEBUG \
   -w /app python:3.12-slim \
   bash -c 'pip install asyncpg httpx pydantic pydantic-settings && python test_sync.py'
 ```
 
-Find the Postgres container IP with:
+Update `DB_HOSTNAME` in `test.env` to point to the Postgres container IP:
 
 ```bash
 docker inspect immich_postgres --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}'
