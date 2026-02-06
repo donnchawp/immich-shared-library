@@ -2,7 +2,7 @@ import logging
 from uuid import UUID
 
 from src.album_sync import add_assets_to_album, backfill_album
-from src.asset_sync import get_unsynced_source_assets, sync_asset
+from src.asset_sync import find_duplicate_filenames, get_unsynced_source_assets, record_skipped_duplicates, sync_asset
 from src.cleanup import cleanup_deleted_assets, cleanup_reassigned_faces
 from src.config import settings
 from src.db import transaction
@@ -19,6 +19,7 @@ async def run_full_sync() -> dict:
     """
     stats = {
         "assets_synced": 0,
+        "assets_skipped_duplicate": 0,
         "faces_synced": 0,
         "persons_updated": 0,
         "assets_cleaned": 0,
@@ -34,7 +35,21 @@ async def run_full_sync() -> dict:
         while True:
             async with transaction() as conn:
                 source_assets = await get_unsynced_source_assets(conn, job)
+
+                # Duplicate detection: skip source assets already in target by filename + capture time
+                duplicates = await find_duplicate_filenames(conn, source_assets, job)
+                if duplicates:
+                    await record_skipped_duplicates(conn, duplicates)
+                    stats["assets_skipped_duplicate"] += len(duplicates)
+                    logger.warning(
+                        "Job %s: skipping %d duplicate(s) by filename+date",
+                        job.name, len(duplicates),
+                    )
+
                 for source in source_assets:
+                    if source["id"] in duplicates:
+                        logger.debug("Skipping duplicate asset %s (%s)", source["id"], source["originalFileName"])
+                        continue
                     target_id = await sync_asset(conn, source, job)
                     if target_id is not None:
                         stats["assets_synced"] += 1

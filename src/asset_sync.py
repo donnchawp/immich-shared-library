@@ -1,6 +1,7 @@
 import logging
 import os
 from datetime import datetime, timezone
+from pathlib import PurePosixPath
 from uuid import UUID, uuid4
 
 import asyncpg
@@ -61,6 +62,102 @@ async def get_unsynced_source_assets(
         job.source_user_id,
         job.source_path_prefix,
         limit,
+    )
+
+
+async def find_duplicate_filenames(
+    conn: asyncpg.Connection, source_assets: list[asyncpg.Record], job: SyncJob
+) -> set[UUID]:
+    """Find source assets that already exist in the target user's own uploads by filename stem + capture time.
+
+    Matches on filename stem (without extension) and EXIF dateTimeOriginal.
+    Only checks the target user's non-sync-library assets (their own uploads).
+    Returns set of source asset IDs that are duplicates.
+    """
+    if not source_assets:
+        return set()
+
+    # Build stem -> list of source asset IDs mapping
+    stem_to_sources: dict[str, list[UUID]] = {}
+    source_ids = []
+    for sa in source_assets:
+        stem = PurePosixPath(sa["originalFileName"]).stem
+        stem_to_sources.setdefault(stem, []).append(sa["id"])
+        source_ids.append(sa["id"])
+
+    # Batch-fetch source EXIF dateTimeOriginal
+    source_exif_rows = await conn.fetch(
+        """
+        SELECT "assetId", "dateTimeOriginal"
+        FROM asset_exif
+        WHERE "assetId" = ANY($1::uuid[])
+          AND "dateTimeOriginal" IS NOT NULL
+        """,
+        source_ids,
+    )
+    source_exif: dict[UUID, datetime] = {
+        row["assetId"]: row["dateTimeOriginal"] for row in source_exif_rows
+    }
+
+    # Only check stems where at least one source asset has EXIF dateTimeOriginal
+    stems_to_check = []
+    for stem, sids in stem_to_sources.items():
+        if any(sid in source_exif for sid in sids):
+            stems_to_check.append(stem)
+
+    if not stems_to_check:
+        return set()
+
+    # Find target user's own uploads matching any of those stems
+    target_matches = await conn.fetch(
+        """
+        SELECT regexp_replace(a."originalFileName", '\\.[^.]+$', '') AS stem,
+               e."dateTimeOriginal"
+        FROM asset a
+        JOIN asset_exif e ON e."assetId" = a.id
+        WHERE a."ownerId" = $1
+          AND a."libraryId" IS DISTINCT FROM $2
+          AND a."deletedAt" IS NULL
+          AND e."dateTimeOriginal" IS NOT NULL
+          AND regexp_replace(a."originalFileName", '\\.[^.]+$', '') = ANY($3::text[])
+        """,
+        job.target_user_id,
+        job.target_library_id,
+        stems_to_check,
+    )
+
+    # Build index of (stem, dateTimeOriginal) that exist in target
+    target_index: set[tuple[str, datetime]] = {
+        (row["stem"], row["dateTimeOriginal"]) for row in target_matches
+    }
+
+    if not target_index:
+        return set()
+
+    # Match source assets against target index
+    duplicates: set[UUID] = set()
+    for sa in source_assets:
+        sid = sa["id"]
+        if sid not in source_exif:
+            continue  # No EXIF dateTimeOriginal — can't confirm, don't skip
+        stem = PurePosixPath(sa["originalFileName"]).stem
+        if (stem, source_exif[sid]) in target_index:
+            duplicates.add(sid)
+
+    return duplicates
+
+
+async def record_skipped_duplicates(conn: asyncpg.Connection, source_asset_ids: set[UUID]) -> None:
+    """Batch-insert skip records for duplicate assets."""
+    if not source_asset_ids:
+        return
+    await conn.execute(
+        """
+        INSERT INTO _face_sync_skipped (source_asset_id, reason)
+        SELECT unnest($1::uuid[]), 'duplicate_filename'
+        ON CONFLICT (source_asset_id) DO NOTHING
+        """,
+        list(source_asset_ids),
     )
 
 
