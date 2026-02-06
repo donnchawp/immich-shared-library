@@ -17,7 +17,7 @@ async def run_full_sync() -> dict:
     stats = {
         "assets_synced": 0,
         "faces_synced": 0,
-        "names_updated": 0,
+        "persons_updated": 0,
         "assets_cleaned": 0,
         "faces_reassigned": 0,
         "persons_cleaned": 0,
@@ -31,22 +31,19 @@ async def run_full_sync() -> dict:
                 target_id = await sync_asset(conn, source)
                 if target_id is not None:
                     stats["assets_synced"] += 1
-                    # Sync faces for this newly created asset
-                    face_count = await sync_faces_for_asset(conn, source["id"], target_id)
-                    stats["faces_synced"] += face_count
+                    stats["faces_synced"] += await sync_faces_for_asset(conn, source["id"], target_id)
         if len(source_assets) < 500:
             break
 
     # Phase 2: Incremental face sync (catch new/updated faces on existing assets)
     async with transaction() as conn:
-        inc_faces = await sync_faces_incremental(conn)
-        stats["faces_synced"] += inc_faces
+        stats["faces_synced"] += await sync_faces_incremental(conn)
 
     # Phase 3: Sync person metadata changes (names, visibility, thumbnails)
     async with transaction() as conn:
-        stats["names_updated"] += await sync_person_names(conn)
-        stats["names_updated"] += await sync_person_visibility(conn)
-        stats["names_updated"] += await sync_person_thumbnails(conn)
+        stats["persons_updated"] += await sync_person_names(conn)
+        stats["persons_updated"] += await sync_person_visibility(conn)
+        stats["persons_updated"] += await sync_person_thumbnails(conn)
 
     # Phase 4: Handle deletions and person merges
     async with transaction() as conn:

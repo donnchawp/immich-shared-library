@@ -2,8 +2,6 @@ import asyncio
 import logging
 import sys
 
-from uuid import UUID
-
 from src.config import settings
 from src.db import close_pool, execute, fetch_one, init_pool
 from src.health import start_health_server, stop_health_server
@@ -50,9 +48,9 @@ async def validate_user_and_library_ids() -> None:
 
     Raises RuntimeError if validation fails.
     """
-    source_uid = UUID(settings.source_user_id)
-    target_uid = UUID(settings.target_user_id)
-    target_lid = UUID(settings.target_library_id)
+    source_uid = settings.source_uid
+    target_uid = settings.target_uid
+    target_lid = settings.target_lid
 
     if source_uid == target_uid:
         raise RuntimeError("source_user_id and target_user_id must be different")
@@ -138,16 +136,12 @@ async def main() -> None:
     logger.info("Sync interval: %ds", settings.sync_interval_seconds)
 
     api = ImmichAPI()
-
-    # Wait for Immich to be ready
     await wait_for_immich(api)
 
-    # Initialize database
     await init_pool()
     await ensure_tracking_tables()
     await validate_user_and_library_ids()
 
-    # Start health check server
     await start_health_server()
 
     try:

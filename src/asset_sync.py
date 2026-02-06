@@ -58,7 +58,7 @@ async def get_unsynced_source_assets(
           )
         LIMIT $3
         """,
-        UUID(settings.source_user_id),
+        settings.source_uid,
         settings.shared_path_prefix,
         limit,
     )
@@ -73,8 +73,8 @@ async def sync_asset(conn: asyncpg.Connection, source: asyncpg.Record) -> UUID |
     source_id = source["id"]
     target_id = uuid4()
     now = datetime.now(timezone.utc)
-    target_user_id = UUID(settings.target_user_id)
-    target_library_id = UUID(settings.target_library_id)
+    target_user_id = settings.target_uid
+    target_library_id = settings.target_lid
 
     target_path = _remap_asset_path(source["originalPath"])
 
@@ -96,14 +96,14 @@ async def sync_asset(conn: asyncpg.Connection, source: asyncpg.Record) -> UUID |
             VALUES ($1, $2, $3, $4, $5)
             ON CONFLICT (source_asset_id) DO NOTHING
             """,
-            source_id, existing, UUID(settings.source_user_id), target_user_id, now,
+            source_id, existing, settings.source_uid, target_user_id, now,
         )
         if result == "INSERT 0 1":
             logger.info("Recovered mapping for existing asset %s -> %s", source_id, existing)
         return existing
 
     # Use a savepoint so failure rolls back only this asset, not the whole transaction
-    savepoint = await conn.execute("SAVEPOINT sync_asset")
+    await conn.execute("SAVEPOINT sync_asset")
     created_files: list[str] = []
     try:
         # 1. Insert asset record
@@ -187,7 +187,7 @@ async def sync_asset(conn: asyncpg.Connection, source: asyncpg.Record) -> UUID |
             """,
             source_id,
             target_id,
-            UUID(settings.source_user_id),
+            settings.source_uid,
             target_user_id,
             now,
         )
@@ -267,7 +267,7 @@ async def _sync_asset_files(
 
     new_files = hardlink_asset_files(
         source_user_id=source_user_id,
-        target_user_id=UUID(settings.target_user_id),
+        target_user_id=settings.target_uid,
         source_asset_id=source_id,
         target_asset_id=target_id,
         source_files=source_files,

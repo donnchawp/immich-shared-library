@@ -1,3 +1,6 @@
+from functools import cached_property
+from uuid import UUID
+
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings
 
@@ -23,6 +26,18 @@ class Settings(BaseSettings):
     upload_location_mount: str = "/usr/src/app/upload"
 
     log_level: str = "INFO"
+
+    @cached_property
+    def source_uid(self) -> UUID:
+        return UUID(self.source_user_id)
+
+    @cached_property
+    def target_uid(self) -> UUID:
+        return UUID(self.target_user_id)
+
+    @cached_property
+    def target_lid(self) -> UUID:
+        return UUID(self.target_library_id)
 
 
 settings = Settings()

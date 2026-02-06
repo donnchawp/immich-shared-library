@@ -12,9 +12,7 @@ logger = logging.getLogger(__name__)
 
 
 def _hardlink_person_thumbnail(
-    source_person_id: UUID,
     target_person_id: UUID,
-    source_user_id: UUID,
     target_user_id: UUID,
     source_thumbnail_path: str,
 ) -> str:
@@ -85,7 +83,7 @@ async def get_or_create_target_person(
         WHERE source_person_id = $1 AND target_user_id = $2
         """,
         source_person_id,
-        UUID(settings.target_user_id),
+        settings.target_uid,
     )
     if existing:
         return existing["target_person_id"]
@@ -103,7 +101,7 @@ async def get_or_create_target_person(
         WHERE source_person_id = $1 AND target_user_id = $2
         """,
         source_person_id,
-        UUID(settings.target_user_id),
+        settings.target_uid,
     )
     if existing:
         return existing["target_person_id"]
@@ -114,16 +112,11 @@ async def get_or_create_target_person(
         logger.warning("Source person %s not found", source_person_id)
         return None
 
-    # Create mirrored person for target user
     target_person_id = uuid4()
-    target_user_id = UUID(settings.target_user_id)
 
-    # Hardlink the person's cropped face thumbnail
     target_thumbnail = _hardlink_person_thumbnail(
-        source_person_id=source_person_id,
         target_person_id=target_person_id,
-        source_user_id=source["ownerId"],
-        target_user_id=target_user_id,
+        target_user_id=settings.target_uid,
         source_thumbnail_path=source["thumbnailPath"],
     )
 
@@ -133,7 +126,7 @@ async def get_or_create_target_person(
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
         """,
         target_person_id,
-        target_user_id,
+        settings.target_uid,
         source["name"],
         target_thumbnail,
         source["isHidden"],
@@ -152,8 +145,8 @@ async def get_or_create_target_person(
         """,
         source_person_id,
         target_person_id,
-        UUID(settings.source_user_id),
-        UUID(settings.target_user_id),
+        settings.source_uid,
+        settings.target_uid,
     )
 
     logger.info("Created mirrored person %s -> %s (name=%s)", source_person_id, target_person_id, source["name"])
@@ -169,9 +162,8 @@ async def sync_person_thumbnails(conn: asyncpg.Connection) -> int:
     """
     rows = await conn.fetch(
         """
-        SELECT m.source_person_id, m.target_person_id,
-               s."thumbnailPath" as source_thumb, s."ownerId" as source_owner_id,
-               t."thumbnailPath" as target_thumb
+        SELECT m.target_person_id,
+               s."thumbnailPath" as source_thumb
         FROM _face_sync_person_map m
         JOIN person s ON s.id = m.source_person_id
         JOIN person t ON t.id = m.target_person_id
@@ -183,10 +175,8 @@ async def sync_person_thumbnails(conn: asyncpg.Connection) -> int:
     count = 0
     for row in rows:
         target_thumb = _hardlink_person_thumbnail(
-            source_person_id=row["source_person_id"],
             target_person_id=row["target_person_id"],
-            source_user_id=row["source_owner_id"],
-            target_user_id=UUID(settings.target_user_id),
+            target_user_id=settings.target_uid,
             source_thumbnail_path=row["source_thumb"],
         )
         if target_thumb:

@@ -1,10 +1,10 @@
 import logging
-from uuid import UUID
 
 import asyncpg
 
 from src.config import settings
 from src.file_ops import remove_hardlinks
+from src.person_sync import get_or_create_target_person
 
 logger = logging.getLogger(__name__)
 
@@ -89,14 +89,11 @@ async def cleanup_reassigned_faces(conn: asyncpg.Connection) -> int:
             AND pm.target_user_id = $1
         WHERE tf."personId" IS DISTINCT FROM pm.target_person_id
         """,
-        UUID(settings.target_user_id),
+        settings.target_uid,
     )
 
     count = 0
     for row in mismatched:
-        # The new source person may need a mirrored target person
-        from src.person_sync import get_or_create_target_person
-
         new_target_person_id = None
         if row["new_source_person_id"] is not None:
             new_target_person_id = await get_or_create_target_person(conn, row["new_source_person_id"])
