@@ -120,20 +120,13 @@ class ImmichClient:
         return self._request("/api/libraries")
 
     def create_library(self, owner_id: str, name: str, import_paths: list[str]) -> dict:
-        """Create a library without triggering a scan.
-
-        Creates with empty import paths first (to avoid auto-scan on creation),
-        then updates with the real import paths and exclusion pattern.
-        """
-        library = self._request("/api/libraries", {
+        """Create a library with exclusion pattern **/* so Immich won't scan it."""
+        return self._request("/api/libraries", {
             "ownerId": owner_id,
             "name": name,
-        })
-        # Update with import paths + exclusion — PUT doesn't trigger a scan
-        return self._request(f"/api/libraries/{library['id']}", {
             "importPaths": import_paths,
             "exclusionPatterns": ["**/*"],
-        }, method="PUT")
+        })
 
     def get_albums(self) -> list[dict]:
         return self._request("/api/albums")
