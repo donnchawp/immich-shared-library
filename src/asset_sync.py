@@ -5,33 +5,33 @@ from uuid import UUID, uuid4
 
 import asyncpg
 
-from src.config import settings
+from src.config import SyncJob
 from src.file_ops import hardlink_asset_files, remove_hardlinks
 
 logger = logging.getLogger(__name__)
 
 
-def _remap_asset_path(source_path: str) -> str:
+def _remap_asset_path(source_path: str, job: SyncJob) -> str:
     """Remap an asset's originalPath from the source prefix to the target prefix.
 
     e.g., /external_library/donncha/photo.jpg -> /external_library/jacinta/photo.jpg
     Normalizes the result to collapse any '..' components.
     """
-    if settings.target_path_prefix and settings.shared_path_prefix:
-        if source_path.startswith(settings.shared_path_prefix):
-            remapped = settings.target_path_prefix + source_path[len(settings.shared_path_prefix):]
+    if job.target_path_prefix and job.source_path_prefix:
+        if source_path.startswith(job.source_path_prefix):
+            remapped = job.target_path_prefix + source_path[len(job.source_path_prefix):]
             normalized = os.path.normpath(remapped)
-            if not normalized.startswith(settings.target_path_prefix):
+            if not normalized.startswith(job.target_path_prefix):
                 raise ValueError(
                     f"Remapped path {remapped} normalizes to {normalized}, "
-                    f"which escapes target prefix {settings.target_path_prefix}"
+                    f"which escapes target prefix {job.target_path_prefix}"
                 )
             return normalized
     return os.path.normpath(source_path)
 
 
 async def get_unsynced_source_assets(
-    conn: asyncpg.Connection, limit: int = 500
+    conn: asyncpg.Connection, job: SyncJob, limit: int = 500
 ) -> list[asyncpg.Record]:
     """Find fully-processed source assets in the shared directory that haven't been synced yet.
 
@@ -58,14 +58,14 @@ async def get_unsynced_source_assets(
           )
         LIMIT $3
         """,
-        settings.source_uid,
-        settings.shared_path_prefix,
+        job.source_user_id,
+        job.source_path_prefix,
         limit,
     )
 
 
-async def sync_asset(conn: asyncpg.Connection, source: asyncpg.Record) -> UUID | None:
-    """Create a complete asset record for User B from a source asset.
+async def sync_asset(conn: asyncpg.Connection, source: asyncpg.Record, job: SyncJob) -> UUID | None:
+    """Create a complete asset record for the target user from a source asset.
 
     Uses a savepoint so a single asset failure doesn't roll back the entire batch.
     Returns the new target asset ID, or None on failure.
@@ -73,10 +73,10 @@ async def sync_asset(conn: asyncpg.Connection, source: asyncpg.Record) -> UUID |
     source_id = source["id"]
     target_id = uuid4()
     now = datetime.now(timezone.utc)
-    target_user_id = settings.target_uid
-    target_library_id = settings.target_lid
+    target_user_id = job.target_user_id
+    target_library_id = job.target_library_id
 
-    target_path = _remap_asset_path(source["originalPath"])
+    target_path = _remap_asset_path(source["originalPath"], job)
 
     # Idempotency: check if a target asset already exists for this path + owner + library
     existing = await conn.fetchval(
@@ -96,7 +96,7 @@ async def sync_asset(conn: asyncpg.Connection, source: asyncpg.Record) -> UUID |
             VALUES ($1, $2, $3, $4, $5)
             ON CONFLICT (source_asset_id) DO NOTHING
             """,
-            source_id, existing, settings.source_uid, target_user_id, now,
+            source_id, existing, job.source_user_id, target_user_id, now,
         )
         if result == "INSERT 0 1":
             logger.info("Recovered mapping for existing asset %s -> %s", source_id, existing)
@@ -155,7 +155,7 @@ async def sync_asset(conn: asyncpg.Connection, source: asyncpg.Record) -> UUID |
         await _copy_exif(conn, source_id, target_id)
 
         # 3. Hardlink thumbnails/previews and create asset_files records
-        created_files = await _sync_asset_files(conn, source_id, target_id, source["ownerId"])
+        created_files = await _sync_asset_files(conn, source_id, target_id, source["ownerId"], target_user_id)
 
         # 4. Set job status to mark as fully processed
         await conn.execute(
@@ -187,7 +187,7 @@ async def sync_asset(conn: asyncpg.Connection, source: asyncpg.Record) -> UUID |
             """,
             source_id,
             target_id,
-            settings.source_uid,
+            job.source_user_id,
             target_user_id,
             now,
         )
@@ -248,6 +248,7 @@ async def _sync_asset_files(
     source_id: UUID,
     target_id: UUID,
     source_user_id: UUID,
+    target_user_id: UUID,
 ) -> list[str]:
     """Hardlink source asset files and create records for target asset.
 
@@ -267,7 +268,7 @@ async def _sync_asset_files(
 
     new_files = hardlink_asset_files(
         source_user_id=source_user_id,
-        target_user_id=settings.target_uid,
+        target_user_id=target_user_id,
         source_asset_id=source_id,
         target_asset_id=target_id,
         source_files=source_files,

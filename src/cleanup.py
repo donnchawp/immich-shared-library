@@ -2,7 +2,6 @@ import logging
 
 import asyncpg
 
-from src.config import settings
 from src.file_ops import remove_hardlinks
 from src.person_sync import get_or_create_target_person
 
@@ -46,6 +45,12 @@ async def cleanup_deleted_assets(conn: asyncpg.Connection) -> int:
             # and the source still has a link to the inode).
             remove_hardlinks(file_paths)
 
+            # Remove from albums before deleting asset
+            await conn.execute(
+                'DELETE FROM album_asset WHERE "assetId" = $1',
+                target_id,
+            )
+
             # Delete the target asset (cascades to exif, files, faces, smart_search, job_status)
             await conn.execute("DELETE FROM asset WHERE id = $1", target_id)
 
@@ -72,12 +77,15 @@ async def cleanup_reassigned_faces(conn: asyncpg.Connection) -> int:
     Returns the number of faces updated.
     """
     # Find target faces where the source face's person has changed
+    # User IDs are derived from the tracking table instead of global settings
     mismatched = await conn.fetch(
         """
         SELECT
             tf.id AS target_face_id,
             sf."personId" AS new_source_person_id,
-            tf."personId" AS current_target_person_id
+            tf."personId" AS current_target_person_id,
+            m.source_user_id,
+            m.target_user_id
         FROM _face_sync_asset_map m
         JOIN asset_face sf ON sf."assetId" = m.source_asset_id AND sf."deletedAt" IS NULL
         JOIN asset_face tf ON tf."assetId" = m.target_asset_id AND tf."deletedAt" IS NULL
@@ -86,17 +94,19 @@ async def cleanup_reassigned_faces(conn: asyncpg.Connection) -> int:
             AND tf."boundingBoxX2" = sf."boundingBoxX2"
             AND tf."boundingBoxY2" = sf."boundingBoxY2"
         LEFT JOIN _face_sync_person_map pm ON pm.source_person_id = sf."personId"
-            AND pm.target_user_id = $1
+            AND pm.target_user_id = m.target_user_id
         WHERE tf."personId" IS DISTINCT FROM pm.target_person_id
         """,
-        settings.target_uid,
     )
 
     count = 0
     for row in mismatched:
         new_target_person_id = None
         if row["new_source_person_id"] is not None:
-            new_target_person_id = await get_or_create_target_person(conn, row["new_source_person_id"])
+            new_target_person_id = await get_or_create_target_person(
+                conn, row["new_source_person_id"],
+                row["source_user_id"], row["target_user_id"],
+            )
 
         await conn.execute(
             'UPDATE asset_face SET "personId" = $1 WHERE id = $2',

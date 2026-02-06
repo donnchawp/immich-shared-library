@@ -48,52 +48,108 @@ async def validate_user_and_library_ids() -> None:
 
     Raises RuntimeError if validation fails.
     """
-    source_uid = settings.source_uid
-    target_uid = settings.target_uid
-    target_lid = settings.target_lid
-
-    if source_uid == target_uid:
-        raise RuntimeError("source_user_id and target_user_id must be different")
-
-    source_user = await fetch_one(
-        'SELECT id FROM "user" WHERE id = $1 AND "deletedAt" IS NULL', source_uid
-    )
-    if source_user is None:
-        raise RuntimeError(f"source_user_id {source_uid} not found or deleted in Immich")
-
-    target_user = await fetch_one(
-        'SELECT id FROM "user" WHERE id = $1 AND "deletedAt" IS NULL', target_uid
-    )
-    if target_user is None:
-        raise RuntimeError(f"target_user_id {target_uid} not found or deleted in Immich")
-
-    library = await fetch_one(
-        'SELECT id, "ownerId" FROM library WHERE id = $1 AND "deletedAt" IS NULL', target_lid
-    )
-    if library is None:
-        raise RuntimeError(f"target_library_id {target_lid} not found or deleted in Immich")
-    if library["ownerId"] != target_uid:
-        raise RuntimeError(
-            f"target_library_id {target_lid} belongs to user {library['ownerId']}, "
-            f"not target_user_id {target_uid}"
+    # Validate each sync job's users and library
+    for job in settings.sync_jobs:
+        source_user = await fetch_one(
+            'SELECT id FROM "user" WHERE id = $1 AND "deletedAt" IS NULL', job.source_user_id
         )
+        if source_user is None:
+            raise RuntimeError(
+                f"[{job.name}] source_user_id {job.source_user_id} not found or deleted in Immich"
+            )
 
-    logger.info("Configuration validated: users and library exist and are correctly associated")
+        target_user = await fetch_one(
+            'SELECT id FROM "user" WHERE id = $1 AND "deletedAt" IS NULL', job.target_user_id
+        )
+        if target_user is None:
+            raise RuntimeError(
+                f"[{job.name}] target_user_id {job.target_user_id} not found or deleted in Immich"
+            )
+
+        if job.source_user_id == job.target_user_id:
+            raise RuntimeError(
+                f"[{job.name}] source_user_id and target_user_id must be different"
+            )
+
+        library = await fetch_one(
+            'SELECT id, "ownerId" FROM library WHERE id = $1 AND "deletedAt" IS NULL',
+            job.target_library_id,
+        )
+        if library is None:
+            raise RuntimeError(
+                f"[{job.name}] target_library_id {job.target_library_id} not found or deleted in Immich"
+            )
+        if library["ownerId"] != job.target_user_id:
+            raise RuntimeError(
+                f"[{job.name}] target_library_id {job.target_library_id} belongs to user "
+                f"{library['ownerId']}, not target_user_id {job.target_user_id}"
+            )
+
+    # Validate album if configured
+    if settings.target_album_uid:
+        album = await fetch_one(
+            'SELECT id, "ownerId", "deletedAt" FROM album WHERE id = $1',
+            settings.target_album_uid,
+        )
+        if album is None:
+            raise RuntimeError(
+                f"target_album_id {settings.target_album_uid} not found in Immich"
+            )
+        if album["deletedAt"] is not None:
+            raise RuntimeError(
+                f"target_album_id {settings.target_album_uid} is deleted"
+            )
+        job_target_ids = {job.target_user_id for job in settings.sync_jobs}
+        if album["ownerId"] not in job_target_ids:
+            raise RuntimeError(
+                f"target_album_id {settings.target_album_uid} belongs to user "
+                f"{album['ownerId']}, not any configured target user {job_target_ids}"
+            )
+
+    logger.info("Configuration validated: users, libraries, and album exist and are correctly associated")
 
 
 def validate_config() -> bool:
     """Validate that required configuration is present."""
-    required = [
-        ("source_user_id", settings.source_user_id),
-        ("target_user_id", settings.target_user_id),
-        ("target_library_id", settings.target_library_id),
-        ("shared_path_prefix", settings.shared_path_prefix),
-        ("immich_api_key", settings.immich_api_key.get_secret_value()),
-    ]
-    missing = [name for name, val in required if not val]
-    if missing:
-        logger.error("Missing required configuration: %s", ", ".join(missing))
+    if not settings.immich_api_key.get_secret_value():
+        logger.error("Missing required configuration: immich_api_key")
         return False
+
+    # At least one sync source must be configured
+    has_external = bool(settings.shared_path_prefix)
+    has_upload = bool(settings.upload_source_user_id)
+
+    if not has_external and not has_upload:
+        logger.error("At least one of shared_path_prefix or upload_source_user_id must be set")
+        return False
+
+    # Validate external library sync requirements
+    if has_external:
+        required = [
+            ("source_user_id", settings.source_user_id),
+            ("target_user_id", settings.target_user_id),
+            ("target_library_id", settings.target_library_id),
+            ("target_path_prefix", settings.target_path_prefix),
+        ]
+        missing = [name for name, val in required if not val]
+        if missing:
+            logger.error("External library sync requires: %s", ", ".join(missing))
+            return False
+
+    # Validate internal library sync requirements
+    if has_upload:
+        required = [
+            ("upload_target_library_id", settings.upload_target_library_id),
+            ("target_upload_path_prefix", settings.target_upload_path_prefix),
+        ]
+        # Internal library sync needs a target: either its own or the global one
+        if not settings.upload_target_user_id and not settings.target_user_id:
+            required.append(("upload_target_user_id or target_user_id", ""))
+        missing = [name for name, val in required if not val]
+        if missing:
+            logger.error("Internal library sync requires: %s", ", ".join(missing))
+            return False
+
     return True
 
 
@@ -129,11 +185,15 @@ async def main() -> None:
         sys.exit(1)
 
     logger.info("Starting immich-shared-library sidecar")
-    logger.info("Source user: %s", settings.source_user_id)
-    logger.info("Target user: %s", settings.target_user_id)
-    logger.info("Target library: %s", settings.target_library_id)
-    logger.info("Shared path prefix: %s", settings.shared_path_prefix)
     logger.info("Sync interval: %ds", settings.sync_interval_seconds)
+    for job in settings.sync_jobs:
+        logger.info(
+            "Sync job [%s]: source=%s, target=%s, src_prefix=%s, tgt_prefix=%s",
+            job.name, job.source_user_id, job.target_user_id,
+            job.source_path_prefix, job.target_path_prefix,
+        )
+    if settings.target_album_uid:
+        logger.info("Album: %s", settings.target_album_uid)
 
     api = ImmichAPI()
     await wait_for_immich(api)

@@ -68,8 +68,10 @@ def _hardlink_person_thumbnail(
 async def get_or_create_target_person(
     conn: asyncpg.Connection,
     source_person_id: UUID,
+    source_user_id: UUID,
+    target_user_id: UUID,
 ) -> UUID | None:
-    """Find or create a mirrored person for User B.
+    """Find or create a mirrored person for the target user.
 
     Uses an advisory lock on the source person ID to prevent duplicate person
     creation from concurrent transactions.
@@ -83,7 +85,7 @@ async def get_or_create_target_person(
         WHERE source_person_id = $1 AND target_user_id = $2
         """,
         source_person_id,
-        settings.target_uid,
+        target_user_id,
     )
     if existing:
         return existing["target_person_id"]
@@ -101,7 +103,7 @@ async def get_or_create_target_person(
         WHERE source_person_id = $1 AND target_user_id = $2
         """,
         source_person_id,
-        settings.target_uid,
+        target_user_id,
     )
     if existing:
         return existing["target_person_id"]
@@ -116,7 +118,7 @@ async def get_or_create_target_person(
 
     target_thumbnail = _hardlink_person_thumbnail(
         target_person_id=target_person_id,
-        target_user_id=settings.target_uid,
+        target_user_id=target_user_id,
         source_thumbnail_path=source["thumbnailPath"],
     )
 
@@ -126,7 +128,7 @@ async def get_or_create_target_person(
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
         """,
         target_person_id,
-        settings.target_uid,
+        target_user_id,
         source["name"],
         target_thumbnail,
         source["isHidden"],
@@ -145,8 +147,8 @@ async def get_or_create_target_person(
         """,
         source_person_id,
         target_person_id,
-        settings.source_uid,
-        settings.target_uid,
+        source_user_id,
+        target_user_id,
     )
 
     logger.info("Created mirrored person %s -> %s (name=%s)", source_person_id, target_person_id, source["name"])
@@ -163,6 +165,7 @@ async def sync_person_thumbnails(conn: asyncpg.Connection) -> int:
     rows = await conn.fetch(
         """
         SELECT m.target_person_id,
+               m.target_user_id,
                s."thumbnailPath" as source_thumb
         FROM _face_sync_person_map m
         JOIN person s ON s.id = m.source_person_id
@@ -176,7 +179,7 @@ async def sync_person_thumbnails(conn: asyncpg.Connection) -> int:
     for row in rows:
         target_thumb = _hardlink_person_thumbnail(
             target_person_id=row["target_person_id"],
-            target_user_id=settings.target_uid,
+            target_user_id=row["target_user_id"],
             source_thumbnail_path=row["source_thumb"],
         )
         if target_thumb:

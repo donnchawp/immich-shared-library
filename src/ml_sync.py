@@ -12,6 +12,8 @@ async def sync_faces_for_asset(
     conn: asyncpg.Connection,
     source_asset_id: UUID,
     target_asset_id: UUID,
+    source_user_id: UUID,
+    target_user_id: UUID,
 ) -> int:
     """Copy face data from source asset to target asset.
 
@@ -37,7 +39,9 @@ async def sync_faces_for_asset(
         # Get or create mirrored person
         target_person_id = None
         if face["personId"] is not None:
-            target_person_id = await get_or_create_target_person(conn, face["personId"])
+            target_person_id = await get_or_create_target_person(
+                conn, face["personId"], source_user_id, target_user_id,
+            )
 
         # Insert face record only if no matching bounding box exists on the target asset
         # (atomic check-and-insert to avoid TOCTOU race)
@@ -120,7 +124,8 @@ async def sync_faces_incremental(conn: asyncpg.Connection) -> int:
     # Find synced asset pairs where the source has faces updated after synced_at
     pairs = await conn.fetch(
         """
-        SELECT m.source_asset_id, m.target_asset_id, m.synced_at
+        SELECT m.source_asset_id, m.target_asset_id, m.synced_at,
+               m.source_user_id, m.target_user_id
         FROM _face_sync_asset_map m
         WHERE EXISTS (
             SELECT 1 FROM asset_face af
@@ -134,7 +139,8 @@ async def sync_faces_incremental(conn: asyncpg.Connection) -> int:
     total = 0
     for pair in pairs:
         count = await sync_faces_for_asset(
-            conn, pair["source_asset_id"], pair["target_asset_id"]
+            conn, pair["source_asset_id"], pair["target_asset_id"],
+            pair["source_user_id"], pair["target_user_id"],
         )
         if count > 0:
             # Update the watermark so we don't re-check this asset next cycle

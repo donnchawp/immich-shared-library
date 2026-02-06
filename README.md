@@ -33,48 +33,37 @@ The target user's assets appear instantly with full search, face recognition, an
 ## Prerequisites
 
 - A running Immich instance (v2+) with Docker Compose
-- Two Immich users (source and target)
-- An external library for the source user containing the photos to share
-- An external library for the target user with symlinks pointing to the same photos
-- The source user's photos must be fully processed by Immich (metadata, faces, CLIP)
+- Two or more Immich users (at least one source and one target)
+- Source assets must be fully processed by Immich (metadata, faces, CLIP)
 
-## Installation
+The sidecar supports two sync methods. You can use one or both:
+
+| Method | What it syncs | Source |
+|---|---|---|
+| **External Library Sync** | A subset (or all) of one user's external library | Source user's external library directory |
+| **Upload Sync** | App/website uploads from a different user | Source user's upload directory (camera roll, web uploads, etc.) |
+
+### Example scenario
+
+Alice manages the family photo library in Lightroom Classic and imports the finished edits into Immich via an external library. She uses **External Library Sync** to share a curated subset of family photos with Bob — just the family shots, not the street photography or landscapes.
+
+Bob uploads all his phone photos through the Immich app. Alice uses **Upload Sync** to pull Bob's entire upload library into her account. The ML data (CLIP embeddings, face detection, face recognition) is copied along with the assets, so Alice gets full search and face recognition on Bob's photos without any duplicate GPU processing.
+
+Both sync methods run together in the same sidecar, syncing into Alice's and Bob's accounts respectively.
+
+## Setup
 
 ### 1. Create an API key
 
-In Immich, go to **Account Settings > API Keys** and create a key. This key needs permission to trigger library scans.
+In Immich, go to **Account Settings > API Keys** and create a key.
 
-### 2. Set up the target user's external library
-
-Create an external library for the target user in Immich. The library's import path should contain symlinks pointing to the source user's photos. For example:
-
-```
-/external_library/
-  user_a/
-    shared/         # Photos to share with user_b
-      photo1.jpg
-      photo2.jpg
-    private/        # Not shared
-      photo3.jpg
-  user_b/
-    shared -> ../user_a/shared   # Single symlink to the entire directory
-```
-
-### 3. Get the required UUIDs
-
-You need three UUIDs from Immich: the source user ID, target user ID, and target user's external library ID.
-
-**User IDs:** In the Immich web UI, go to **Administration > Users** and click on a username. The UUID appears in the URL: `/admin/users/{UUID}`.
-
-**Library ID:** In the Immich web UI, go to **Administration > External Libraries** and click on the target user's external library. The UUID appears in the URL: `/admin/library-management/{UUID}`.
-
-### 4. Configure environment
+### 2. Configure environment
 
 ```bash
 cp .env.example .env
 ```
 
-Edit `.env`:
+Edit `.env` with the common settings:
 
 ```env
 DB_PASSWORD=postgres
@@ -84,41 +73,144 @@ UPLOAD_LOCATION=../immich-app/library
 EXTERNAL_LIBRARY_DIR=../immich-app/external_library
 
 IMMICH_API_KEY=your-immich-api-key
-
-SOURCE_USER_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
 TARGET_USER_ID=yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy
-TARGET_LIBRARY_ID=zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz
-
-# Path prefixes as seen inside the Immich container (not on the host)
-SHARED_PATH_PREFIX=/external_library/user_a/shared/
-TARGET_PATH_PREFIX=/external_library/user_b/shared/
 ```
 
-### 5. Configure the target external library
+### 3. Find UUIDs
 
-The target user's external library contains symlinks to the source user's shared photos. Immich must **not** scan or watch this library — if it does, it will create its own asset records and run ML processing independently, defeating the purpose of the sidecar.
+**User IDs:** In the Immich web UI, go to **Administration > Users** and click on a username. The UUID appears in the URL: `/admin/users/{UUID}`.
 
-Add an exclusion pattern to the target library that tells Immich to ignore all files:
+**Library IDs:** In the Immich web UI, go to **Administration > External Libraries** and click on a library. The UUID appears in the URL: `/admin/library-management/{UUID}`.
+
+Now follow the instructions for the sync method(s) you want to use, then skip to [Album Assignment](#optional-album-assignment) and [Start the Sidecar](#start-the-sidecar).
+
+---
+
+## External Library Sync
+
+Syncs assets from a source user's external library into the target user's account. Use this when both users should see the same set of externally-managed photos (e.g., a shared photo directory on a NAS).
+
+### How it works
+
+The source user (User A) has an external library that Immich scans and processes normally. You create a *second* external library for the target user (User B) containing a symlink to the same photos. The sidecar creates asset records for User B directly in the database — Immich never scans this target library.
+
+### Step 1: Create the symlink
+
+Create a symlink so the target user's external library points to the source user's photos:
+
+```
+/external_library/
+  user_a/               # Source user's external library (scanned by Immich)
+    photos/
+      photo1.jpg
+      photo2.jpg
+  user_b_shared/        # Target user's external library (NOT scanned — sidecar handles it)
+    photos -> ../user_a/photos
+```
+
+You can symlink the entire source directory or just a subdirectory — the `SHARED_PATH_PREFIX` controls which source assets are synced.
+
+### Step 2: Create the target external library in Immich
+
+Create a new external library for the target user (User B) in Immich with an import path that covers the symlink directory (e.g., `/external_library/user_b_shared/`).
+
+**Important:** This library must not be scanned by Immich. Add the exclusion pattern `**/*` to tell Immich to ignore all files:
 
 1. Go to **Administration > External Libraries**
-2. Click on the target user's external library
+2. Click on the target user's new external library
 3. Add `**/*` as an exclusion pattern and save
 
-The sidecar bypasses library scanning entirely by writing asset records directly to the database. Immich sees the target user's assets because they exist in the `asset` table, not because it scanned the filesystem.
+The sidecar writes asset records directly to the database. Immich sees User B's assets because they exist in the `asset` table, not because it scanned the filesystem.
 
-### 6. Enable library watching
+### Step 3: Enable library watching
 
-In Immich's **Administration > Settings > External Library**, enable **Library Watching**. This uses filesystem events (inotify) to detect new files added to any external library. Because the target library has the `**/*` exclusion pattern, Immich will ignore file events in that library.
+In Immich's **Administration > Settings > External Library**, enable **Library Watching**. This uses filesystem events (inotify) to detect new files added to the *source* user's external library. Immich will process them through the ML pipeline. Once processing completes, the sidecar picks them up on the next sync cycle.
 
-When a new file is added to the source user's external library, Immich will automatically detect it, create an asset record, and run ML processing (metadata extraction, face detection, CLIP embedding). Once processing completes, the sidecar picks it up on the next sync cycle.
+Because the target library has the `**/*` exclusion pattern, Immich will ignore file events in that library.
 
-> **Note:** The sidecar does not trigger library scans itself. It relies on Immich's library watching (or manual scans) to discover new source files. If library watching doesn't work in your environment (e.g., network drives), you can trigger scans manually after adding files:
+> **Note:** The sidecar does not trigger library scans itself. It relies on Immich's library watching (or manual scans) to discover new source files. If library watching doesn't work in your environment (e.g., network drives), you can trigger scans manually:
 > ```bash
 > curl -X POST "http://localhost:2283/api/libraries/SOURCE_LIBRARY_ID/scan" \
 >   -H "x-api-key: YOUR_KEY"
 > ```
 
-### 7. Start the sidecar
+### Step 4: Add to `.env`
+
+```env
+SOURCE_USER_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+TARGET_LIBRARY_ID=zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz
+
+# Path prefixes as seen inside the Immich container (not on the host)
+SHARED_PATH_PREFIX=/external_library/user_a/photos/
+TARGET_PATH_PREFIX=/external_library/user_b_shared/photos/
+```
+
+---
+
+## Upload Sync
+
+Syncs app/website uploads from a source user into the target user's account. Use this when the source user uploads photos via the Immich mobile app or web UI and you want them to appear in the target user's library too.
+
+### How it works
+
+The source user (User C) uploads photos normally — Immich stores them in its upload directory and runs ML processing. You create an external library for the target user (User B) containing a symlink to User C's upload directory. The sidecar creates asset records for User B directly in the database.
+
+### Step 1: Create the symlink
+
+Create a symlink from a directory inside the target user's external library to the source user's upload directory:
+
+```
+/external_library/
+  user_b_uploads/     # Target user's external library (NOT scanned — sidecar handles it)
+    user_c -> /data/upload/cccccccc-cccc-cccc-cccc-cccccccccccc/
+```
+
+The symlink target must point to the source user's upload directory *inside the container*. Immich stores uploads at `{upload_location}/upload/{user_id}/`.
+
+### Step 2: Create the target external library in Immich
+
+Create a **new** external library for the target user (User B) in Immich. This must be a **separate library** from any library used for external library sync.
+
+**Important:** This library must not be scanned by Immich. Add the exclusion pattern `**/*`:
+
+1. Go to **Administration > External Libraries**
+2. Click on the target user's new upload sync library
+3. Add `**/*` as an exclusion pattern and save
+
+> **Why a separate library?** The source user's libraries are actively scanned by Immich to discover and process new assets. The upload sync target library must *not* be scanned (Immich would create duplicate records and run redundant ML processing). The sidecar handles creating the asset records directly in the database.
+
+### Step 3: Add to `.env`
+
+```env
+# Source user whose uploads you want to sync
+UPLOAD_SOURCE_USER_ID=cccccccc-cccc-cccc-cccc-cccccccccccc
+
+# The new external library created above (separate from any external library sync library)
+UPLOAD_TARGET_LIBRARY_ID=wwwwwwww-wwww-wwww-wwww-wwwwwwwwwwww
+
+# Path prefix where the symlink maps uploads into the external library
+TARGET_UPLOAD_PATH_PREFIX=/external_library/user_b_uploads/user_c/
+```
+
+The sidecar automatically derives the source path prefix from the upload location mount and the source user ID (e.g., `/usr/src/app/upload/upload/cccccccc-cccc-cccc-cccc-cccccccccccc/`).
+
+> **Note:** If you're only doing upload sync, you don't need `SOURCE_USER_ID`, `TARGET_LIBRARY_ID`, `SHARED_PATH_PREFIX`, or `TARGET_PATH_PREFIX`. Those are only for external library sync.
+
+---
+
+## Optional: Album Assignment
+
+To have all synced assets (from both sync methods) automatically added to an album in the target user's account, create the album first in Immich, then add its UUID to `.env`:
+
+```env
+TARGET_ALBUM_ID=aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa
+```
+
+The album must be owned by the target user.
+
+If you add `TARGET_ALBUM_ID` after assets have already been synced, the sidecar will backfill all previously synced assets into the album on the next cycle. When a source asset is deleted, its album entry is also removed during cleanup.
+
+## Start the Sidecar
 
 The sidecar runs as a standalone compose project that connects to Immich's Docker network. From this directory:
 
@@ -143,22 +235,33 @@ The sidecar will:
 | `DB_USERNAME` | `postgres` | PostgreSQL username |
 | `DB_DATABASE_NAME` | `immich` | PostgreSQL database name |
 | `IMMICH_API_KEY` | *(required)* | Immich API key |
-| `SOURCE_USER_ID` | *(required)* | UUID of the source user |
 | `TARGET_USER_ID` | *(required)* | UUID of the target user |
-| `TARGET_LIBRARY_ID` | *(required)* | UUID of the target user's external library |
-| `SHARED_PATH_PREFIX` | *(required)* | Path prefix for source assets as seen inside the Immich container (e.g., `/external_library/user_a/shared/`) |
-| `TARGET_PATH_PREFIX` | | Path prefix for target assets as seen inside the Immich container (e.g., `/external_library/user_b/shared/`) |
+| **External library sync** | | *Required if `SHARED_PATH_PREFIX` is set* |
+| `SOURCE_USER_ID` | | UUID of the source user (external library) |
+| `TARGET_LIBRARY_ID` | | UUID of the target user's external library |
+| `SHARED_PATH_PREFIX` | | Path prefix for source assets inside the container (e.g., `/external_library/user_a/shared/`) |
+| `TARGET_PATH_PREFIX` | | Path prefix for target assets inside the container (e.g., `/external_library/user_b/shared/`) |
+| **Upload sync** | | *Required if `UPLOAD_SOURCE_USER_ID` is set* |
+| `UPLOAD_SOURCE_USER_ID` | | UUID of the source user whose uploads to sync |
+| `UPLOAD_TARGET_LIBRARY_ID` | | UUID of a separate external library for the target user (with `**/*` exclusion) |
+| `TARGET_UPLOAD_PATH_PREFIX` | | Path prefix where the upload symlink maps into the external library |
+| **Album** | | |
+| `TARGET_ALBUM_ID` | | UUID of album to add all synced assets to (must be owned by target user) |
+| **General** | | |
 | `SYNC_INTERVAL_SECONDS` | `60` | Seconds between sync cycles |
 | `LOG_LEVEL` | `INFO` | Logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
 
+At least one of `SHARED_PATH_PREFIX` or `UPLOAD_SOURCE_USER_ID` must be set. Both can be configured simultaneously to sync from multiple sources.
+
 ## How the Sync Works
 
-Each sync cycle runs four phases:
+Each sync cycle runs five phases:
 
-1. **New assets** — Finds fully-processed source assets not yet synced. Creates target asset records with copied EXIF, CLIP embeddings, faces, and hardlinked thumbnails.
+1. **New assets** — For each configured sync job (external library, uploads), finds fully-processed source assets not yet synced. Creates target asset records with copied EXIF, CLIP embeddings, faces, and hardlinked thumbnails.
+1b. **Album assignment** — Adds newly synced assets to the target album (if configured). Backfills any previously synced assets that are missing from the album.
 2. **Incremental faces** — Detects face updates on already-synced assets (using a watermark timestamp) and copies new faces.
 3. **Person metadata** — Syncs person name changes, visibility (`isHidden`), and thumbnail updates from source to target.
-4. **Cleanup** — Removes target assets whose source was deleted or trashed. Detects person merges (face reassignment). Removes orphaned target persons.
+4. **Cleanup** — Removes target assets (and their album entries) whose source was deleted or trashed. Detects person merges (face reassignment). Removes orphaned target persons.
 
 ## Caveats
 
@@ -208,14 +311,15 @@ docker inspect immich_postgres --format '{{range .NetworkSettings.Networks}}{{.I
 ```
 src/
   main.py          — Entry point: config validation, health check, concurrent loops
-  sync_engine.py   — Orchestrates 4-phase sync cycle
+  sync_engine.py   — Orchestrates 5-phase sync cycle
   asset_sync.py    — Asset record creation, EXIF copy, path remapping
   ml_sync.py       — Face and embedding sync
   person_sync.py   — Person mirroring, name/visibility sync
+  album_sync.py    — Album assignment and backfill
   cleanup.py       — Deletion detection and cleanup
   file_ops.py      — Hardlink creation and removal
   db.py            — asyncpg connection pool and transaction helpers
-  config.py        — Pydantic Settings for environment variables
+  config.py        — SyncJob dataclass, Pydantic Settings for environment variables
   immich_api.py    — Immich REST API client (health check)
   health.py        — TCP health check server
 ```

@@ -26,6 +26,13 @@ services:
       SHARED_PATH_PREFIX: ${SHARED_PATH_PREFIX}
       TARGET_PATH_PREFIX: ${TARGET_PATH_PREFIX}
 
+      UPLOAD_SOURCE_USER_ID: ${UPLOAD_SOURCE_USER_ID:-}
+      UPLOAD_TARGET_USER_ID: ${UPLOAD_TARGET_USER_ID:-}
+      UPLOAD_TARGET_LIBRARY_ID: ${UPLOAD_TARGET_LIBRARY_ID:-}
+      TARGET_UPLOAD_PATH_PREFIX: ${TARGET_UPLOAD_PATH_PREFIX:-}
+
+      TARGET_ALBUM_ID: ${TARGET_ALBUM_ID:-}
+
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     volumes:
       # Must match Immich's upload and external library mounts (both host path and container path)
