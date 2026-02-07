@@ -389,6 +389,8 @@ Each sync cycle runs five phases:
 
 ### Development Setup
 
+This is optional — the sidecar runs entirely in Docker and `setup.py` uses only the Python standard library. A local venv is only useful for IDE autocomplete, linting, and syntax checking.
+
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
