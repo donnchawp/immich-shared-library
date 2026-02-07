@@ -395,6 +395,22 @@ source .venv/bin/activate
 pip install -e .
 ```
 
+### Utility Scripts
+
+The utility scripts read configuration from `.env` (the same file used by `docker compose`). Since the Immich PostgreSQL container doesn't expose port 5432 by default, they must run inside a Docker container on the Immich network. `run-utility.sh` handles the Docker invocation:
+
+```bash
+./run-utility.sh test_sync.py
+./run-utility.sh dedup_synced.py --match-time
+./run-utility.sh delete_synced.py
+```
+
+- **`test_sync.py`** — Run a single sync cycle and print verification queries.
+- **`delete_synced.py`** — Delete all synced assets for a target user. Does not mark sources as skipped, so running the sync engine again will recreate everything. Useful for resetting a target account.
+- **`dedup_synced.py`** — Detect and remove synced assets that duplicate the target user's own uploads (matched by filename + capture date). Use `--match-time` to compare the full timestamp (with TZ normalisation) instead of just the date. Marks duplicates as skipped so the sync engine won't recreate them.
+
+`delete_synced.py` and `dedup_synced.py` are interactive: they show a summary and prompt for confirmation before making changes, with a dry-run option.
+
 ### Testing
 
 1. Run the setup wizard to configure your `.env` and connect to a local Immich instance:
@@ -424,22 +440,6 @@ pip install -e .
    ```
 
 6. Run `test_sync.py` again — it will recreate the deleted assets, confirming the full round-trip works.
-
-### Utility Scripts
-
-The utility scripts read configuration from `.env` (the same file used by `docker compose`). Since the Immich PostgreSQL container doesn't expose port 5432 by default, they must run inside a Docker container on the Immich network. `run-utility.sh` handles the Docker invocation:
-
-```bash
-./run-utility.sh test_sync.py
-./run-utility.sh dedup_synced.py --match-time
-./run-utility.sh delete_synced.py
-```
-
-- **`test_sync.py`** — Run a single sync cycle and print verification queries.
-- **`delete_synced.py`** — Delete all synced assets for a target user. Does not mark sources as skipped, so running the sync engine again will recreate everything. Useful for resetting a target account.
-- **`dedup_synced.py`** — Detect and remove synced assets that duplicate the target user's own uploads (matched by filename + capture date). Use `--match-time` to compare the full timestamp (with TZ normalisation) instead of just the date. Marks duplicates as skipped so the sync engine won't recreate them.
-
-`delete_synced.py` and `dedup_synced.py` are interactive: they show a summary and prompt for confirmation before making changes, with a dry-run option.
 
 ### Project Structure
 
