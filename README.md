@@ -4,7 +4,9 @@ A Docker sidecar service that syncs a subset of [Immich](https://immich.app/) ph
 
 ## The Problem
 
-Immich's partner sharing is all-or-nothing: you share your entire library or nothing. The common workaround is symlinking an external library directory so both users point at the same photos. This works — both users see the photos — but Immich processes each user's assets independently through the full ML pipeline:
+Immich's built-in partner sharing lets you view another user's library, but it's limited: you share your entire library or nothing, and face recognition doesn't work on partner-shared photos — you can't search for or browse by people in your partner's library.
+
+The common workaround is symlinking an external library directory so both users point at the same photos. This gives each user their own copy of the assets with full face recognition support, but Immich processes each user's assets independently through the full ML pipeline:
 
 | Per-asset work | Symlink only | With sidecar |
 |---|---|---|
