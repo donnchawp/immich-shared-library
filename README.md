@@ -53,11 +53,43 @@ Both sync methods run together in the same sidecar, syncing into Alice's and Bob
 
 ## Setup
 
-### 1. Create an API key
+### Quick Setup (Recommended)
+
+The interactive setup wizard handles everything: connecting to Immich, detecting paths, creating symlinks and libraries, and generating the `.env` file.
+
+**Prerequisites:** Create an admin API key in Immich (**Account Settings > API Keys**) and have `python3` installed on the host.
+
+```bash
+python3 setup.py
+```
+
+The wizard will:
+
+1. Connect to your Immich server and verify admin access
+2. Auto-detect volume mount paths from Immich's `docker-compose.yml`
+3. Let you choose which sync method(s) to configure (external library, upload sync, or both)
+4. Walk you through selecting source/target users
+5. Create the necessary symlinks and external libraries in Immich (with `**/*` exclusion so Immich won't scan them)
+6. Optionally set up album assignment
+7. Generate a `.env` file with all the correct UUIDs and path prefixes
+
+Once the wizard completes, start the sidecar:
+
+```bash
+docker compose up -d
+```
+
+If you already have a `.env` file, re-running the wizard will use your existing values as defaults and let you add or reconfigure sync methods.
+
+### Manual Setup
+
+If the wizard doesn't suit your environment, or you need to understand what each setting does (useful for troubleshooting), follow the manual steps below.
+
+#### 1. Create an API key
 
 In Immich, go to **Account Settings > API Keys** and create a key.
 
-### 2. Configure environment
+#### 2. Configure environment
 
 ```bash
 cp .env.example .env
@@ -76,7 +108,7 @@ IMMICH_API_KEY=your-immich-api-key
 TARGET_USER_ID=yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy
 ```
 
-### 3. Find UUIDs
+#### 3. Find UUIDs
 
 **User IDs:** In the Immich web UI, go to **Administration > Users** and click on a username. The UUID appears in the URL: `/admin/users/{UUID}`.
 
