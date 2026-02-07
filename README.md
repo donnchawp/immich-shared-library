@@ -87,6 +87,50 @@ docker compose up -d
 
 If you already have a `.env` file, re-running the wizard will use your existing values as defaults and let you add or reconfigure sync methods.
 
+### Multi-Job Configuration (config.yaml)
+
+For setups with more than one sync job, or for cleaner configuration, create a `config.yaml` file. This separates per-job settings from infrastructure settings (which stay in `.env`).
+
+```yaml
+# config.yaml
+sync_jobs:
+  - name: "alice-external-to-bob"
+    source_user_id: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    target_user_id: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    target_library_id: "llllllll-llll-llll-llll-llllllllllll"
+    source_path_prefix: "/external_library/alice/photos/"
+    target_path_prefix: "/external_library/bob_shared/photos/"
+    album_id: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"  # optional, per-job
+
+  - name: "charlie-uploads-to-alice"
+    source_user_id: "cccccccc-cccc-cccc-cccc-cccccccccccc"
+    target_user_id: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    target_library_id: "mmmmmmmm-mmmm-mmmm-mmmm-mmmmmmmmmmmm"
+    source_path_prefix: "/usr/src/app/upload/library/cccccccc-cccc-cccc-cccc-cccccccccccc/"
+    target_path_prefix: "/external_library/alice_uploads/charlie/"
+```
+
+```env
+# .env (infrastructure only)
+DB_PASSWORD=postgres
+UPLOAD_LOCATION=../immich-app/library
+EXTERNAL_LIBRARY_DIR=../immich-app/external_library
+IMMICH_API_KEY=your-key
+```
+
+Mount the config file in `docker-compose.yml` by uncommenting the volume line:
+
+```yaml
+volumes:
+  - ./config.yaml:/app/config.yaml:ro
+```
+
+The setup wizard (`python3 setup.py`) generates both files and enables the volume mount automatically.
+
+**Backward compatibility:** If no `config.yaml` exists, the sidecar falls back to per-job environment variables (`SOURCE_USER_ID`, `TARGET_USER_ID`, etc.) — existing `.env`-only deployments continue to work unchanged.
+
+> **Migrating from env vars to config.yaml:** Create a `config.yaml` with your job(s), move album config from `TARGET_ALBUM_ID` to per-job `album_id`, add the volume mount to `docker-compose.yml`, and remove the per-job env vars from `.env`. Re-running `python3 setup.py` does this automatically.
+
 ### Manual Setup
 
 If the wizard doesn't suit your environment, or you need to understand what each setting does (useful for troubleshooting), follow the manual steps below.
@@ -238,15 +282,29 @@ The sidecar automatically derives the source path prefix from the upload locatio
 
 ## Optional: Album Assignment
 
-To have all synced assets (from both sync methods) automatically added to an album in the target user's account, create the album first in Immich, then add its UUID to `.env`:
+To have synced assets automatically added to an album in the target user's account, create the album first in Immich, then configure it.
+
+**With config.yaml (recommended):** Add `album_id` to each job that needs it. Different jobs can target different albums:
+
+```yaml
+sync_jobs:
+  - name: "alice-to-bob"
+    # ...
+    album_id: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"  # Bob's album
+  - name: "charlie-to-alice"
+    # ...
+    album_id: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"  # Alice's album
+```
+
+**With env vars (legacy):** Add `TARGET_ALBUM_ID` to `.env` — this applies the same album to all jobs:
 
 ```env
 TARGET_ALBUM_ID=aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa
 ```
 
-The album must be owned by the target user.
+The album must be owned by the job's target user.
 
-If you add `TARGET_ALBUM_ID` after assets have already been synced, the sidecar will backfill all previously synced assets into the album on the next cycle. When a source asset is deleted, its album entry is also removed during cleanup.
+If you add an album after assets have already been synced, the sidecar will backfill all previously synced assets into the album on the next cycle. When a source asset is deleted, its album entry is also removed during cleanup.
 
 ## Start the Sidecar
 
@@ -265,6 +323,22 @@ The sidecar will:
 
 ## Configuration Reference
 
+### config.yaml (per-job settings)
+
+Each job in `sync_jobs` supports these fields:
+
+| Field | Required | Description |
+|---|---|---|
+| `name` | Yes | Unique name for this sync job |
+| `source_user_id` | Yes | UUID of the source user |
+| `target_user_id` | Yes | UUID of the target user (receives synced copies) |
+| `target_library_id` | Yes | UUID of the target user's external library (with `**/*` exclusion) |
+| `source_path_prefix` | Yes | Path prefix for source assets inside the container |
+| `target_path_prefix` | Yes | Path prefix for target assets inside the container |
+| `album_id` | No | UUID of album to add synced assets to (must be owned by target user) |
+
+### .env (infrastructure settings)
+
 | Variable | Default | Description |
 |---|---|---|
 | `UPLOAD_LOCATION` | *(required)* | Host path to Immich's upload/data directory (e.g., `../immich-app/library`) |
@@ -273,23 +347,26 @@ The sidecar will:
 | `DB_USERNAME` | `postgres` | PostgreSQL username |
 | `DB_DATABASE_NAME` | `immich` | PostgreSQL database name |
 | `IMMICH_API_KEY` | *(required)* | Immich API key |
-| `TARGET_USER_ID` | *(required)* | UUID of the target user |
-| **External library sync** | | *Required if `SHARED_PATH_PREFIX` is set* |
-| `SOURCE_USER_ID` | | UUID of the source user (external library) |
-| `TARGET_LIBRARY_ID` | | UUID of the target user's external library |
-| `SHARED_PATH_PREFIX` | | Path prefix for source assets inside the container (e.g., `/external_library/user_a/shared/`) |
-| `TARGET_PATH_PREFIX` | | Path prefix for target assets inside the container (e.g., `/external_library/user_b/shared/`) |
-| **Upload sync** | | *Required if `UPLOAD_SOURCE_USER_ID` is set* |
-| `UPLOAD_SOURCE_USER_ID` | | UUID of the source user whose uploads to sync |
-| `UPLOAD_TARGET_LIBRARY_ID` | | UUID of a separate external library for the target user (with `**/*` exclusion) |
-| `TARGET_UPLOAD_PATH_PREFIX` | | Path prefix where the upload symlink maps into the external library |
-| **Album** | | |
-| `TARGET_ALBUM_ID` | | UUID of album to add all synced assets to (must be owned by target user) |
-| **General** | | |
 | `SYNC_INTERVAL_SECONDS` | `60` | Seconds between sync cycles |
 | `LOG_LEVEL` | `INFO` | Logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
 
-At least one of `SHARED_PATH_PREFIX` or `UPLOAD_SOURCE_USER_ID` must be set. Both can be configured simultaneously to sync from multiple sources.
+### Legacy env vars (when config.yaml is not present)
+
+When no `config.yaml` file exists, the sidecar falls back to these per-job env vars:
+
+| Variable | Description |
+|---|---|
+| `TARGET_USER_ID` | UUID of the target user |
+| `SOURCE_USER_ID` | UUID of the source user (external library sync) |
+| `TARGET_LIBRARY_ID` | UUID of the target user's external library |
+| `SHARED_PATH_PREFIX` | Source path prefix (external library sync) |
+| `TARGET_PATH_PREFIX` | Target path prefix (external library sync) |
+| `UPLOAD_SOURCE_USER_ID` | UUID of the source user (upload sync) |
+| `UPLOAD_TARGET_LIBRARY_ID` | UUID of a separate external library (upload sync) |
+| `TARGET_UPLOAD_PATH_PREFIX` | Target path prefix (upload sync) |
+| `TARGET_ALBUM_ID` | UUID of album (applies to all jobs) |
+
+At least one of `SHARED_PATH_PREFIX` or `UPLOAD_SOURCE_USER_ID` must be set. Both can be configured simultaneously.
 
 ## How the Sync Works
 
@@ -377,7 +454,7 @@ src/
   cleanup.py       — Deletion detection and cleanup
   file_ops.py      — Hardlink creation and removal
   db.py            — asyncpg connection pool and transaction helpers
-  config.py        — SyncJob dataclass, Pydantic Settings for environment variables
+  config.py        — SyncJob dataclass, YAML loader, Pydantic Settings (env var fallback)
   immich_api.py    — Immich REST API client (health check)
   health.py        — TCP health check server
 ```

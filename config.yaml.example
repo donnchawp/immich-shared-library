@@ -1,0 +1,26 @@
+# Sync job configuration for immich-shared-library
+#
+# Each job syncs assets from a source user to a target user.
+# Infrastructure settings (DB, API key, paths, intervals) stay in .env.
+#
+# If this file does not exist, the sidecar falls back to env vars
+# (SOURCE_USER_ID, TARGET_USER_ID, etc.) for backward compatibility.
+
+sync_jobs:
+  # External library sync: share a subset of one user's external library
+  - name: "alice-external-to-bob"
+    source_user_id: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    target_user_id: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    target_library_id: "llllllll-llll-llll-llll-llllllllllll"
+    source_path_prefix: "/external_library/alice/photos/"
+    target_path_prefix: "/external_library/bob_shared/photos/"
+    # album_id: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"  # optional
+
+  # Upload sync: sync one user's app/web uploads to another user
+  # - name: "charlie-uploads-to-alice"
+  #   source_user_id: "cccccccc-cccc-cccc-cccc-cccccccccccc"
+  #   target_user_id: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+  #   target_library_id: "mmmmmmmm-mmmm-mmmm-mmmm-mmmmmmmmmmmm"
+  #   source_path_prefix: "/usr/src/app/upload/library/cccccccc-cccc-cccc-cccc-cccccccccccc/"
+  #   target_path_prefix: "/external_library/alice_uploads/charlie/"
+  #   album_id: "yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy"  # optional, per-job

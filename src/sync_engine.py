@@ -28,10 +28,12 @@ async def run_full_sync() -> dict:
         "album_assets_added": 0,
     }
 
-    new_target_ids: list[UUID] = []
+    # Track new target asset IDs per job (for per-job album assignment)
+    job_target_ids: dict[str, list[UUID]] = {}
 
     # Phase 1: Sync new assets (per job, in batches to limit memory usage)
     for job in settings.sync_jobs:
+        job_ids: list[UUID] = []
         while True:
             async with transaction() as conn:
                 source_assets = await get_unsynced_source_assets(conn, job)
@@ -53,19 +55,24 @@ async def run_full_sync() -> dict:
                     target_id = await sync_asset(conn, source, job)
                     if target_id is not None:
                         stats["assets_synced"] += 1
-                        new_target_ids.append(target_id)
+                        job_ids.append(target_id)
                         stats["faces_synced"] += await sync_faces_for_asset(
                             conn, source["id"], target_id,
                             job.source_user_id, job.target_user_id,
                         )
             if len(source_assets) < 500:
                 break
+        if job_ids:
+            job_target_ids[job.name] = job_ids
 
-    # Phase 1b: Album assignment (new + backfill)
-    if settings.target_album_uid:
+    # Phase 1b: Per-job album assignment (new + backfill)
+    for job in settings.sync_jobs:
+        if not job.album_id:
+            continue
         async with transaction() as conn:
-            stats["album_assets_added"] += await add_assets_to_album(conn, new_target_ids)
-            stats["album_assets_added"] += await backfill_album(conn)
+            new_ids = job_target_ids.get(job.name, [])
+            stats["album_assets_added"] += await add_assets_to_album(conn, new_ids, job.album_id)
+            stats["album_assets_added"] += await backfill_album(conn, job.album_id, job.target_user_id)
 
     # Phase 2: Incremental face sync (catch new/updated faces on existing assets)
     async with transaction() as conn:

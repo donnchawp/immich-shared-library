@@ -20,11 +20,12 @@ services:
 
       SYNC_INTERVAL_SECONDS: ${SYNC_INTERVAL_SECONDS:-60}
 
-      SOURCE_USER_ID: ${SOURCE_USER_ID}
-      TARGET_USER_ID: ${TARGET_USER_ID}
-      TARGET_LIBRARY_ID: ${TARGET_LIBRARY_ID}
-      SHARED_PATH_PREFIX: ${SHARED_PATH_PREFIX}
-      TARGET_PATH_PREFIX: ${TARGET_PATH_PREFIX}
+      # Legacy per-job env vars (used when config.yaml is not present)
+      SOURCE_USER_ID: ${SOURCE_USER_ID:-}
+      TARGET_USER_ID: ${TARGET_USER_ID:-}
+      TARGET_LIBRARY_ID: ${TARGET_LIBRARY_ID:-}
+      SHARED_PATH_PREFIX: ${SHARED_PATH_PREFIX:-}
+      TARGET_PATH_PREFIX: ${TARGET_PATH_PREFIX:-}
 
       UPLOAD_SOURCE_USER_ID: ${UPLOAD_SOURCE_USER_ID:-}
       UPLOAD_TARGET_USER_ID: ${UPLOAD_TARGET_USER_ID:-}
@@ -38,6 +39,8 @@ services:
       # Must match Immich's upload and external library mounts (both host path and container path)
       - ${UPLOAD_LOCATION}:${UPLOAD_LOCATION_MOUNT:-/usr/src/app/upload}
       - ${EXTERNAL_LIBRARY_DIR}:${EXTERNAL_LIBRARY_MOUNT:-/external_library}
+      # Uncomment to use config.yaml for multi-job configuration:
+      - ./config.yaml:/app/config.yaml:ro
     networks:
       - immich
     restart: always

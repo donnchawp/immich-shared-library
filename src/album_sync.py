@@ -4,19 +4,16 @@ from uuid import UUID
 
 import asyncpg
 
-from src.config import settings
-
 logger = logging.getLogger(__name__)
 
 
-async def add_assets_to_album(conn: asyncpg.Connection, asset_ids: list[UUID]) -> int:
+async def add_assets_to_album(conn: asyncpg.Connection, asset_ids: list[UUID], album_id: UUID | None) -> int:
     """Add newly synced assets to the target album.
 
-    Skips if target_album_id is not configured. Uses ON CONFLICT DO NOTHING
+    Skips if album_id is None or asset_ids is empty. Uses ON CONFLICT DO NOTHING
     for idempotency.
     Returns the number of assets added.
     """
-    album_id = settings.target_album_uid
     if album_id is None or not asset_ids:
         return 0
 
@@ -44,14 +41,13 @@ async def add_assets_to_album(conn: asyncpg.Connection, asset_ids: list[UUID]) -
     return count
 
 
-async def backfill_album(conn: asyncpg.Connection) -> int:
+async def backfill_album(conn: asyncpg.Connection, album_id: UUID | None, target_user_id: UUID) -> int:
     """Add all previously synced assets that are missing from the target album.
 
-    This handles the case where TARGET_ALBUM_ID is configured after assets
-    have already been synced.
+    Scoped to a specific target user so each job only backfills its own assets.
+    This handles the case where album_id is configured after assets have already been synced.
     Returns the number of assets added.
     """
-    album_id = settings.target_album_uid
     if album_id is None:
         return 0
 
@@ -60,13 +56,15 @@ async def backfill_album(conn: asyncpg.Connection) -> int:
         INSERT INTO album_asset ("albumId", "assetId")
         SELECT $1, m.target_asset_id
         FROM _face_sync_asset_map m
-        WHERE NOT EXISTS (
+        WHERE m.target_user_id = $2
+        AND NOT EXISTS (
             SELECT 1 FROM album_asset aa
             WHERE aa."albumId" = $1 AND aa."assetId" = m.target_asset_id
         )
         RETURNING "assetId"
         """,
         album_id,
+        target_user_id,
     )
 
     count = len(rows)

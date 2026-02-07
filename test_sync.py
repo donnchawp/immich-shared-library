@@ -10,7 +10,6 @@ import asyncio
 import os
 import sys
 from pathlib import Path
-from uuid import UUID
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(__file__))
@@ -29,19 +28,29 @@ for line in env_file.read_text().splitlines():
     if key and value:
         os.environ.setdefault(key.strip(), value.strip())
 
+# Point CONFIG_FILE at local config.yaml if it exists
+config_yaml = Path(__file__).parent / "config.yaml"
+if config_yaml.is_file():
+    os.environ.setdefault("CONFIG_FILE", str(config_yaml))
+
 os.environ.setdefault("SYNC_INTERVAL_SECONDS", "9999")
 os.environ.setdefault("LOG_LEVEL", "DEBUG")
 
 import logging
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", stream=sys.stdout)
 
+from src.config import settings
 from src.db import init_pool, close_pool
 from src.main import ensure_tracking_tables
 from src.sync_engine import run_full_sync
 
 
 async def main():
-    target_user_id = UUID(os.environ["TARGET_USER_ID"])
+    # Use first sync job's target user for verification queries
+    if not settings.sync_jobs:
+        print("Error: No sync jobs configured. Check your config.yaml or .env.")
+        sys.exit(1)
+    target_user_id = settings.sync_jobs[0].target_user_id
 
     print("=== Initializing database pool ===")
     await init_pool()

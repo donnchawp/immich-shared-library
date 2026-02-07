@@ -166,6 +166,38 @@ def load_env_file(path: Path) -> dict[str, str]:
     return env
 
 
+def load_config_yaml(path: Path) -> list[dict]:
+    """Parse config.yaml and return the list of job dicts.
+
+    Uses line-based parsing — no YAML library needed on the host.
+    Returns an empty list if the file doesn't exist or can't be parsed.
+    """
+    if not path.is_file():
+        return []
+    try:
+        jobs = []
+        current_job = None
+        for line in path.read_text().splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if stripped.startswith("- name:"):
+                if current_job is not None:
+                    jobs.append(current_job)
+                current_job = {"name": stripped.split(":", 1)[1].strip().strip('"').strip("'")}
+            elif current_job is not None and ":" in stripped and not stripped.startswith("-"):
+                key, _, value = stripped.partition(":")
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                if value and not value.startswith("#"):
+                    current_job[key] = value
+        if current_job is not None:
+            jobs.append(current_job)
+        return jobs
+    except Exception:
+        return []
+
+
 def extract_volumes_from_compose(compose_path: Path) -> list[str] | None:
     """Extract volume mount strings from the immich-server service in a docker-compose.yml.
 
@@ -323,7 +355,7 @@ def select_target_user(users: list[dict], source_user: dict) -> dict:
 
 
 def step_detect_paths(existing: dict[str, str]) -> dict[str, str]:
-    """Step 3: Detect or ask for paths."""
+    """Step 2: Detect or ask for paths."""
     print("\n═══ Step 2: Configure paths ═══\n")
 
     # If we already have paths from a previous run, offer to reuse them
@@ -385,97 +417,6 @@ def step_detect_paths(existing: dict[str, str]) -> dict[str, str]:
     return paths
 
 
-def step_choose_sync_methods(existing: dict[str, str]) -> tuple[list[str], dict | None, dict | None]:
-    """Step 4: Choose sync method(s).
-
-    Returns (methods_to_configure, existing_external, existing_upload) where existing_*
-    are dicts of preserved config for methods already configured and not being reconfigured.
-    """
-    print("\n═══ Step 3: Choose sync method(s) ═══\n")
-
-    has_external = bool(existing.get("SHARED_PATH_PREFIX"))
-    has_upload = bool(existing.get("UPLOAD_SOURCE_USER_ID"))
-
-    # Show what's already configured
-    if has_external or has_upload:
-        print("  Already configured:")
-        if has_external:
-            print(f"    - External Library Sync (source: {existing.get('SOURCE_USER_ID', '?')})")
-        if has_upload:
-            print(f"    - Internal Library Sync (source: {existing.get('UPLOAD_SOURCE_USER_ID', '?')})")
-        print()
-
-    if has_external and has_upload:
-        print("  Both sync methods are already configured.")
-        print("  1. Reconfigure everything")
-        print("  2. Keep current configuration")
-        while True:
-            choice = input("\nEnter number: ").strip()
-            if choice == "1":
-                return ["external", "upload"], None, None
-            elif choice == "2":
-                return [], _extract_external(existing), _extract_upload(existing)
-            print("  Please enter 1 or 2.")
-
-    if has_external and not has_upload:
-        print("  1. Add Internal Library Sync — keep external library sync, add internal library sync")
-        print("  2. Reconfigure everything    — start fresh")
-        while True:
-            choice = input("\nEnter number: ").strip()
-            if choice == "1":
-                return ["upload"], _extract_external(existing), None
-            elif choice == "2":
-                return ["external", "upload"], None, None
-            print("  Please enter 1 or 2.")
-
-    if has_upload and not has_external:
-        print("  1. Add External Library Sync — keep internal library sync, add external library sync")
-        print("  2. Reconfigure everything    — start fresh")
-        while True:
-            choice = input("\nEnter number: ").strip()
-            if choice == "1":
-                return ["external"], None, _extract_upload(existing)
-            elif choice == "2":
-                return ["external", "upload"], None, None
-            print("  Please enter 1 or 2.")
-
-    # Nothing configured yet
-    print("  1. External Library Sync    — sync from a user's external library")
-    print("  2. Internal Library Sync   — sync from a user's app/web uploads")
-    print("  3. Both")
-    while True:
-        choice = input("\nEnter number: ").strip()
-        if choice == "1":
-            return ["external"], None, None
-        elif choice == "2":
-            return ["upload"], None, None
-        elif choice == "3":
-            return ["external", "upload"], None, None
-        print("  Please enter 1, 2, or 3.")
-
-
-def _extract_external(env: dict[str, str]) -> dict:
-    """Extract external library sync config from existing .env values."""
-    return {
-        "target_user_id": env.get("TARGET_USER_ID", ""),
-        "source_user_id": env.get("SOURCE_USER_ID", ""),
-        "target_library_id": env.get("TARGET_LIBRARY_ID", ""),
-        "shared_path_prefix": env.get("SHARED_PATH_PREFIX", ""),
-        "target_path_prefix": env.get("TARGET_PATH_PREFIX", ""),
-    }
-
-
-def _extract_upload(env: dict[str, str]) -> dict:
-    """Extract upload sync config from existing .env values."""
-    return {
-        "target_user_id": env.get("TARGET_USER_ID", ""),
-        "upload_target_user_id": env.get("UPLOAD_TARGET_USER_ID", ""),
-        "upload_source_user_id": env.get("UPLOAD_SOURCE_USER_ID", ""),
-        "upload_target_library_id": env.get("UPLOAD_TARGET_LIBRARY_ID", ""),
-        "target_upload_path_prefix": env.get("TARGET_UPLOAD_PATH_PREFIX", ""),
-    }
-
-
 def find_or_create_library(
     client: ImmichClient, target_user: dict, import_path: str, default_name: str
 ) -> dict:
@@ -518,11 +459,12 @@ def find_or_create_library(
     return library
 
 
-def step_external_library_sync(
-    client: ImmichClient, users: list[dict], paths: dict
+def configure_external_library_job(
+    client: ImmichClient, users: list[dict], paths: dict,
+    existing_job: dict | None = None,
 ) -> dict:
-    """Step 5a: Configure External Library Sync."""
-    print("\n═══ Step 4a: External Library Sync ═══\n")
+    """Configure an external library sync job. Returns a job config dict."""
+    print("\n── External Library Sync ──\n")
 
     print("Select the source user (whose external library to sync from):\n")
     source_user = pick_from_list(users, user_label, user_detail)
@@ -593,20 +535,21 @@ def step_external_library_sync(
     target_prefix = f"{ext_lib_container}/{target_path.rstrip('/')}/"
 
     return {
-        "target_user_id": target_user["id"],
+        "type": "external",
         "source_user_id": source_user["id"],
+        "target_user_id": target_user["id"],
         "target_library_id": library["id"],
-        "shared_path_prefix": shared_prefix,
+        "source_path_prefix": shared_prefix,
         "target_path_prefix": target_prefix,
     }
 
 
-def step_internal_library_sync(
+def configure_upload_sync_job(
     client: ImmichClient, users: list[dict], paths: dict,
-    external_config: dict | None = None,
+    exclude_library_ids: list[str] | None = None,
 ) -> dict:
-    """Step 5b: Configure Internal Library Sync."""
-    print("\n═══ Step 4b: Internal Library Sync ═══\n")
+    """Configure an internal library (upload) sync job. Returns a job config dict."""
+    print("\n── Internal Library Sync ──\n")
 
     print("Select the source user (whose internal library to sync):\n")
     source_user = pick_from_list(users, user_label, user_detail)
@@ -652,14 +595,13 @@ def step_internal_library_sync(
         import_path = ext_lib_container
 
     # Find existing libraries with **/* exclusion (not scanning for new files)
-    # Exclude the external library sync's library — it needs to monitor for changes
-    exclude_lib_id = external_config.get("target_library_id") if external_config else None
+    exclude_ids = set(exclude_library_ids or [])
     libraries = client.get_libraries()
     candidates = [
         lib for lib in libraries
         if lib.get("ownerId") == target_user["id"]
         and "**/*" in lib.get("exclusionPatterns", [])
-        and lib["id"] != exclude_lib_id
+        and lib["id"] not in exclude_ids
     ]
 
     library = None
@@ -690,28 +632,96 @@ def step_internal_library_sync(
         library = client.create_library(target_user["id"], lib_name, [import_path])
         print(f"  Library created: {library['id']}")
 
+    # Source path prefix: internal library path in the container
+    source_prefix = f"{upload_container}/library/{source_user['id']}/"
     # Target path prefix in the container
     target_upload_prefix = f"{ext_lib_container}/{target_path.rstrip('/')}/"
 
     return {
+        "type": "upload",
+        "source_user_id": source_user["id"],
         "target_user_id": target_user["id"],
-        "upload_source_user_id": source_user["id"],
-        "upload_target_library_id": library["id"],
-        "target_upload_path_prefix": target_upload_prefix,
+        "target_library_id": library["id"],
+        "source_path_prefix": source_prefix,
+        "target_path_prefix": target_upload_prefix,
     }
 
 
-def step_album(client: ImmichClient, existing: dict[str, str]) -> str | None:
-    """Step 6: Optional album assignment."""
-    print("\n═══ Step 5: Album assignment (optional) ═══\n")
+def step_configure_jobs(
+    client: ImmichClient, users: list[dict], paths: dict,
+    existing_jobs: list[dict],
+) -> list[dict]:
+    """Step 3: Configure sync jobs in a loop."""
+    print("\n═══ Step 3: Configure sync jobs ═══\n")
 
-    existing_album = existing.get("TARGET_ALBUM_ID", "")
-    if existing_album:
-        print(f"  Currently configured: {existing_album}")
-        if prompt_yes_no("  Keep this album?"):
-            return existing_album
+    if existing_jobs:
+        print("  Existing jobs:")
+        for j in existing_jobs:
+            album_str = f", album={j.get('album_id', '')}" if j.get("album_id") else ""
+            print(f"    - {j.get('name', '?')}: {j.get('source_user_id', '?')[:8]}... -> {j.get('target_user_id', '?')[:8]}...{album_str}")
+        if prompt_yes_no("\n  Keep existing jobs and add more?"):
+            jobs = list(existing_jobs)
+        else:
+            jobs = []
+    else:
+        jobs = []
 
-    if not prompt_yes_no("Add synced assets to an album?", default=False):
+    # Collect library IDs already used (to avoid reusing them)
+    used_library_ids = [j.get("target_library_id", "") for j in jobs]
+
+    while True:
+        print(f"\n  Jobs configured so far: {len(jobs)}")
+        if jobs:
+            for j in jobs:
+                print(f"    - {j.get('name', '?')}")
+
+        if not jobs:
+            print("\n  What type of sync job do you want to add?")
+        else:
+            print("\n  Add another sync job?")
+            if not prompt_yes_no("  Add another job?", default=False):
+                break
+            print()
+
+        print("  1. External Library Sync — sync from a user's external library")
+        print("  2. Internal Library Sync — sync from a user's app/web uploads")
+        while True:
+            choice = input("\nEnter number: ").strip()
+            if choice in ("1", "2"):
+                break
+            print("  Please enter 1 or 2.")
+
+        if choice == "1":
+            job = configure_external_library_job(client, users, paths)
+        else:
+            job = configure_upload_sync_job(client, users, paths, used_library_ids)
+
+        # Give the job a name
+        default_name = f"job-{len(jobs) + 1}"
+        if job["type"] == "external":
+            default_name = f"external-{len(jobs) + 1}"
+        elif job["type"] == "upload":
+            default_name = f"upload-{len(jobs) + 1}"
+        job["name"] = prompt("Job name", default_name)
+
+        # Per-job album assignment
+        album_id = step_album_for_job(client, job["name"])
+        if album_id:
+            job["album_id"] = album_id
+
+        jobs.append(job)
+        used_library_ids.append(job.get("target_library_id", ""))
+
+    if not jobs:
+        print("\n  Error: At least one sync job is required.")
+        sys.exit(1)
+
+    return jobs
+
+
+def step_album_for_job(client: ImmichClient, job_name: str) -> str | None:
+    """Optional: assign an album to a specific job."""
+    if not prompt_yes_no(f"  Add synced assets to an album for job '{job_name}'?", default=False):
         return None
 
     print("\n  1. Create a new album")
@@ -739,58 +749,54 @@ def step_album(client: ImmichClient, existing: dict[str, str]) -> str | None:
         )
         return selected["id"]
     else:
-        print("  Skipping album setup.")
         return None
 
 
 def step_database(existing: dict[str, str]) -> str:
-    """Step 7: Database settings."""
-    print("\n═══ Step 6: Database settings ═══\n")
+    """Step 4: Database settings."""
+    print("\n═══ Step 4: Database settings ═══\n")
     print("The sidecar connects to Immich's PostgreSQL database.")
     print("The hostname is resolved automatically inside Docker (immich_postgres).\n")
     db_password = prompt_secret("Database password", existing.get("DB_PASSWORD", "postgres"))
     return db_password
 
 
+def generate_config_yaml(jobs: list[dict]) -> str:
+    """Generate config.yaml content from a list of job dicts.
+
+    Uses string formatting (no pyyaml needed on host).
+    """
+    lines = [
+        "# Sync job configuration for immich-shared-library",
+        "",
+        "sync_jobs:",
+    ]
+
+    for job in jobs:
+        lines.append(f'  - name: "{job["name"]}"')
+        lines.append(f'    source_user_id: "{job["source_user_id"]}"')
+        lines.append(f'    target_user_id: "{job["target_user_id"]}"')
+        lines.append(f'    target_library_id: "{job["target_library_id"]}"')
+        lines.append(f'    source_path_prefix: "{job["source_path_prefix"]}"')
+        lines.append(f'    target_path_prefix: "{job["target_path_prefix"]}"')
+        if job.get("album_id"):
+            lines.append(f'    album_id: "{job["album_id"]}"')
+        lines.append("")
+
+    return "\n".join(lines)
+
+
 def generate_env(
     *,
     api_key: str,
     paths: dict[str, str],
-    external: dict | None,
-    upload: dict | None,
-    album_id: str | None,
     db_password: str,
 ) -> str:
-    """Generate .env file content."""
-    # Derive TARGET_USER_ID and UPLOAD_TARGET_USER_ID
-    ext_target = external["target_user_id"] if external else ""
-    upload_target = upload["target_user_id"] if upload else ""
-    upload_target_override = upload.get("upload_target_user_id", "") if upload else ""
-
-    # TARGET_USER_ID comes from external config, or upload if no external
-    target_user_id = ext_target or upload_target_override or upload_target
-
-    # Determine if upload needs its own UPLOAD_TARGET_USER_ID
-    upload_needs_own_target = False
-    if upload and external and upload_target != ext_target:
-        upload_needs_own_target = True
-        # upload_target_user_id is the upload's target (which differs from external's)
-        upload_target_user_id = upload_target_override or upload_target
-    elif upload and not external:
-        # No external sync — TARGET_USER_ID will be the upload target, no override needed
-        upload_needs_own_target = False
-        upload_target_user_id = ""
-    else:
-        upload_target_user_id = upload_target_override or ""
-
-    # If there's an explicit override from a previous config, preserve it
-    if upload_target_override and upload_target_override != target_user_id:
-        upload_needs_own_target = True
-        upload_target_user_id = upload_target_override
-
+    """Generate .env file content (infrastructure only)."""
     lines = []
 
     lines.append("# Database (same credentials as your Immich .env)")
+    lines.append("DB_HOSTNAME=immich_postgres")
     lines.append(f"DB_PASSWORD={db_password}")
     lines.append("")
 
@@ -811,37 +817,29 @@ def generate_env(
     lines.append(f"IMMICH_API_KEY={api_key}")
     lines.append("")
 
-    lines.append("# Target user (receives synced copies)")
-    lines.append(f"TARGET_USER_ID={target_user_id}")
-    lines.append("")
-
-    if external:
-        lines.append("# External Library Sync")
-        lines.append(f"SOURCE_USER_ID={external['source_user_id']}")
-        lines.append(f"TARGET_LIBRARY_ID={external['target_library_id']}")
-        lines.append(f"SHARED_PATH_PREFIX={external['shared_path_prefix']}")
-        lines.append(f"TARGET_PATH_PREFIX={external['target_path_prefix']}")
-        lines.append("")
-
-    if upload:
-        lines.append("# Internal Library Sync")
-        lines.append(f"UPLOAD_SOURCE_USER_ID={upload['upload_source_user_id']}")
-        if upload_needs_own_target:
-            lines.append(f"UPLOAD_TARGET_USER_ID={upload_target_user_id}")
-        lines.append(f"UPLOAD_TARGET_LIBRARY_ID={upload['upload_target_library_id']}")
-        lines.append(f"TARGET_UPLOAD_PATH_PREFIX={upload['target_upload_path_prefix']}")
-        lines.append("")
-
-    if album_id:
-        lines.append("# Album assignment")
-        lines.append(f"TARGET_ALBUM_ID={album_id}")
-        lines.append("")
-
     lines.append("# SYNC_INTERVAL_SECONDS=60")
     lines.append("# LOG_LEVEL=INFO")
     lines.append("")
 
     return "\n".join(lines)
+
+
+def enable_config_volume_mount() -> None:
+    """Uncomment the config.yaml volume mount in docker-compose.yml if present."""
+    compose_path = Path("docker-compose.yml")
+    if not compose_path.is_file():
+        return
+
+    content = compose_path.read_text()
+    old_line = "      # - ./config.yaml:/app/config.yaml:ro"
+    new_line = "      - ./config.yaml:/app/config.yaml:ro"
+
+    if old_line in content:
+        content = content.replace(old_line, new_line)
+        compose_path.write_text(content)
+        print("  Enabled config.yaml volume mount in docker-compose.yml")
+    elif new_line in content:
+        pass  # Already enabled
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -856,6 +854,11 @@ def main():
     if existing:
         print("\n  Found existing .env — values will be used as defaults.")
 
+    # Load existing config.yaml if present
+    existing_jobs = load_config_yaml(Path("config.yaml"))
+    if existing_jobs:
+        print(f"  Found existing config.yaml — {len(existing_jobs)} job(s) configured.")
+
     # Step 1: Connect to Immich
     client, api_key = step_connect(existing)
     users = client.get_users()
@@ -863,57 +866,68 @@ def main():
     # Step 2: Detect paths
     paths = step_detect_paths(existing)
 
-    # Step 3: Choose sync methods (returns preserved config for methods not being reconfigured)
-    methods, kept_external, kept_upload = step_choose_sync_methods(existing)
+    # Step 3: Configure sync jobs
+    jobs = step_configure_jobs(client, users, paths, existing_jobs)
 
-    # Step 4a/4b: Configure sync methods (each step asks for source + target user)
-    external_config = kept_external
-    upload_config = kept_upload
-
-    if "external" in methods:
-        external_config = step_external_library_sync(client, users, paths)
-
-    if "upload" in methods:
-        upload_config = step_internal_library_sync(client, users, paths, external_config)
-
-    # Step 5: Album
-    album_id = step_album(client, existing)
-
-    # Step 6: Database
+    # Step 4: Database
     db_password = step_database(existing)
 
-    # Generate .env
+    # Generate config.yaml
+    yaml_content = generate_config_yaml(jobs)
+
+    # Generate .env (infrastructure only)
     env_content = generate_env(
         api_key=api_key,
         paths=paths,
-        external=external_config,
-        upload=upload_config,
-        album_id=album_id,
         db_password=db_password,
     )
 
     print("\n═══ Summary ═══\n")
+    print("── config.yaml ──")
+    print(yaml_content)
+    print("── .env ──")
     print(env_content)
 
+    # Write config.yaml
+    yaml_path = Path("config.yaml")
+    if yaml_path.exists():
+        print(f"\nWarning: {yaml_path} already exists.")
+        if not prompt_yes_no("Overwrite?", default=False):
+            alt = Path("config.yaml.generated")
+            alt.write_text(yaml_content)
+            print(f"  Saved to {alt} instead.")
+        else:
+            yaml_path.write_text(yaml_content)
+            print(f"  Saved to {yaml_path}")
+    else:
+        yaml_path.write_text(yaml_content)
+        print(f"  Saved to {yaml_path}")
+
+    # Write .env
     env_path = Path(".env")
     if env_path.exists():
-        print(f"Warning: {env_path} already exists.")
+        print(f"\nWarning: {env_path} already exists.")
         if not prompt_yes_no("Overwrite?", default=False):
-            alt_path = Path(".env.generated")
-            alt_path.write_text(env_content)
-            print(f"\n  Saved to {alt_path} instead.")
-            print(f"  Review and rename: mv {alt_path} .env")
-            print_next_steps()
-            return
+            alt = Path(".env.generated")
+            alt.write_text(env_content)
+            print(f"  Saved to {alt} instead.")
+            print(f"  Review and rename: mv {alt} .env")
+        else:
+            env_path.write_text(env_content)
+            print(f"  Saved to {env_path}")
+    else:
+        env_path.write_text(env_content)
+        print(f"  Saved to {env_path}")
 
-    env_path.write_text(env_content)
-    print(f"  Saved to {env_path}")
+    # Enable config volume mount in docker-compose.yml
+    enable_config_volume_mount()
+
     print_next_steps()
 
 
 def print_next_steps():
     print("\n═══ Next steps ═══\n")
-    print("  1. Review the .env file")
+    print("  1. Review config.yaml and .env")
     print("  2. Start the sidecar:")
     print("       docker compose up -d")
     print("  3. Check logs:")

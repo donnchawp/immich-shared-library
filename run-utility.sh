@@ -82,4 +82,4 @@ exec docker run --rm -it --network "$NETWORK" \
     -v "${UPLOAD_LOCATION}:${UPLOAD_LOCATION_MOUNT}" \
     -v "${EXTERNAL_LIBRARY_DIR}:${EXTERNAL_LIBRARY_MOUNT}" \
     -w /app "$IMAGE" \
-    bash -c "pip install -q asyncpg httpx pydantic pydantic-settings && python $SCRIPT $*"
+    bash -c "pip install -q asyncpg httpx pydantic pydantic-settings pyyaml && python $SCRIPT $*"

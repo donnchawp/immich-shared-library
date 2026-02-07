@@ -63,10 +63,14 @@ There are no automated tests yet. `test_sync.py` is a manual integration test th
 - `cleanup.py` — Deletion detection (LEFT JOIN on source), hardlink removal before DB deletion
 - `file_ops.py` — Hardlink creation/removal, path remapping by exact UUID component matching
 - `db.py` — asyncpg pool (min=2, max=10), `transaction()` context manager, query helpers
-- `config.py` — Pydantic Settings loading all env vars, computed `dsn` property
+- `config.py` — SyncJob dataclass, YAML config loader, Pydantic Settings (env var fallback)
 - `main.py` — Entry point: config validation, health wait, DB init, concurrent sync + scan loops
 - `immich_api.py` — httpx AsyncClient (single instance) for Immich REST API (health check)
 - `health.py` — TCP health check server on port 8080
+
+### Configuration
+
+Per-job config can come from either `config.yaml` (preferred for multi-job setups) or env vars (legacy, backward compat). If `config.yaml` exists at `/app/config.yaml` (or `CONFIG_FILE` env var path), it takes priority. Album assignment is per-job (`album_id` in YAML, or global `TARGET_ALBUM_ID` for env var mode).
 
 ### Tracking tables (created automatically)
 
