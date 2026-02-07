@@ -32,6 +32,7 @@ The target user's assets appear instantly with full search, face recognition, an
 
 ## Prerequisites
 
+- **Docker** with `docker compose` — the sidecar builds and runs entirely in Docker, no other development tools required
 - **Immich v2.5.5** (tested). Other v2.x versions may work but the database schema can change between releases — check the [Immich release notes](https://github.com/immich-app/immich/releases) before upgrading.
 - Two or more Immich users (at least one source and one target)
 - Source assets must be fully processed by Immich (metadata, faces, CLIP)
