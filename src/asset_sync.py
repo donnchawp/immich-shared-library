@@ -313,30 +313,34 @@ async def sync_asset(conn: asyncpg.Connection, source: asyncpg.Record, job: Sync
         return None
 
 
+_EXIF_COLUMNS = frozenset([
+    "make", "model", "exifImageWidth", "exifImageHeight", "fileSizeInByte",
+    "orientation", "dateTimeOriginal", "modifyDate", "lensModel", "fNumber",
+    "focalLength", "iso", "latitude", "longitude", "city", "state", "country",
+    "description", "fps", "exposureTime", "livePhotoCID", "timeZone",
+    "projectionType", "profileDescription", "colorspace", "bitsPerSample",
+    "autoStackId", "rating", "tags", "lockedProperties",
+])
+
+
 async def _copy_exif(conn: asyncpg.Connection, source_id: UUID, target_id: UUID) -> None:
     """Copy exif data from source asset to target asset."""
     exif = await conn.fetchrow('SELECT * FROM asset_exif WHERE "assetId" = $1', source_id)
     if exif is None:
         return
 
-    # Hardcoded allowlist of EXIF columns to copy (excludes assetId, updatedAt, updateId)
-    cols = [
-        "make", "model", "exifImageWidth", "exifImageHeight", "fileSizeInByte",
-        "orientation", "dateTimeOriginal", "modifyDate", "lensModel", "fNumber",
-        "focalLength", "iso", "latitude", "longitude", "city", "state", "country",
-        "description", "fps", "exposureTime", "livePhotoCID", "timeZone",
-        "projectionType", "profileDescription", "colorspace", "bitsPerSample",
-        "autoStackId", "rating", "tags", "lockedProperties",
-    ]
-    # Filter to only columns present in this row (forward-compatible if Immich removes a column)
-    cols = [c for c in cols if c in exif]
+    # Filter to only allowlisted columns present in this row
+    # (forward-compatible if Immich adds/removes columns)
+    cols = [c for c in exif.keys() if c in _EXIF_COLUMNS]
+    values = [target_id] + [exif[c] for c in cols]
+
+    # Column names are from _EXIF_COLUMNS (a code constant, not user input)
     col_names = ', '.join(f'"{c}"' for c in cols)
     placeholders = ', '.join(f'${i + 2}' for i in range(len(cols)))
 
     await conn.execute(
         f'INSERT INTO asset_exif ("assetId", {col_names}) VALUES ($1, {placeholders})',
-        target_id,
-        *[exif[c] for c in cols],
+        *values,
     )
 
 

@@ -20,18 +20,18 @@ async def add_assets_to_album(conn: asyncpg.Connection, asset_ids: list[UUID]) -
     if album_id is None or not asset_ids:
         return 0
 
-    result = await conn.execute(
+    rows = await conn.fetch(
         """
         INSERT INTO album_asset ("albumId", "assetId")
         SELECT $1, unnest($2::uuid[])
         ON CONFLICT DO NOTHING
+        RETURNING "assetId"
         """,
         album_id,
         asset_ids,
     )
 
-    # result is like "INSERT 0 N"
-    count = int(result.split()[-1])
+    count = len(rows)
 
     if count > 0:
         await conn.execute(
@@ -55,7 +55,7 @@ async def backfill_album(conn: asyncpg.Connection) -> int:
     if album_id is None:
         return 0
 
-    result = await conn.execute(
+    rows = await conn.fetch(
         """
         INSERT INTO album_asset ("albumId", "assetId")
         SELECT $1, m.target_asset_id
@@ -64,11 +64,12 @@ async def backfill_album(conn: asyncpg.Connection) -> int:
             SELECT 1 FROM album_asset aa
             WHERE aa."albumId" = $1 AND aa."assetId" = m.target_asset_id
         )
+        RETURNING "assetId"
         """,
         album_id,
     )
 
-    count = int(result.split()[-1])
+    count = len(rows)
 
     if count > 0:
         await conn.execute(
