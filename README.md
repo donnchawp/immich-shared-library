@@ -32,9 +32,14 @@ The target user's assets appear instantly with full search, face recognition, an
 
 ## Prerequisites
 
-- A running Immich instance (v2+) with Docker Compose
+- **Immich v2.5.5** (tested). Other v2.x versions may work but the database schema can change between releases — check the [Immich release notes](https://github.com/immich-app/immich/releases) before upgrading.
 - Two or more Immich users (at least one source and one target)
 - Source assets must be fully processed by Immich (metadata, faces, CLIP)
+
+> **Back up your database before running this sidecar.** It writes directly to Immich's PostgreSQL database. If something goes wrong, you'll want a backup to restore from. A simple `pg_dump` is enough:
+> ```bash
+> docker exec immich_postgres pg_dump -U postgres immich > immich_backup.sql
+> ```
 
 The sidecar supports two sync methods. You can use one or both:
 
@@ -299,7 +304,7 @@ Each sync cycle runs five phases:
 
 - **`force=true` jobs**: If someone triggers a force re-process in Immich, it will re-run ML on the target user's assets, overwriting the copied data. The sidecar will re-sync on the next cycle, but there will be temporary GPU usage.
 - **Same filesystem required**: Hardlinks only work when the sidecar container mounts the same volume as Immich. Cross-filesystem setups would need file copies instead.
-- **Direct database access**: This service writes directly to Immich's database. Immich schema changes in future versions may require updates to this sidecar.
+- **Direct database access**: This service writes directly to Immich's database. Tested with v2.5.5 — schema changes in other versions may require updates to this sidecar. Always back up your database before use.
 - **Single direction**: Sync is one-way (source → target). Changes made to target assets in Immich are not propagated back.
 
 ## Contributing
