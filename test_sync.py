@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
 Manual test script that runs the sidecar sync logic once against a local Immich instance.
-Connects to Postgres via localhost (requires port 5432 exposed or SSH tunnel).
+Must be run inside a Docker container on the Immich network (see run-utility.sh).
 
 Usage:
-  cp test.env.example test.env   # then fill in your values
-  python3 test_sync.py
+  ./run-utility.sh test_sync.py
 """
 import asyncio
 import os
@@ -16,10 +15,10 @@ from uuid import UUID
 # Add project root to path
 sys.path.insert(0, os.path.dirname(__file__))
 
-# Load test.env file
-env_file = Path(__file__).parent / "test.env"
+# Load .env file
+env_file = Path(__file__).parent / ".env"
 if not env_file.exists():
-    print("Error: test.env not found. Copy test.env.example to test.env and fill in your values.")
+    print("Error: .env not found. Copy env.example to .env and fill in your values.")
     sys.exit(1)
 
 for line in env_file.read_text().splitlines():

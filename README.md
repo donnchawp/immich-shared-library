@@ -92,7 +92,7 @@ In Immich, go to **Account Settings > API Keys** and create a key.
 #### 2. Configure environment
 
 ```bash
-cp .env.example .env
+cp env.example .env
 ```
 
 Edit `.env` with the common settings:
@@ -312,31 +312,51 @@ source .venv/bin/activate
 pip install -e .
 ```
 
-### Running Against a Local Immich Instance
+### Testing
 
-The test script `test_sync.py` runs a single sync cycle against a local Immich instance. It reads configuration from a `test.env` file:
+1. Run the setup wizard to configure your `.env` and connect to a local Immich instance:
+
+   ```bash
+   python3 setup.py
+   ```
+
+2. Copy some photos into the source user's watched folders or upload them via the Immich app/web UI. Wait for Immich to finish processing (metadata, thumbnails, CLIP, faces).
+
+3. Run a sync cycle to create the target assets:
+
+   ```bash
+   ./run-utility.sh test_sync.py
+   ```
+
+4. Verify `dedup_synced.py` detects duplicates (if the target user also has copies of the same photos):
+
+   ```bash
+   ./run-utility.sh dedup_synced.py
+   ```
+
+5. Run `delete_synced.py` and confirm it shows the correct number of synced assets:
+
+   ```bash
+   ./run-utility.sh delete_synced.py
+   ```
+
+6. Run `test_sync.py` again — it will recreate the deleted assets, confirming the full round-trip works.
+
+### Utility Scripts
+
+The utility scripts read configuration from `.env` (the same file used by `docker compose`). Since the Immich PostgreSQL container doesn't expose port 5432 by default, they must run inside a Docker container on the Immich network. `run-utility.sh` handles the Docker invocation:
 
 ```bash
-cp test.env.example test.env
-# Edit test.env with your Immich API key, user IDs, and library ID
+./run-utility.sh test_sync.py
+./run-utility.sh dedup_synced.py --match-time
+./run-utility.sh delete_synced.py
 ```
 
-Since the Immich PostgreSQL container doesn't expose port 5432 by default, tests must run inside a Docker container on the Immich network:
+- **`test_sync.py`** — Run a single sync cycle and print verification queries.
+- **`delete_synced.py`** — Delete all synced assets for a target user. Does not mark sources as skipped, so running the sync engine again will recreate everything. Useful for resetting a target account.
+- **`dedup_synced.py`** — Detect and remove synced assets that duplicate the target user's own uploads (matched by filename + capture date). Use `--match-time` to compare the full timestamp (with TZ normalisation) instead of just the date. Marks duplicates as skipped so the sync engine won't recreate them.
 
-```bash
-docker run --rm --network immich_default \
-  -v $(pwd):/app \
-  -v /path/to/immich-app/library:/data \
-  -v /path/to/immich-app/external_library:/external_library \
-  -w /app python:3.12-slim \
-  bash -c 'pip install asyncpg httpx pydantic pydantic-settings && python test_sync.py'
-```
-
-Update `DB_HOSTNAME` in `test.env` to point to the Postgres container IP:
-
-```bash
-docker inspect immich_postgres --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}'
-```
+`delete_synced.py` and `dedup_synced.py` are interactive: they show a summary and prompt for confirmation before making changes, with a dry-run option.
 
 ### Project Structure
 
