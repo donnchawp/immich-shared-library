@@ -8,6 +8,7 @@ from src.config import settings
 from src.db import transaction
 from src.ml_sync import sync_faces_for_asset, sync_faces_incremental
 from src.person_sync import cleanup_orphaned_persons, sync_person_names, sync_person_thumbnails, sync_person_visibility
+from src.schema import validate_schema
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +18,8 @@ async def run_full_sync() -> dict:
 
     Returns a summary dict of what was done.
     """
+    await validate_schema()
+
     stats = {
         "assets_synced": 0,
         "assets_skipped_duplicate": 0,

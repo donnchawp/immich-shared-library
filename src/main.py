@@ -6,6 +6,7 @@ from src.config import settings
 from src.db import close_pool, execute, fetch_one, init_pool
 from src.health import start_health_server, stop_health_server
 from src.immich_api import ImmichAPI
+from src.schema import validate_schema
 from src.sync_engine import run_full_sync
 
 logger = logging.getLogger(__name__)
@@ -173,6 +174,7 @@ async def main() -> None:
 
     await init_pool()
     await ensure_tracking_tables()
+    await validate_schema()
     await validate_user_and_library_ids()
 
     await start_health_server()
