@@ -316,6 +316,15 @@ The sidecar runs as a standalone compose project that connects to Immich's Docke
 docker compose up -d
 ```
 
+> **Network configuration:** The `docker-compose.yml` assumes Immich's Docker network is named `immich_default` (the default when Immich's compose project is named `immich`). If your Immich setup uses a different network name — for example because of a custom `COMPOSE_PROJECT_NAME`, a different directory name, or a manually defined network — edit the `networks` section at the bottom of `docker-compose.yml` to match:
+> ```yaml
+> networks:
+>   immich:
+>     external: true
+>     name: your_actual_network_name  # e.g., immich-app_default
+> ```
+> You can find your Immich network name with `docker network ls | grep immich`.
+
 The `UPLOAD_LOCATION` and `EXTERNAL_LIBRARY_DIR` in `.env` must point to the same host directories that Immich mounts (typically `./library` and `./external_library` in your Immich directory). Hardlinks require the same filesystem.
 
 The sidecar will:
