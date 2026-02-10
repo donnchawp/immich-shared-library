@@ -128,11 +128,6 @@ class ImmichClient:
             "exclusionPatterns": ["**/*"],
         })
 
-    def get_albums(self) -> list[dict]:
-        return self._request("/api/albums")
-
-    def create_album(self, name: str) -> dict:
-        return self._request("/api/albums", {"albumName": name})
 
 
 # ── Docker-compose detection ─────────────────────────────────────────────────
@@ -705,7 +700,7 @@ def step_configure_jobs(
         job["name"] = prompt("Job name", default_name)
 
         # Per-job album assignment
-        album_id = step_album_for_job(client, job["name"])
+        album_id = step_album_for_job(job["name"])
         if album_id:
             job["album_id"] = album_id
 
@@ -719,37 +714,14 @@ def step_configure_jobs(
     return jobs
 
 
-def step_album_for_job(client: ImmichClient, job_name: str) -> str | None:
+def step_album_for_job(job_name: str) -> str | None:
     """Optional: assign an album to a specific job."""
     if not prompt_yes_no(f"  Add synced assets to an album for job '{job_name}'?", default=False):
         return None
 
-    print("\n  1. Create a new album")
-    print("  2. Use an existing album")
-    choice = input("\nEnter number: ").strip()
-
-    if choice == "1":
-        album_name = prompt("Album name", "Shared Photos")
-        album = client.create_album(album_name)
-        print(f"  Album created: {album['id']}")
-        return album["id"]
-    elif choice == "2":
-        albums = client.get_albums()
-        if not albums:
-            print("  No albums found. Creating a new one.")
-            album_name = prompt("Album name", "Shared Photos")
-            album = client.create_album(album_name)
-            print(f"  Album created: {album['id']}")
-            return album["id"]
-        print()
-        selected = pick_from_list(
-            albums,
-            lambda a: a.get("albumName", "(unnamed)"),
-            lambda a: a["id"],
-        )
-        return selected["id"]
-    else:
-        return None
+    print("\n  Create an album in the target user's Immich UI, then paste the ID from the URL.")
+    print("  Example: http://immich:2283/albums/<album-id-here>\n")
+    return prompt("Album ID (UUID)")
 
 
 def step_database(existing: dict[str, str]) -> str:
