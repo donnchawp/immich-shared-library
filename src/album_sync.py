@@ -56,6 +56,7 @@ async def backfill_album(conn: asyncpg.Connection, album_id: UUID | None, target
         INSERT INTO album_asset ("albumId", "assetId")
         SELECT $1, m.target_asset_id
         FROM _face_sync_asset_map m
+        JOIN asset a ON a.id = m.target_asset_id
         WHERE m.target_user_id = $2
         AND NOT EXISTS (
             SELECT 1 FROM album_asset aa
