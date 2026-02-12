@@ -114,12 +114,18 @@ INSERTED_COLUMNS: dict[str, set[str]] = {
     },
 }
 
-# Expected vector dimensions for embedding columns. The sidecar copies
-# embeddings verbatim via INSERT INTO ... SELECT, so a dimension mismatch
-# means Immich changed its ML model and existing embeddings are incompatible.
-EXPECTED_VECTOR_DIMS: dict[str, dict[str, int]] = {
-    "smart_search": {"embedding": 512},
-    "face_search": {"embedding": 512},
+# Child tables that must CASCADE DELETE from asset.id.
+# cleanup.py deletes from asset and relies on cascades for these.
+EXPECTED_CASCADE_CHILDREN: set[str] = {
+    "asset_exif", "asset_file", "asset_face", "smart_search", "asset_job_status",
+}
+
+# Unique/PK constraints required for ON CONFLICT clauses on Immich tables.
+# Each entry is table -> frozenset of column names that must be covered by
+# a single unique or primary key constraint.
+EXPECTED_UNIQUE_CONSTRAINTS: dict[str, list[frozenset[str]]] = {
+    "face_search": [frozenset({"faceId"})],
+    "album_asset": [frozenset({"albumId", "assetId"})],
 }
 
 
@@ -129,7 +135,6 @@ async def validate_schema(conn: asyncpg.Connection | None = None) -> None:
     Queries information_schema.columns and compares against REQUIRED_SCHEMA.
     Also checks for new NOT NULL columns (without defaults) in tables the
     sidecar INSERTs into — these would cause hard failures at runtime.
-    Also verifies pgvector embedding dimensions haven't changed.
     Raises SchemaValidationError listing every problem found.
     """
     expected_tables = list(REQUIRED_SCHEMA.keys())
@@ -184,37 +189,57 @@ async def validate_schema(conn: asyncpg.Connection | None = None) -> None:
             if col not in INSERTED_COLUMNS.get(table, set()):
                 unsupplied.setdefault(table, []).append(col)
 
-        # Check pgvector embedding dimensions haven't changed.
-        dim_mismatches: list[str] = []
-        for table, col_dims in EXPECTED_VECTOR_DIMS.items():
+        # Check CASCADE DELETE from asset to expected child tables.
+        constraint_problems: list[str] = []
+        cascade_rows = await c.fetch(
+            """
+            SELECT child.relname AS child_table
+            FROM pg_constraint con
+            JOIN pg_class child ON con.conrelid = child.oid
+            JOIN pg_class parent ON con.confrelid = parent.oid
+            JOIN pg_namespace n ON n.oid = parent.relnamespace
+            WHERE parent.relname = 'asset'
+              AND n.nspname = 'public'
+              AND con.contype = 'f'
+              AND con.confdeltype = 'c'
+            """,
+        )
+        cascade_children = {row["child_table"] for row in cascade_rows}
+        missing_cascades = EXPECTED_CASCADE_CHILDREN - cascade_children
+        if missing_cascades:
+            constraint_problems.append(
+                f"Missing CASCADE DELETE from 'asset' to: "
+                f"{', '.join(sorted(missing_cascades))}"
+            )
+
+        # Check unique/PK constraints needed for ON CONFLICT clauses.
+        for table, required_constraints in EXPECTED_UNIQUE_CONSTRAINTS.items():
             if table in missing_tables:
                 continue
-            for col, expected_dim in col_dims.items():
-                if col in missing_columns.get(table, []):
-                    continue
-                row = await c.fetchrow(
-                    """
-                    SELECT format_type(a.atttypid, a.atttypmod) AS col_type
-                    FROM pg_attribute a
-                    JOIN pg_class cl ON cl.oid = a.attrelid
-                    JOIN pg_namespace n ON n.oid = cl.relnamespace
-                    WHERE n.nspname = 'public'
-                      AND cl.relname = $1
-                      AND a.attname = $2
-                      AND a.attnum > 0
-                      AND NOT a.attisdropped
-                    """,
-                    table,
-                    col,
-                )
-                if row:
-                    col_type = row["col_type"]  # e.g. "vector(512)"
-                    if f"({expected_dim})" not in col_type:
-                        dim_mismatches.append(
-                            f"{table}.{col}: expected vector({expected_dim}), got {col_type}"
-                        )
+            uc_rows = await c.fetch(
+                """
+                SELECT con.oid,
+                       array_agg(a.attname ORDER BY array_position(con.conkey, a.attnum)) AS cols
+                FROM pg_constraint con
+                JOIN pg_class cl ON con.conrelid = cl.oid
+                JOIN pg_namespace n ON n.oid = cl.relnamespace
+                JOIN pg_attribute a ON a.attrelid = cl.oid AND a.attnum = ANY(con.conkey)
+                WHERE cl.relname = $1
+                  AND n.nspname = 'public'
+                  AND con.contype IN ('p', 'u')
+                GROUP BY con.oid
+                """,
+                table,
+            )
+            actual_constraints = [frozenset(row["cols"]) for row in uc_rows]
+            for required in required_constraints:
+                if required not in actual_constraints:
+                    constraint_problems.append(
+                        f"Missing unique constraint on '{table}' "
+                        f"({', '.join(sorted(required))}) — ON CONFLICT will fail"
+                    )
 
-        if missing_tables or missing_columns or unsupplied or dim_mismatches:
+        if missing_tables or missing_columns or unsupplied or constraint_problems:
             parts = []
             if missing_tables:
                 parts.append(f"Missing tables: {', '.join(sorted(missing_tables))}")
@@ -225,8 +250,8 @@ async def validate_schema(conn: asyncpg.Connection | None = None) -> None:
                     f"New required columns in '{table}' not supplied by sidecar: "
                     f"{', '.join(sorted(cols))} — INSERTs will fail"
                 )
-            for mismatch in dim_mismatches:
-                parts.append(f"Embedding dimension mismatch: {mismatch}")
+            for problem in constraint_problems:
+                parts.append(problem)
             msg = (
                 "Immich schema validation failed — the database schema does not match "
                 "what this sidecar expects. This usually means Immich was upgraded to a "
