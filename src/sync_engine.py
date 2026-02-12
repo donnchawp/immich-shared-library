@@ -18,8 +18,7 @@ async def run_full_sync() -> dict:
 
     Returns a summary dict of what was done.
     """
-    await validate_schema()
-
+    schema_validated = False
     stats = {
         "assets_synced": 0,
         "assets_skipped_duplicate": 0,
@@ -40,6 +39,9 @@ async def run_full_sync() -> dict:
         while True:
             async with transaction() as conn:
                 source_assets = await get_unsynced_source_assets(conn, job)
+                if source_assets and not schema_validated:
+                    await validate_schema(conn)
+                    schema_validated = True
 
                 # Duplicate detection: skip source assets already in target by filename + capture time
                 duplicates = await find_duplicate_filenames(conn, source_assets, job)
