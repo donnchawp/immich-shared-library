@@ -114,6 +114,14 @@ INSERTED_COLUMNS: dict[str, set[str]] = {
     },
 }
 
+# Expected vector dimensions for embedding columns. The sidecar copies
+# embeddings verbatim via INSERT INTO ... SELECT, so a dimension mismatch
+# means Immich changed its ML model and existing embeddings are incompatible.
+EXPECTED_VECTOR_DIMS: dict[str, dict[str, int]] = {
+    "smart_search": {"embedding": 512},
+    "face_search": {"embedding": 512},
+}
+
 
 async def validate_schema(conn: asyncpg.Connection | None = None) -> None:
     """Validate that all required Immich tables and columns exist.
@@ -121,6 +129,7 @@ async def validate_schema(conn: asyncpg.Connection | None = None) -> None:
     Queries information_schema.columns and compares against REQUIRED_SCHEMA.
     Also checks for new NOT NULL columns (without defaults) in tables the
     sidecar INSERTs into — these would cause hard failures at runtime.
+    Also verifies pgvector embedding dimensions haven't changed.
     Raises SchemaValidationError listing every problem found.
     """
     expected_tables = list(REQUIRED_SCHEMA.keys())
@@ -175,7 +184,37 @@ async def validate_schema(conn: asyncpg.Connection | None = None) -> None:
             if col not in INSERTED_COLUMNS.get(table, set()):
                 unsupplied.setdefault(table, []).append(col)
 
-        if missing_tables or missing_columns or unsupplied:
+        # Check pgvector embedding dimensions haven't changed.
+        dim_mismatches: list[str] = []
+        for table, col_dims in EXPECTED_VECTOR_DIMS.items():
+            if table in missing_tables:
+                continue
+            for col, expected_dim in col_dims.items():
+                if col in missing_columns.get(table, []):
+                    continue
+                row = await c.fetchrow(
+                    """
+                    SELECT format_type(a.atttypid, a.atttypmod) AS col_type
+                    FROM pg_attribute a
+                    JOIN pg_class cl ON cl.oid = a.attrelid
+                    JOIN pg_namespace n ON n.oid = cl.relnamespace
+                    WHERE n.nspname = 'public'
+                      AND cl.relname = $1
+                      AND a.attname = $2
+                      AND a.attnum > 0
+                      AND NOT a.attisdropped
+                    """,
+                    table,
+                    col,
+                )
+                if row:
+                    col_type = row["col_type"]  # e.g. "vector(512)"
+                    if f"({expected_dim})" not in col_type:
+                        dim_mismatches.append(
+                            f"{table}.{col}: expected vector({expected_dim}), got {col_type}"
+                        )
+
+        if missing_tables or missing_columns or unsupplied or dim_mismatches:
             parts = []
             if missing_tables:
                 parts.append(f"Missing tables: {', '.join(sorted(missing_tables))}")
@@ -186,6 +225,8 @@ async def validate_schema(conn: asyncpg.Connection | None = None) -> None:
                     f"New required columns in '{table}' not supplied by sidecar: "
                     f"{', '.join(sorted(cols))} — INSERTs will fail"
                 )
+            for mismatch in dim_mismatches:
+                parts.append(f"Embedding dimension mismatch: {mismatch}")
             msg = (
                 "Immich schema validation failed — the database schema does not match "
                 "what this sidecar expects. This usually means Immich was upgraded to a "
