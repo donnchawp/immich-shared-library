@@ -322,6 +322,8 @@ _EXIF_COLUMNS = frozenset([
     "autoStackId", "rating", "tags", "lockedProperties",
 ])
 
+_exif_warned: set[str] = set()
+
 
 async def _copy_exif(conn: asyncpg.Connection, source_id: UUID, target_id: UUID) -> None:
     """Copy exif data from source asset to target asset."""
@@ -329,8 +331,14 @@ async def _copy_exif(conn: asyncpg.Connection, source_id: UUID, target_id: UUID)
     if exif is None:
         return
 
+    # Warn once per missing allowlisted column (likely renamed in an Immich upgrade)
+    actual_cols = set(exif.keys())
+    missing = _EXIF_COLUMNS - actual_cols - _exif_warned
+    if missing:
+        _exif_warned.update(missing)
+        logger.warning("EXIF columns in allowlist but missing from DB (renamed?): %s", ", ".join(sorted(missing)))
+
     # Filter to only allowlisted columns present in this row
-    # (forward-compatible if Immich adds/removes columns)
     cols = [c for c in exif.keys() if c in _EXIF_COLUMNS]
     values = [target_id] + [exif[c] for c in cols]
 
