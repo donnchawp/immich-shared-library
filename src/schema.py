@@ -66,13 +66,65 @@ class SchemaValidationError(RuntimeError):
     """Raised when the Immich database schema doesn't match expectations."""
 
 
+# Columns the sidecar supplies when INSERTing into each Immich table.
+# Used to detect new NOT NULL columns (without defaults) that would cause
+# INSERT failures after an Immich upgrade.
+INSERTED_COLUMNS: dict[str, set[str]] = {
+    "asset": {
+        "id", "deviceAssetId", "ownerId", "deviceId", "type", "originalPath",
+        "fileCreatedAt", "fileModifiedAt", "isFavorite", "duration",
+        "encodedVideoPath", "checksum", "livePhotoVideoId", "originalFileName",
+        "thumbhash", "isOffline", "libraryId", "isExternal", "localDateTime",
+        "stackId", "duplicateId", "status", "visibility", "width", "height",
+        "isEdited",
+    },
+    "asset_exif": {
+        "assetId", "make", "model", "exifImageWidth", "exifImageHeight",
+        "fileSizeInByte", "orientation", "dateTimeOriginal", "modifyDate",
+        "lensModel", "fNumber", "focalLength", "iso", "latitude", "longitude",
+        "city", "state", "country", "description", "fps", "exposureTime",
+        "livePhotoCID", "timeZone", "projectionType", "profileDescription",
+        "colorspace", "bitsPerSample", "autoStackId", "rating", "tags",
+        "lockedProperties",
+    },
+    "asset_file": {
+        "id", "assetId", "type", "path", "isEdited", "isProgressive",
+    },
+    "asset_job_status": {
+        "assetId", "facesRecognizedAt", "metadataExtractedAt",
+        "duplicatesDetectedAt", "ocrAt",
+    },
+    "smart_search": {
+        "assetId", "embedding",
+    },
+    "asset_face": {
+        "id", "assetId", "personId", "imageWidth", "imageHeight",
+        "boundingBoxX1", "boundingBoxY1", "boundingBoxX2", "boundingBoxY2",
+        "sourceType", "isVisible",
+    },
+    "face_search": {
+        "faceId", "embedding",
+    },
+    "person": {
+        "id", "ownerId", "name", "thumbnailPath", "isHidden", "birthDate",
+        "faceAssetId", "isFavorite", "color",
+    },
+    "album_asset": {
+        "albumId", "assetId",
+    },
+}
+
+
 async def validate_schema(conn: asyncpg.Connection | None = None) -> None:
     """Validate that all required Immich tables and columns exist.
 
     Queries information_schema.columns and compares against REQUIRED_SCHEMA.
-    Raises SchemaValidationError listing every missing table and/or column.
+    Also checks for new NOT NULL columns (without defaults) in tables the
+    sidecar INSERTs into — these would cause hard failures at runtime.
+    Raises SchemaValidationError listing every problem found.
     """
     expected_tables = list(REQUIRED_SCHEMA.keys())
+    insert_tables = list(INSERTED_COLUMNS.keys())
 
     async def _check(c: asyncpg.Connection) -> None:
         rows = await c.fetch(
@@ -101,12 +153,39 @@ async def validate_schema(conn: asyncpg.Connection | None = None) -> None:
             if missing:
                 missing_columns[table] = sorted(missing)
 
-        if missing_tables or missing_columns:
+        # Check for new NOT NULL columns without defaults that the sidecar
+        # doesn't supply — these would cause every INSERT to fail.
+        required_rows = await c.fetch(
+            """
+            SELECT table_name, column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = ANY($1)
+              AND is_nullable = 'NO'
+              AND column_default IS NULL
+              AND is_identity = 'NO'
+              AND is_generated = 'NEVER'
+            """,
+            insert_tables,
+        )
+        unsupplied: dict[str, list[str]] = {}
+        for row in required_rows:
+            table = row["table_name"]
+            col = row["column_name"]
+            if col not in INSERTED_COLUMNS.get(table, set()):
+                unsupplied.setdefault(table, []).append(col)
+
+        if missing_tables or missing_columns or unsupplied:
             parts = []
             if missing_tables:
                 parts.append(f"Missing tables: {', '.join(sorted(missing_tables))}")
             for table, cols in sorted(missing_columns.items()):
                 parts.append(f"Missing columns in '{table}': {', '.join(cols)}")
+            for table, cols in sorted(unsupplied.items()):
+                parts.append(
+                    f"New required columns in '{table}' not supplied by sidecar: "
+                    f"{', '.join(sorted(cols))} — INSERTs will fail"
+                )
             msg = (
                 "Immich schema validation failed — the database schema does not match "
                 "what this sidecar expects. This usually means Immich was upgraded to a "
