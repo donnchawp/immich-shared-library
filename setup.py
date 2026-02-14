@@ -353,19 +353,21 @@ def step_detect_paths(existing: dict[str, str]) -> dict[str, str]:
     """Step 2: Detect or ask for paths."""
     print("\n═══ Step 2: Configure paths ═══\n")
 
-    # If we already have paths from a previous run, offer to reuse them
+    # If we already have paths (including container mounts) from a previous run, offer to reuse
     existing_upload = existing.get("UPLOAD_LOCATION", "")
     existing_ext = existing.get("EXTERNAL_LIBRARY_DIR", "")
-    if existing_upload and existing_ext:
+    upload_container = existing.get("UPLOAD_LOCATION_MOUNT", "")
+    ext_lib_container = existing.get("EXTERNAL_LIBRARY_MOUNT", "")
+    if existing_upload and existing_ext and upload_container and ext_lib_container:
         print(f"  Current paths:")
-        print(f"    Upload location:  {existing_upload}")
-        print(f"    External library: {existing_ext}")
+        print(f"    Upload location:  {existing_upload} -> {upload_container}")
+        print(f"    External library: {existing_ext} -> {ext_lib_container}")
         if prompt_yes_no("\n  Keep these paths?"):
             paths = {
                 "upload_host": existing_upload,
-                "upload_container": existing.get("UPLOAD_LOCATION_MOUNT", "/usr/src/app/upload"),
+                "upload_container": upload_container,
                 "ext_lib_host": existing_ext,
-                "ext_lib_container": existing.get("EXTERNAL_LIBRARY_MOUNT", "/external_library"),
+                "ext_lib_container": ext_lib_container,
             }
             paths["upload_host"] = str(Path(paths["upload_host"]).expanduser().resolve())
             paths["ext_lib_host"] = str(Path(paths["ext_lib_host"]).expanduser().resolve())
@@ -777,13 +779,10 @@ def generate_env(
     lines.append(f"EXTERNAL_LIBRARY_DIR={paths['ext_lib_host']}")
     lines.append("")
 
-    # Only include container mounts if non-default
-    if paths["upload_container"] != "/usr/src/app/upload":
-        lines.append(f"UPLOAD_LOCATION_MOUNT={paths['upload_container']}")
-    if paths["ext_lib_container"] != "/external_library":
-        lines.append(f"EXTERNAL_LIBRARY_MOUNT={paths['ext_lib_container']}")
-    if paths["upload_container"] != "/usr/src/app/upload" or paths["ext_lib_container"] != "/external_library":
-        lines.append("")
+    # Container mount paths (always written so they're preserved for future runs)
+    lines.append(f"UPLOAD_LOCATION_MOUNT={paths['upload_container']}")
+    lines.append(f"EXTERNAL_LIBRARY_MOUNT={paths['ext_lib_container']}")
+    lines.append("")
 
     lines.append("# Immich API")
     lines.append(f"IMMICH_API_KEY={api_key}")
