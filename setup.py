@@ -565,8 +565,8 @@ def configure_upload_sync_job(
 
     source_library_container = f"{upload_container}/library/{source_user['id']}"
 
-    print(f"\n  Symlink: {target_link} -> {source_library_host}")
-    print(f"  (In-container: {ext_lib_container}/{target_path} -> {source_library_container})")
+    print(f"\n  Symlink: {target_link} -> {source_library_container}")
+    print(f"  (target is the in-container path for {source_library_host})")
 
     if not os.path.exists(source_library_host):
         print(f"\n  Warning: source library path {source_library_host} does not exist.")
@@ -577,7 +577,7 @@ def configure_upload_sync_job(
     else:
         if prompt_yes_no("  Create this symlink?"):
             os.makedirs(os.path.dirname(target_link), exist_ok=True)
-            os.symlink(source_library_host, target_link)
+            os.symlink(source_library_container, target_link)
             print("  Symlink created.")
         else:
             print("  Skipped symlink creation (create it manually before running the sidecar).")
