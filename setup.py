@@ -503,14 +503,18 @@ def configure_external_library_job(
         if not prompt_yes_no("  Continue anyway?", default=False):
             sys.exit(1)
 
+    # Use a relative symlink so it resolves correctly inside the container
+    # (both source and target are within the same external library volume)
+    relative_source = os.path.relpath(source_real, os.path.dirname(target_link))
+
     # Create symlink
-    print(f"\n  Symlink: {target_link} -> {source_real}")
+    print(f"\n  Symlink: {target_link} -> {relative_source}")
     if os.path.exists(target_link) or os.path.islink(target_link):
         print(f"  (already exists)")
     else:
         if prompt_yes_no("  Create this symlink?"):
             os.makedirs(os.path.dirname(target_link), exist_ok=True)
-            os.symlink(source_real, target_link)
+            os.symlink(relative_source, target_link)
             print("  Symlink created.")
         else:
             print("  Skipped symlink creation (create it manually before running the sidecar).")
