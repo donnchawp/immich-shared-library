@@ -187,11 +187,13 @@ async def sync_asset(conn: asyncpg.Connection, source: asyncpg.Record, job: Sync
     )
     if existing is not None:
         # Already synced but mapping was lost (crash recovery) — re-create mapping
+        # Use DO NOTHING (no conflict target) to handle unique violations on
+        # either source_asset_id or target_asset_id.
         result = await conn.execute(
             """
             INSERT INTO _face_sync_asset_map (source_asset_id, target_asset_id, source_user_id, target_user_id, synced_at)
             VALUES ($1, $2, $3, $4, $5)
-            ON CONFLICT (source_asset_id) DO NOTHING
+            ON CONFLICT DO NOTHING
             """,
             source_id, existing, job.source_user_id, target_user_id, now,
         )
