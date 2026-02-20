@@ -488,10 +488,10 @@ def configure_external_library_job(
         print()
 
     source_path = prompt(
-        "Source path within external library (e.g. 'donncha/photos')"
+        "Source path within external library (e.g. 'source_user/shared')"
     )
     target_path = prompt(
-        "Target symlink path within external library (e.g. 'jacinta/photos')",
+        "Target symlink path within external library (e.g. 'target_user_shared')",
     )
 
     # Determine symlink source and target

@@ -179,11 +179,12 @@ The source user (User A) has an external library that Immich scans and processes
 ```
 /external_library/
   user_a/               # Source user's external library (scanned by Immich)
-    photos/
+    personal/
       photo1.jpg
+    shared/             # Subdirectory to share with User B
       photo2.jpg
-  user_b_shared/        # Target user's external library (NOT scanned — sidecar handles it)
-    photos -> ../user_a/photos
+      photo3.jpg
+  user_b_shared -> user_a/shared   # Target user's external library (NOT scanned — sidecar handles it)
 ```
 
 You can symlink the entire source directory or just a subdirectory — the `SHARED_PATH_PREFIX` controls which source assets are synced.
@@ -215,8 +216,8 @@ SOURCE_USER_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
 TARGET_LIBRARY_ID=zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz
 
 # Path prefixes as seen inside the Immich container (not on the host)
-SHARED_PATH_PREFIX=/external_library/user_a/photos/
-TARGET_PATH_PREFIX=/external_library/user_b_shared/photos/
+SHARED_PATH_PREFIX=/external_library/user_a/shared/
+TARGET_PATH_PREFIX=/external_library/user_b_shared/
 ```
 
 #### Upload Sync
