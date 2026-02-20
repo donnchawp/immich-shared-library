@@ -389,6 +389,14 @@ Each sync cycle runs five phases:
 3. **Person metadata** — Syncs person name changes, visibility (`isHidden`), and thumbnail updates from source to target.
 4. **Cleanup** — Removes target assets (and their album entries) whose source was deleted or trashed. Detects person merges (face reassignment). Removes orphaned target persons.
 
+## How Faces Are Handled
+
+When the sidecar syncs an asset, it copies the source user's face detection data (bounding boxes, embeddings) and creates a **mirrored person** for the target user. The source user's person names, visibility, and thumbnails are propagated to these mirrored persons automatically on every sync cycle. The source user is the authority — if they rename "Mom" to "Mother", the target user's mirrored person updates to match.
+
+### Duplicate people
+
+If the target user already has their own photos with detected faces, they'll see duplicate person entries: their own person (from their uploads) and the sidecar's mirrored person (from synced assets). To unify them, use Immich's merge feature in the People view. The sidecar detects the merge on the next cycle and adopts the surviving person, so name and visibility sync continue to work regardless of which direction you merge.
+
 ## Caveats
 
 - **`force=true` jobs**: If someone triggers a force re-process in Immich, it will re-run ML on the target user's assets, overwriting the copied data. The sidecar will re-sync on the next cycle, but there will be temporary GPU usage.
