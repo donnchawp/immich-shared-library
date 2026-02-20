@@ -65,6 +65,110 @@ def _hardlink_person_thumbnail(
     return str(target)
 
 
+async def _try_adopt_surviving_person(
+    conn: asyncpg.Connection,
+    source_person_id: UUID,
+    stale_target_person_id: UUID,
+    target_user_id: UUID,
+) -> UUID | None:
+    """When a mapped target person was deleted (e.g. merged by target user),
+    find the surviving person by checking where synced faces ended up.
+
+    If found, updates the mapping to the survivor and returns it.
+    If not found, deletes the stale mapping and returns None.
+    """
+    # Look at bounding-box-matched target faces to find where they were reassigned
+    surviving = await conn.fetchval(
+        """
+        SELECT tf."personId"
+        FROM _face_sync_asset_map m
+        JOIN asset_face sf ON sf."assetId" = m.source_asset_id
+            AND sf."personId" = $1
+            AND sf."deletedAt" IS NULL
+        JOIN asset_face tf ON tf."assetId" = m.target_asset_id
+            AND tf."deletedAt" IS NULL
+            AND tf."boundingBoxX1" = sf."boundingBoxX1"
+            AND tf."boundingBoxY1" = sf."boundingBoxY1"
+            AND tf."boundingBoxX2" = sf."boundingBoxX2"
+            AND tf."boundingBoxY2" = sf."boundingBoxY2"
+        WHERE tf."personId" IS NOT NULL
+        LIMIT 1
+        """,
+        source_person_id,
+    )
+
+    if surviving is not None:
+        await conn.execute(
+            """
+            UPDATE _face_sync_person_map
+            SET target_person_id = $1
+            WHERE source_person_id = $2 AND target_user_id = $3
+            """,
+            surviving,
+            source_person_id,
+            target_user_id,
+        )
+        logger.info(
+            "Adopted person %s for source %s (target user merged sidecar person %s)",
+            surviving,
+            source_person_id,
+            stale_target_person_id,
+        )
+        return surviving
+
+    # No surviving person found — clean up stale mapping
+    await conn.execute(
+        """
+        DELETE FROM _face_sync_person_map
+        WHERE source_person_id = $1 AND target_user_id = $2
+        """,
+        source_person_id,
+        target_user_id,
+    )
+    logger.warning(
+        "Cleared stale person mapping: target %s no longer exists (source: %s)",
+        stale_target_person_id,
+        source_person_id,
+    )
+    return None
+
+
+async def _check_mapping(
+    conn: asyncpg.Connection,
+    source_person_id: UUID,
+    target_user_id: UUID,
+) -> UUID | None:
+    """Check person mapping and validate the target person still exists.
+
+    Returns the target person ID if the mapping is valid.
+    If the mapped person was deleted (e.g. user merged it), tries to adopt
+    the surviving person. Returns None if no valid mapping exists.
+    """
+    existing = await conn.fetchrow(
+        """
+        SELECT target_person_id FROM _face_sync_person_map
+        WHERE source_person_id = $1 AND target_user_id = $2
+        """,
+        source_person_id,
+        target_user_id,
+    )
+    if not existing:
+        return None
+
+    # Verify the target person still exists
+    person_exists = await conn.fetchval(
+        "SELECT EXISTS(SELECT 1 FROM person WHERE id = $1)",
+        existing["target_person_id"],
+    )
+    if person_exists:
+        return existing["target_person_id"]
+
+    # Stale mapping — target person was deleted (likely merged by target user)
+    return await _try_adopt_surviving_person(
+        conn, source_person_id, existing["target_person_id"], target_user_id,
+    )
+
+
 async def get_or_create_target_person(
     conn: asyncpg.Connection,
     source_person_id: UUID,
@@ -78,17 +182,10 @@ async def get_or_create_target_person(
 
     Returns the target person ID, or None if source person doesn't exist.
     """
-    # Check if we already have a mapping (fast path, no lock needed)
-    existing = await conn.fetchrow(
-        """
-        SELECT target_person_id FROM _face_sync_person_map
-        WHERE source_person_id = $1 AND target_user_id = $2
-        """,
-        source_person_id,
-        target_user_id,
-    )
-    if existing:
-        return existing["target_person_id"]
+    # Fast path (no lock needed)
+    target = await _check_mapping(conn, source_person_id, target_user_id)
+    if target is not None:
+        return target
 
     # Serialize person creation for this source person to prevent orphan duplicates
     await conn.execute(
@@ -97,16 +194,9 @@ async def get_or_create_target_person(
     )
 
     # Re-check after acquiring lock (another transaction may have created it)
-    existing = await conn.fetchrow(
-        """
-        SELECT target_person_id FROM _face_sync_person_map
-        WHERE source_person_id = $1 AND target_user_id = $2
-        """,
-        source_person_id,
-        target_user_id,
-    )
-    if existing:
-        return existing["target_person_id"]
+    target = await _check_mapping(conn, source_person_id, target_user_id)
+    if target is not None:
+        return target
 
     # Get source person details
     source = await conn.fetchrow("SELECT * FROM person WHERE id = $1", source_person_id)
