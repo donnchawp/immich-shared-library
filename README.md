@@ -166,7 +166,7 @@ TARGET_USER_ID=yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy
 
 **Library IDs:** In the Immich web UI, go to **Administration > External Libraries** and click on a library. The UUID appears in the URL: `/admin/library-management/{UUID}`.
 
-Now configure one or both sync methods ([external library](#external-library-syc) or [upload](#upload-sync)), then continue to [Album Assignment](#4-album-assignment-optional) and [Start the Sidecar](#5-start-the-sidecar).
+Now configure one or both sync methods ([external library](#external-library-sync) or [upload](#upload-sync)), then continue to [Album Assignment](#4-album-assignment-optional) and [Start the Sidecar](#5-start-the-sidecar).
 
 #### External Library Sync
 
