@@ -35,6 +35,19 @@ async def close_pool() -> None:
         logger.info("Database connection pool closed")
 
 
+async def reset_pool() -> None:
+    """Close and recreate the connection pool to recover from stale connections."""
+    global _pool
+    if _pool is not None:
+        try:
+            await _pool.close()
+        except Exception:
+            pass
+        _pool = None
+    await init_pool()
+    logger.info("Database connection pool reset")
+
+
 def get_pool() -> asyncpg.Pool:
     if _pool is None:
         raise RuntimeError("Database pool not initialized. Call init_pool() first.")

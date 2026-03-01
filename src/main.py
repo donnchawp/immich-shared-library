@@ -3,7 +3,7 @@ import logging
 import sys
 
 from src.config import settings
-from src.db import close_pool, execute, fetch_one, init_pool
+from src.db import close_pool, execute, fetch_one, init_pool, reset_pool
 from src.health import start_health_server, stop_health_server
 from src.immich_api import ImmichAPI
 from src.schema import validate_schema
@@ -128,13 +128,28 @@ def validate_config() -> bool:
     return True
 
 
+def _is_connection_error(exc: Exception) -> bool:
+    """Check if an exception indicates a broken database connection."""
+    return isinstance(exc, (
+        OSError,  # covers ConnectionResetError, socket.gaierror, etc.
+        asyncpg.exceptions.ConnectionDoesNotExistError,
+        asyncpg.exceptions.InterfaceError,
+    ))
+
+
 async def sync_loop() -> None:
     """Main sync loop that periodically syncs assets."""
     while True:
         try:
             await run_full_sync()
-        except Exception:
+        except Exception as e:
             logger.exception("Error in sync loop")
+            if _is_connection_error(e) or (e.__cause__ and _is_connection_error(e.__cause__)):
+                logger.info("Detected connection error, resetting database pool")
+                try:
+                    await reset_pool()
+                except Exception:
+                    logger.exception("Failed to reset database pool, will retry next cycle")
         await asyncio.sleep(settings.sync_interval_seconds)
 
 
