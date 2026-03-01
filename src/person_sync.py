@@ -91,6 +91,7 @@ async def _try_adopt_surviving_person(
             AND tf."boundingBoxY1" = sf."boundingBoxY1"
             AND tf."boundingBoxX2" = sf."boundingBoxX2"
             AND tf."boundingBoxY2" = sf."boundingBoxY2"
+        JOIN person p ON p.id = tf."personId"
         WHERE tf."personId" IS NOT NULL
         LIMIT 1
         """,
