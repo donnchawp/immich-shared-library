@@ -52,16 +52,19 @@ async def get_unsynced_source_assets(
           AND NOT EXISTS (
             SELECT 1 FROM _face_sync_asset_map m
             WHERE m.source_asset_id = a.id
+              AND m.target_user_id = $4
           )
           AND NOT EXISTS (
             SELECT 1 FROM _face_sync_skipped s
             WHERE s.source_asset_id = a.id
+              AND s.target_user_id = $4
           )
         LIMIT $3
         """,
         job.source_user_id,
         job.source_path_prefix,
         limit,
+        job.target_user_id,
     )
 
 
@@ -147,17 +150,20 @@ async def find_duplicate_filenames(
     return duplicates
 
 
-async def record_skipped_duplicates(conn: asyncpg.Connection, source_asset_ids: set[UUID]) -> None:
+async def record_skipped_duplicates(
+    conn: asyncpg.Connection, source_asset_ids: set[UUID], target_user_id: UUID
+) -> None:
     """Batch-insert skip records for duplicate assets."""
     if not source_asset_ids:
         return
     await conn.execute(
         """
-        INSERT INTO _face_sync_skipped (source_asset_id, reason)
-        SELECT unnest($1::uuid[]), 'duplicate_filename'
-        ON CONFLICT (source_asset_id) DO NOTHING
+        INSERT INTO _face_sync_skipped (source_asset_id, target_user_id, reason)
+        SELECT unnest($1::uuid[]), $2, 'duplicate_filename'
+        ON CONFLICT (source_asset_id, target_user_id) DO NOTHING
         """,
         list(source_asset_ids),
+        target_user_id,
     )
 
 
@@ -187,13 +193,13 @@ async def sync_asset(conn: asyncpg.Connection, source: asyncpg.Record, job: Sync
     )
     if existing is not None:
         # Already synced but mapping was lost (crash recovery) — re-create mapping
-        # Use DO NOTHING (no conflict target) to handle unique violations on
-        # either source_asset_id or target_asset_id.
+        # Use conflict on the composite key (source_asset_id, target_user_id) since
+        # that's our unique constraint. Also catches target_asset_id conflicts.
         result = await conn.execute(
             """
             INSERT INTO _face_sync_asset_map (source_asset_id, target_asset_id, source_user_id, target_user_id, synced_at)
             VALUES ($1, $2, $3, $4, $5)
-            ON CONFLICT DO NOTHING
+            ON CONFLICT (source_asset_id, target_user_id) DO NOTHING
             """,
             source_id, existing, job.source_user_id, target_user_id, now,
         )
@@ -300,11 +306,12 @@ async def sync_asset(conn: asyncpg.Connection, source: asyncpg.Record, job: Sync
         remove_hardlinks(created_files)
         await conn.execute(
             """
-            INSERT INTO _face_sync_skipped (source_asset_id, reason)
-            VALUES ($1, 'duplicate_checksum')
-            ON CONFLICT (source_asset_id) DO NOTHING
+            INSERT INTO _face_sync_skipped (source_asset_id, target_user_id, reason)
+            VALUES ($1, $2, 'duplicate_checksum')
+            ON CONFLICT (source_asset_id, target_user_id) DO NOTHING
             """,
             source_id,
+            target_user_id,
         )
         logger.warning("Skipping asset %s: duplicate checksum for target user", source_id)
         return None

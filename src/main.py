@@ -2,6 +2,8 @@ import asyncio
 import logging
 import sys
 
+import asyncpg
+
 from src.config import settings
 from src.db import close_pool, execute, fetch_one, init_pool, reset_pool
 from src.health import start_health_server, stop_health_server
@@ -12,16 +14,28 @@ from src.sync_engine import run_full_sync
 logger = logging.getLogger(__name__)
 
 
+SCHEMA_VERSION = 2  # Bump when tracking table schema changes
+
+
 async def ensure_tracking_tables() -> None:
-    """Create the sidecar's tracking tables if they don't exist."""
+    """Create the sidecar's tracking tables if they don't exist, and run migrations."""
+    # Version tracking table (created first so migrations can read it)
+    await execute("""
+        CREATE TABLE IF NOT EXISTS _face_sync_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+    """)
+
     await execute("""
         CREATE TABLE IF NOT EXISTS _face_sync_asset_map (
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-            source_asset_id UUID NOT NULL UNIQUE,
+            source_asset_id UUID NOT NULL,
             target_asset_id UUID NOT NULL UNIQUE,
             source_user_id UUID NOT NULL,
             target_user_id UUID NOT NULL,
-            synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (source_asset_id, target_user_id)
         )
     """)
     await execute("""
@@ -36,12 +50,86 @@ async def ensure_tracking_tables() -> None:
     """)
     await execute("""
         CREATE TABLE IF NOT EXISTS _face_sync_skipped (
-            source_asset_id UUID PRIMARY KEY,
+            source_asset_id UUID NOT NULL,
+            target_user_id UUID NOT NULL,
             reason TEXT NOT NULL,
-            skipped_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            skipped_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (source_asset_id, target_user_id)
         )
     """)
-    logger.info("Tracking tables ready")
+
+    await _run_migrations()
+    logger.info("Tracking tables ready (schema version %d)", SCHEMA_VERSION)
+
+
+async def _run_migrations() -> None:
+    """Run pending schema migrations based on stored version."""
+    row = await fetch_one(
+        "SELECT value FROM _face_sync_meta WHERE key = 'schema_version'"
+    )
+    current = int(row["value"]) if row else 1
+
+    if current >= SCHEMA_VERSION:
+        return
+
+    if current < 2:
+        await _migrate_v2()
+
+    await execute(
+        """
+        INSERT INTO _face_sync_meta (key, value) VALUES ('schema_version', $1)
+        ON CONFLICT (key) DO UPDATE SET value = $1
+        """,
+        str(SCHEMA_VERSION),
+    )
+    logger.info("Migrated tracking tables from v%d to v%d", current, SCHEMA_VERSION)
+
+
+async def _migrate_v2() -> None:
+    """GH issue #1: allow syncing one source asset to multiple target users.
+
+    - _face_sync_asset_map: UNIQUE(source_asset_id) -> UNIQUE(source_asset_id, target_user_id)
+    - _face_sync_skipped: add target_user_id, change PK to composite
+    """
+    # Fix asset map unique constraint
+    await execute("""
+        DO $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conname = '_face_sync_asset_map_source_asset_id_key'
+                  AND conrelid = '_face_sync_asset_map'::regclass
+            ) THEN
+                ALTER TABLE _face_sync_asset_map
+                    DROP CONSTRAINT _face_sync_asset_map_source_asset_id_key;
+                ALTER TABLE _face_sync_asset_map
+                    ADD CONSTRAINT _face_sync_asset_map_source_target_user_key
+                    UNIQUE (source_asset_id, target_user_id);
+            END IF;
+        END $$
+    """)
+
+    # Recreate skipped table with target_user_id (skip data is just an
+    # optimisation — losing it means a one-time re-check of skipped assets)
+    await execute("""
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = '_face_sync_skipped'
+                  AND column_name = 'target_user_id'
+            ) THEN
+                DROP TABLE _face_sync_skipped;
+                CREATE TABLE _face_sync_skipped (
+                    source_asset_id UUID NOT NULL,
+                    target_user_id UUID NOT NULL,
+                    reason TEXT NOT NULL,
+                    skipped_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (source_asset_id, target_user_id)
+                );
+            END IF;
+        END $$
+    """)
 
 
 async def validate_user_and_library_ids() -> None:

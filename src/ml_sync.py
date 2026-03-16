@@ -145,8 +145,9 @@ async def sync_faces_incremental(conn: asyncpg.Connection) -> int:
         if count > 0:
             # Update the watermark so we don't re-check this asset next cycle
             await conn.execute(
-                "UPDATE _face_sync_asset_map SET synced_at = NOW() WHERE source_asset_id = $1",
+                "UPDATE _face_sync_asset_map SET synced_at = NOW() WHERE source_asset_id = $1 AND target_user_id = $2",
                 pair["source_asset_id"],
+                pair["target_user_id"],
             )
         total += count
 
