@@ -46,7 +46,7 @@ async def run_full_sync() -> dict:
                 # Duplicate detection: skip source assets already in target by filename + capture time
                 duplicates = await find_duplicate_filenames(conn, source_assets, job)
                 if duplicates:
-                    await record_skipped_duplicates(conn, duplicates)
+                    await record_skipped_duplicates(conn, duplicates, job.target_user_id)
                     stats["assets_skipped_duplicate"] += len(duplicates)
                     logger.warning(
                         "Job %s: skipping %d duplicate(s) by filename+date",
