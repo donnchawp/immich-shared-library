@@ -17,7 +17,7 @@ REQUIRED_SCHEMA: dict[str, set[str]] = {
     "asset": {
         "id", "deviceAssetId", "ownerId", "deviceId", "type", "originalPath",
         "fileCreatedAt", "fileModifiedAt", "isFavorite", "duration",
-        "encodedVideoPath", "checksum", "livePhotoVideoId", "originalFileName",
+        "checksum", "livePhotoVideoId", "originalFileName",
         "thumbhash", "isOffline", "libraryId", "isExternal", "localDateTime",
         "stackId", "duplicateId", "status", "visibility", "width", "height",
         "isEdited", "deletedAt",
@@ -73,7 +73,7 @@ INSERTED_COLUMNS: dict[str, set[str]] = {
     "asset": {
         "id", "deviceAssetId", "ownerId", "deviceId", "type", "originalPath",
         "fileCreatedAt", "fileModifiedAt", "isFavorite", "duration",
-        "encodedVideoPath", "checksum", "livePhotoVideoId", "originalFileName",
+        "checksum", "livePhotoVideoId", "originalFileName",
         "thumbhash", "isOffline", "libraryId", "isExternal", "localDateTime",
         "stackId", "duplicateId", "status", "visibility", "width", "height",
         "isEdited",
