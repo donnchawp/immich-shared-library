@@ -35,7 +35,7 @@ The target user's assets appear instantly with full search, face recognition, an
 ## Prerequisites
 
 - **Docker** with `docker compose` — the sidecar builds and runs entirely in Docker, no other development tools required
-- **Immich v2.6.1** (tested). Other v2.x versions may work but the database schema can change between releases — check the [Immich release notes](https://github.com/immich-app/immich/releases) before upgrading.
+- **Immich v2.7.2** (tested). Other v2.x versions may work but the database schema can change between releases — check the [Immich release notes](https://github.com/immich-app/immich/releases) before upgrading.
 - Two or more Immich users (at least one source and one target)
 - Source assets must be fully processed by Immich (metadata, faces, CLIP)
 
@@ -313,6 +313,25 @@ The sidecar will:
 - Create its tracking tables (`_face_sync_asset_map`, `_face_sync_person_map`)
 - Run a sync cycle every 60 seconds (configurable via `SYNC_INTERVAL_SECONDS`)
 
+## Updating
+
+When you pull new changes from this repository (for example after an Immich upgrade that requires sidecar schema fixes), rebuild the image and restart the container:
+
+```bash
+git pull
+docker compose up -d --build
+```
+
+The `--build` flag is required — without it, Docker will keep using the previously built image and your code changes won't take effect.
+
+Then check the logs to confirm the sidecar is running cleanly and syncing photos:
+
+```bash
+docker compose logs -f
+```
+
+Look for "Schema validation passed" on startup and periodic sync cycle messages. If schema validation fails, the logs will tell you exactly which columns or tables changed — this usually means Immich added new required columns that the sidecar needs to supply.
+
 ## Configuration Reference
 
 ### config.yaml (per-job settings)
@@ -382,7 +401,7 @@ If the target user already has their own photos with detected faces, they'll see
 
 - **`force=true` jobs**: If someone triggers a force re-process in Immich, it will re-run ML on the target user's assets, overwriting the copied data. The sidecar will re-sync on the next cycle, but there will be temporary GPU usage.
 - **Same filesystem required**: Hardlinks only work when the sidecar container mounts the same volume as Immich. Cross-filesystem setups would need file copies instead.
-- **Direct database access**: This service writes directly to Immich's database. Tested with v2.6.1 — schema changes in other versions may require updates to this sidecar. Always back up your database before use.
+- **Direct database access**: This service writes directly to Immich's database. Tested with v2.7.2 — schema changes in other versions may require updates to this sidecar. Always back up your database before use.
 - **Single direction**: Sync is one-way (source → target). Changes made to target assets in Immich are not propagated back.
 
 ## Contributing

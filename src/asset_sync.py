@@ -217,15 +217,15 @@ async def sync_asset(conn: asyncpg.Connection, source: asyncpg.Record, job: Sync
             INSERT INTO asset (
                 id, "deviceAssetId", "ownerId", "deviceId", type, "originalPath",
                 "fileCreatedAt", "fileModifiedAt", "isFavorite", duration,
-                checksum, "livePhotoVideoId", "originalFileName",
+                checksum, "checksumAlgorithm", "livePhotoVideoId", "originalFileName",
                 thumbhash, "isOffline", "libraryId", "isExternal", "localDateTime",
                 "stackId", "duplicateId", status, visibility, width, height, "isEdited"
             ) VALUES (
                 $1, $2, $3, $4, $5, $6,
                 $7, $8, $9, $10,
-                $11, $12, $13,
-                $14, $15, $16, $17, $18,
-                $19, $20, $21, $22, $23, $24, $25
+                $11, $12, $13, $14,
+                $15, $16, $17, $18, $19,
+                $20, $21, $22, $23, $24, $25, $26
             )
             """,
             target_id,
@@ -239,6 +239,7 @@ async def sync_asset(conn: asyncpg.Connection, source: asyncpg.Record, job: Sync
             False,  # isFavorite — don't copy preference
             source["duration"],
             source["checksum"],
+            source["checksumAlgorithm"],
             None,  # livePhotoVideoId — handle separately if needed
             source["originalFileName"],
             source["thumbhash"],
