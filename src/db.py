@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
@@ -9,21 +10,30 @@ from src.config import settings
 logger = logging.getLogger(__name__)
 
 _pool: asyncpg.Pool | None = None
+_pool_lock = asyncio.Lock()
 
 
 async def init_pool() -> asyncpg.Pool:
+    """Return the connection pool, creating it if necessary.
+
+    Idempotent and concurrency-safe: the sync and scan loops run concurrently,
+    so a double-checked lock prevents two coroutines from racing to create two
+    pools when the pool is absent (e.g. after a failed reset_pool()).
+    """
     global _pool
     if _pool is None:
-        _pool = await asyncpg.create_pool(
-            host=settings.db_hostname,
-            port=settings.db_port,
-            user=settings.db_username,
-            password=settings.db_password.get_secret_value(),
-            database=settings.db_database_name,
-            min_size=2,
-            max_size=10,
-        )
-        logger.info("Database connection pool created")
+        async with _pool_lock:
+            if _pool is None:
+                _pool = await asyncpg.create_pool(
+                    host=settings.db_hostname,
+                    port=settings.db_port,
+                    user=settings.db_username,
+                    password=settings.db_password.get_secret_value(),
+                    database=settings.db_database_name,
+                    min_size=2,
+                    max_size=10,
+                )
+                logger.info("Database connection pool created")
     return _pool
 
 
@@ -56,14 +66,16 @@ def get_pool() -> asyncpg.Pool:
 
 @asynccontextmanager
 async def acquire() -> AsyncIterator[asyncpg.Connection]:
-    pool = get_pool()
+    # Lazily (re)create the pool so a failed reset_pool() can recover on the
+    # next operation instead of wedging the loop with "pool not initialized".
+    pool = await init_pool()
     async with pool.acquire() as conn:
         yield conn
 
 
 @asynccontextmanager
 async def transaction() -> AsyncIterator[asyncpg.Connection]:
-    pool = get_pool()
+    pool = await init_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
             yield conn
