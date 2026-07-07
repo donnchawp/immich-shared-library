@@ -170,6 +170,42 @@ async def _check_mapping(
     )
 
 
+async def _resolve_canonical_person(
+    conn: asyncpg.Connection,
+    person_id: UUID,
+) -> tuple[UUID, UUID] | None:
+    """Follow the mirror chain to the canonical (user-created) person.
+
+    A person is a sidecar-created mirror iff it appears as ``target_person_id``
+    in the mapping table. This walks ``target_person_id -> source_person_id``
+    links until it reaches a person that is nobody's mirror — the canonical
+    origin — and returns ``(canonical_person_id, canonical_owner_id)``.
+
+    This is the loop-guard: with bidirectional jobs the sidecar would otherwise
+    mirror its own mirrors back and forth, spawning mirror-of-mirror duplicates
+    that collapse catastrophically when the user merges them. A ``seen`` set
+    breaks cycles (two accounts linked as mutual mirrors of the same person).
+
+    Returns ``None`` if the resolved person no longer exists.
+    """
+    seen: set[UUID] = set()
+    current = person_id
+    while current not in seen:
+        seen.add(current)
+        parent = await conn.fetchval(
+            "SELECT source_person_id FROM _face_sync_person_map WHERE target_person_id = $1 LIMIT 1",
+            current,
+        )
+        if parent is None:
+            break  # current is nobody's mirror -> canonical origin
+        current = parent
+
+    owner = await conn.fetchval('SELECT "ownerId" FROM person WHERE id = $1', current)
+    if owner is None:
+        return None
+    return current, owner
+
+
 async def get_or_create_target_person(
     conn: asyncpg.Connection,
     source_person_id: UUID,
@@ -183,6 +219,21 @@ async def get_or_create_target_person(
 
     Returns the target person ID, or None if source person doesn't exist.
     """
+    # Loop-guard: resolve to the canonical (user-created) person so we never
+    # mirror a mirror. If the canonical person already lives in the target
+    # account, that IS the real person — assign the face to it directly and
+    # never create a duplicate mirror (this closes the bidirectional loop).
+    resolved = await _resolve_canonical_person(conn, source_person_id)
+    if resolved is None:
+        logger.warning("Source person %s not found", source_person_id)
+        return None
+    canonical_id, canonical_owner = resolved
+    if canonical_owner == target_user_id:
+        return canonical_id
+    # Mirror the canonical person, not an intermediate mirror.
+    source_person_id = canonical_id
+    source_user_id = canonical_owner
+
     # Fast path (no lock needed)
     target = await _check_mapping(conn, source_person_id, target_user_id)
     if target is not None:
@@ -325,13 +376,24 @@ async def sync_person_visibility(conn: asyncpg.Connection) -> int:
 
 
 async def cleanup_orphaned_persons(conn: asyncpg.Connection) -> int:
-    """Remove target persons whose source person has been deleted."""
+    """Remove target persons whose source person has been deleted.
+
+    Safety: only delete a mirror person that has NO remaining assigned faces.
+    Deleting a person in Immich sets its faces' personId to NULL (ON DELETE SET
+    NULL), so removing a mirror that still owns faces silently unassigns them.
+    When the target user has merged/adopted a mirror it keeps its faces, so we
+    leave it as a standalone person instead of stranding those faces.
+    """
     deleted = await conn.fetch(
         """
         DELETE FROM person t
         USING _face_sync_person_map m
         WHERE t.id = m.target_person_id
           AND NOT EXISTS (SELECT 1 FROM person WHERE id = m.source_person_id)
+          AND NOT EXISTS (
+              SELECT 1 FROM asset_face af
+              WHERE af."personId" = t.id AND af."deletedAt" IS NULL
+          )
         RETURNING t.id
         """,
     )
@@ -345,5 +407,16 @@ async def cleanup_orphaned_persons(conn: asyncpg.Connection) -> int:
             [row["id"] for row in deleted],
         )
         logger.info("Cleaned up %d orphaned mirrored persons", len(deleted))
+
+    # Prune any mapping whose source person is gone but whose target survived
+    # (e.g. a mirror we kept because it still has faces). The target becomes a
+    # standalone person; leaving the dangling row would make canonical
+    # resolution walk into a deleted person.
+    await conn.execute(
+        """
+        DELETE FROM _face_sync_person_map m
+        WHERE NOT EXISTS (SELECT 1 FROM person WHERE id = m.source_person_id)
+        """,
+    )
 
     return len(deleted)

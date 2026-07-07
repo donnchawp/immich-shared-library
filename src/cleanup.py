@@ -103,8 +103,15 @@ async def cleanup_reassigned_faces(conn: asyncpg.Connection) -> int:
     and updates the target face accordingly.
     Returns the number of faces updated.
     """
-    # Find target faces where the source face's person has changed
-    # User IDs are derived from the tracking table instead of global settings
+    # Find target faces where the source face's person has changed.
+    # User IDs are derived from the tracking table instead of global settings.
+    #
+    # The expected target person is computed the same way get_or_create_target_person
+    # resolves it, so mirror faces don't get flagged as mismatched every cycle:
+    #   - `origin` catches the loop-guard case: the source face's person is itself
+    #     a sidecar mirror whose canonical origin lives in the target account, so
+    #     the face maps straight to that real person.
+    #   - `pm` is the normal mirror mapping keyed on the source person.
     mismatched = await conn.fetch(
         """
         SELECT
@@ -122,7 +129,10 @@ async def cleanup_reassigned_faces(conn: asyncpg.Connection) -> int:
             AND tf."boundingBoxY2" = sf."boundingBoxY2"
         LEFT JOIN _face_sync_person_map pm ON pm.source_person_id = sf."personId"
             AND pm.target_user_id = m.target_user_id
-        WHERE tf."personId" IS DISTINCT FROM pm.target_person_id
+        LEFT JOIN _face_sync_person_map mir ON mir.target_person_id = sf."personId"
+        LEFT JOIN person origin ON origin.id = mir.source_person_id
+            AND origin."ownerId" = m.target_user_id
+        WHERE tf."personId" IS DISTINCT FROM COALESCE(origin.id, pm.target_person_id)
         """,
     )
 
