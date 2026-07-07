@@ -176,8 +176,15 @@ async def validate_user_and_library_ids() -> None:
 
         # Validate per-job album if configured
         if job.album_id:
+            # Since Immich v3, album ownership lives in album_user (role='owner')
+            # rather than album."ownerId"
             album = await fetch_one(
-                'SELECT id, "ownerId", "deletedAt" FROM album WHERE id = $1',
+                """
+                SELECT a.id, a."deletedAt", au."userId" AS owner_id
+                FROM album a
+                LEFT JOIN album_user au ON au."albumId" = a.id AND au.role = 'owner'
+                WHERE a.id = $1
+                """,
                 job.album_id,
             )
             if album is None:
@@ -188,10 +195,10 @@ async def validate_user_and_library_ids() -> None:
                 raise RuntimeError(
                     f"[{job.name}] album_id {job.album_id} is deleted"
                 )
-            if album["ownerId"] != job.target_user_id:
+            if album["owner_id"] != job.target_user_id:
                 raise RuntimeError(
                     f"[{job.name}] album_id {job.album_id} belongs to user "
-                    f"{album['ownerId']}, not target_user_id {job.target_user_id}"
+                    f"{album['owner_id']}, not target_user_id {job.target_user_id}"
                 )
 
     logger.info("Configuration validated: users, libraries, and albums exist and are correctly associated")

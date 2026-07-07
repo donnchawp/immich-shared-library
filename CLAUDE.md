@@ -85,6 +85,10 @@ Key relationships:
 - `person.faceAssetId` is FK to `asset_face.id` (not `asset.id`)
 - `face_search.embedding` and `smart_search.embedding` are `vector(512)` (pgvector)
 - Asset checksum unique constraint: `(ownerId, libraryId, checksum) WHERE libraryId IS NOT NULL`
+- Album ownership (since Immich v3): `album_user` row with `role = 'owner'` — `album."ownerId"` no longer exists
+- `asset.duration` (since Immich v3): integer milliseconds (was varchar)
+- OCR results (since Immich v3): `asset_ocr` (text boxes) + `ocr_search` (search text), both CASCADE from `asset`
+- Video stream metadata (since Immich v3): `asset_video`/`asset_audio`/`asset_keyframe`, all PK on `assetId`, CASCADE from `asset`; videos also have an `encoded_video` row in `asset_file`
 - Thumbnail path: `/data/thumbs/{userId}/{assetId[0:2]}/{assetId[2:4]}/{assetId}_{type}.{ext}`
 - Person thumbnail: `/data/thumbs/{userId}/{personId[0:2]}/{personId[2:4]}/{personId}.jpeg`
 

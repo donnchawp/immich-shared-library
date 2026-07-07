@@ -35,7 +35,7 @@ The target user's assets appear instantly with full search, face recognition, an
 ## Prerequisites
 
 - **Docker** with `docker compose` — the sidecar builds and runs entirely in Docker, no other development tools required
-- **Immich v2.7.4** (tested). Other v2.x versions may work but the database schema can change between releases — check the [Immich release notes](https://github.com/immich-app/immich/releases) before upgrading.
+- **Immich v3.0.1** (tested). Other v3.x versions may work but the database schema can change between releases — check the [Immich release notes](https://github.com/immich-app/immich/releases) before upgrading. Note: since v3, album ownership lives in `album_user` (role `owner`), and the sidecar copies OCR results (`asset_ocr`/`ocr_search`) and video stream metadata (`asset_video`/`asset_audio`/`asset_keyframe`) alongside CLIP embeddings.
 - Two or more Immich users (at least one source and one target)
 - Source assets must be fully processed by Immich (metadata, faces, CLIP)
 
@@ -401,7 +401,7 @@ If the target user already has their own photos with detected faces, they'll see
 
 - **`force=true` jobs**: If someone triggers a force re-process in Immich, it will re-run ML on the target user's assets, overwriting the copied data. The sidecar will re-sync on the next cycle, but there will be temporary GPU usage.
 - **Same filesystem required**: Hardlinks only work when the sidecar container mounts the same volume as Immich. Cross-filesystem setups would need file copies instead.
-- **Direct database access**: This service writes directly to Immich's database. Tested with v2.7.4 — schema changes in other versions may require updates to this sidecar. Always back up your database before use.
+- **Direct database access**: This service writes directly to Immich's database. Tested with v3.0.1 — schema changes in other versions may require updates to this sidecar. Always back up your database before use.
 - **Single direction**: Sync is one-way (source → target). Changes made to target assets in Immich are not propagated back.
 
 ## Contributing
