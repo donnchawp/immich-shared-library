@@ -3,7 +3,7 @@ from uuid import UUID
 
 from src.album_sync import add_assets_to_album, backfill_album
 from src.asset_sync import find_duplicate_filenames, get_unsynced_source_assets, record_skipped_duplicates, sync_asset
-from src.cleanup import cleanup_deleted_assets, cleanup_reassigned_faces
+from src.cleanup import cleanup_deleted_assets, cleanup_reassigned_faces, cleanup_stale_mappings
 from src.config import settings
 from src.db import transaction
 from src.ml_sync import sync_faces_for_asset, sync_faces_incremental
@@ -28,6 +28,7 @@ async def run_full_sync() -> dict:
         "faces_reassigned": 0,
         "persons_cleaned": 0,
         "album_assets_added": 0,
+        "stale_mappings_pruned": 0,
     }
 
     # Track new target asset IDs per job (for per-job album assignment)
@@ -91,6 +92,7 @@ async def run_full_sync() -> dict:
 
     # Phase 4: Handle deletions and person merges
     async with transaction() as conn:
+        stats["stale_mappings_pruned"] = await cleanup_stale_mappings(conn)
         stats["assets_cleaned"] = await cleanup_deleted_assets(conn)
         stats["faces_reassigned"] = await cleanup_reassigned_faces(conn)
         stats["persons_cleaned"] = await cleanup_orphaned_persons(conn)

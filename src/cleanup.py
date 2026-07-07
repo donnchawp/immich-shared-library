@@ -69,6 +69,33 @@ async def cleanup_deleted_assets(conn: asyncpg.Connection) -> int:
     return count
 
 
+async def cleanup_stale_mappings(conn: asyncpg.Connection) -> int:
+    """Prune mappings whose target asset no longer exists in Immich.
+
+    When a target user hard-deletes a synced asset (e.g. empties the trash),
+    the leftover mapping would otherwise block that source asset from ever
+    re-syncing. Trashed assets still have a row (with deletedAt set), so
+    their mapping survives until the trash is emptied — restoring from
+    trash keeps the original mapping intact.
+
+    Returns the number of mappings pruned; pruned sources re-sync in the
+    next cycle's Phase 1.
+    """
+    pruned = await conn.fetch(
+        """
+        DELETE FROM _face_sync_asset_map m
+        WHERE NOT EXISTS (SELECT 1 FROM asset a WHERE a.id = m.target_asset_id)
+        RETURNING source_asset_id, target_asset_id
+        """,
+    )
+    for row in pruned:
+        logger.info(
+            "Pruned stale mapping (target deleted in Immich): source=%s target=%s",
+            row["source_asset_id"], row["target_asset_id"],
+        )
+    return len(pruned)
+
+
 async def cleanup_reassigned_faces(conn: asyncpg.Connection) -> int:
     """Handle person merges: when source faces are reassigned to different persons.
 

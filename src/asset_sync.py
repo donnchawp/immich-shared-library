@@ -11,6 +11,20 @@ from src.file_ops import hardlink_asset_files, remove_hardlinks
 
 logger = logging.getLogger(__name__)
 
+# Video stream tables added in Immich v3. All are PK'd on assetId and CASCADE
+# from asset. Copied so Immich doesn't need to re-probe synced video assets.
+_VIDEO_STREAM_TABLES = [
+    ("asset_video",
+     'bitrate, "frameCount", "timeBase", "index", profile, level, '
+     '"colorPrimaries", "colorTransfer", "colorMatrix", "dvProfile", '
+     '"dvLevel", "dvBlSignalCompatibilityId", "codecName", "formatName", '
+     '"formatLongName", "pixelFormat"'),
+    ("asset_audio", 'bitrate, "index", profile, "codecName"'),
+    ("asset_keyframe",
+     'pts, "accDuration", "ownDuration", "totalDuration", "packetCount", '
+     '"outputFrames"'),
+]
+
 
 def _remap_asset_path(source_path: str, job: SyncJob) -> str:
     """Remap an asset's originalPath from the source prefix to the target prefix.
@@ -215,23 +229,21 @@ async def sync_asset(conn: asyncpg.Connection, source: asyncpg.Record, job: Sync
         await conn.execute(
             """
             INSERT INTO asset (
-                id, "deviceAssetId", "ownerId", "deviceId", type, "originalPath",
+                id, "ownerId", type, "originalPath",
                 "fileCreatedAt", "fileModifiedAt", "isFavorite", duration,
                 checksum, "checksumAlgorithm", "livePhotoVideoId", "originalFileName",
                 thumbhash, "isOffline", "libraryId", "isExternal", "localDateTime",
                 "stackId", "duplicateId", status, visibility, width, height, "isEdited"
             ) VALUES (
-                $1, $2, $3, $4, $5, $6,
-                $7, $8, $9, $10,
-                $11, $12, $13, $14,
-                $15, $16, $17, $18, $19,
-                $20, $21, $22, $23, $24, $25, $26
+                $1, $2, $3, $4,
+                $5, $6, $7, $8,
+                $9, $10, $11, $12,
+                $13, $14, $15, $16, $17,
+                $18, $19, $20, $21, $22, $23, $24
             )
             """,
             target_id,
-            source["deviceAssetId"],
             target_user_id,
-            source["deviceId"],
             source["type"],
             target_path,
             source["fileCreatedAt"],
@@ -262,14 +274,19 @@ async def sync_asset(conn: asyncpg.Connection, source: asyncpg.Record, job: Sync
         # 3. Hardlink thumbnails/previews and create asset_files records
         created_files = await _sync_asset_files(conn, source_id, target_id, source["ownerId"], target_user_id)
 
-        # 4. Set job status to mark as fully processed
+        # 4. Set job status to mark as fully processed.
+        # ocrAt comes from the source row: if the source hasn't been OCR'd
+        # (e.g. OCR disabled), it stays NULL so Immich can OCR the target itself.
         await conn.execute(
             """
             INSERT INTO asset_job_status ("assetId", "facesRecognizedAt", "metadataExtractedAt", "duplicatesDetectedAt", "ocrAt")
-            VALUES ($1, $2, $2, $2, $2)
+            SELECT $1, $2, $2, $2, src."ocrAt"
+            FROM asset_job_status src
+            WHERE src."assetId" = $3
             """,
             target_id,
             now,
+            source_id,
         )
 
         # 5. Copy smart_search embedding
@@ -283,6 +300,41 @@ async def sync_asset(conn: asyncpg.Connection, source: asyncpg.Record, job: Sync
             target_id,
             source_id,
         )
+
+        # 5b. Copy OCR results (detected text boxes + search text), same
+        # pattern as smart_search. asset_ocr.id and updateId have DB defaults.
+        await conn.execute(
+            """
+            INSERT INTO asset_ocr ("assetId", x1, y1, x2, y2, x3, y3, x4, y4,
+                                   "boxScore", "textScore", text, "isVisible")
+            SELECT $1, x1, y1, x2, y2, x3, y3, x4, y4,
+                   "boxScore", "textScore", text, "isVisible"
+            FROM asset_ocr
+            WHERE "assetId" = $2
+            """,
+            target_id,
+            source_id,
+        )
+        await conn.execute(
+            """
+            INSERT INTO ocr_search ("assetId", text)
+            SELECT $1, text
+            FROM ocr_search
+            WHERE "assetId" = $2
+            """,
+            target_id,
+            source_id,
+        )
+
+        # 5c. Copy video/audio stream metadata and keyframe index.
+        # The INSERT...SELECT is a no-op for photos (no source rows).
+        for table, columns in _VIDEO_STREAM_TABLES:
+            await conn.execute(
+                f'INSERT INTO {table} ("assetId", {columns}) '
+                f'SELECT $1, {columns} FROM {table} WHERE "assetId" = $2',
+                target_id,
+                source_id,
+            )
 
         # 6. Track the mapping
         await conn.execute(

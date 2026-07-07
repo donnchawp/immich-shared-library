@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 REQUIRED_SCHEMA: dict[str, set[str]] = {
     "asset": {
-        "id", "deviceAssetId", "ownerId", "deviceId", "type", "originalPath",
+        "id", "ownerId", "type", "originalPath",
         "fileCreatedAt", "fileModifiedAt", "isFavorite", "duration",
         "checksum", "checksumAlgorithm", "livePhotoVideoId", "originalFileName",
         "thumbhash", "isOffline", "libraryId", "isExternal", "localDateTime",
@@ -35,6 +35,26 @@ REQUIRED_SCHEMA: dict[str, set[str]] = {
     "smart_search": {
         "assetId", "embedding",
     },
+    "asset_ocr": {
+        "assetId", "x1", "y1", "x2", "y2", "x3", "y3", "x4", "y4",
+        "boxScore", "textScore", "text", "isVisible",
+    },
+    "ocr_search": {
+        "assetId", "text",
+    },
+    "asset_video": {
+        "assetId", "bitrate", "frameCount", "timeBase", "index", "profile",
+        "level", "colorPrimaries", "colorTransfer", "colorMatrix", "dvProfile",
+        "dvLevel", "dvBlSignalCompatibilityId", "codecName", "formatName",
+        "formatLongName", "pixelFormat",
+    },
+    "asset_audio": {
+        "assetId", "bitrate", "index", "profile", "codecName",
+    },
+    "asset_keyframe": {
+        "assetId", "pts", "accDuration", "ownDuration", "totalDuration",
+        "packetCount", "outputFrames",
+    },
     "asset_face": {
         "id", "assetId", "personId", "imageWidth", "imageHeight",
         "boundingBoxX1", "boundingBoxY1", "boundingBoxX2", "boundingBoxY2",
@@ -48,7 +68,10 @@ REQUIRED_SCHEMA: dict[str, set[str]] = {
         "faceAssetId", "isFavorite", "color",
     },
     "album": {
-        "id", "ownerId", "updatedAt", "deletedAt",
+        "id", "updatedAt", "deletedAt",
+    },
+    "album_user": {
+        "albumId", "userId", "role",
     },
     "album_asset": {
         "albumId", "assetId",
@@ -71,7 +94,7 @@ class SchemaValidationError(RuntimeError):
 # INSERT failures after an Immich upgrade.
 INSERTED_COLUMNS: dict[str, set[str]] = {
     "asset": {
-        "id", "deviceAssetId", "ownerId", "deviceId", "type", "originalPath",
+        "id", "ownerId", "type", "originalPath",
         "fileCreatedAt", "fileModifiedAt", "isFavorite", "duration",
         "checksum", "checksumAlgorithm", "livePhotoVideoId", "originalFileName",
         "thumbhash", "isOffline", "libraryId", "isExternal", "localDateTime",
@@ -97,6 +120,26 @@ INSERTED_COLUMNS: dict[str, set[str]] = {
     "smart_search": {
         "assetId", "embedding",
     },
+    "asset_ocr": {
+        "assetId", "x1", "y1", "x2", "y2", "x3", "y3", "x4", "y4",
+        "boxScore", "textScore", "text", "isVisible",
+    },
+    "ocr_search": {
+        "assetId", "text",
+    },
+    "asset_video": {
+        "assetId", "bitrate", "frameCount", "timeBase", "index", "profile",
+        "level", "colorPrimaries", "colorTransfer", "colorMatrix", "dvProfile",
+        "dvLevel", "dvBlSignalCompatibilityId", "codecName", "formatName",
+        "formatLongName", "pixelFormat",
+    },
+    "asset_audio": {
+        "assetId", "bitrate", "index", "profile", "codecName",
+    },
+    "asset_keyframe": {
+        "assetId", "pts", "accDuration", "ownDuration", "totalDuration",
+        "packetCount", "outputFrames",
+    },
     "asset_face": {
         "id", "assetId", "personId", "imageWidth", "imageHeight",
         "boundingBoxX1", "boundingBoxY1", "boundingBoxX2", "boundingBoxY2",
@@ -118,6 +161,7 @@ INSERTED_COLUMNS: dict[str, set[str]] = {
 # cleanup.py deletes from asset and relies on cascades for these.
 EXPECTED_CASCADE_CHILDREN: set[str] = {
     "asset_exif", "asset_file", "asset_face", "smart_search", "asset_job_status",
+    "asset_ocr", "ocr_search", "asset_video", "asset_audio", "asset_keyframe",
 }
 
 # Unique/PK constraints required for ON CONFLICT clauses on Immich tables.
