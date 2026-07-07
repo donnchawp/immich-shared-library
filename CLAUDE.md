@@ -52,7 +52,7 @@ There are no automated tests yet. `test_sync.py` is a manual integration test th
 
 3. **Person metadata sync** (`person_sync.py`): Syncs name changes, `isHidden` visibility, and thumbnail paths from source to target persons.
 
-4. **Cleanup** (`cleanup.py`, `person_sync.py`): Removes target assets whose source was deleted/trashed, handles person merges (bounding-box matching to detect face reassignment), removes orphaned target persons.
+4. **Cleanup** (`cleanup.py`, `person_sync.py`): Prunes mappings whose target asset was hard-deleted in Immich (so the source re-syncs next cycle; trashed targets keep their mapping), removes target assets whose source was deleted/trashed, handles person merges (bounding-box matching to detect face reassignment), removes orphaned target persons.
 
 ### Key modules
 
