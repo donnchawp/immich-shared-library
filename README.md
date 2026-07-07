@@ -77,7 +77,7 @@ The wizard will:
 2. Auto-detect volume mount paths from Immich's `docker-compose.yml`
 3. Let you choose which sync method(s) to configure (external library, upload sync, or both)
 4. Walk you through selecting source/target users
-5. Create the necessary symlinks and external libraries in Immich (with `**/*` exclusion so Immich won't scan them)
+5. Create the necessary symlinks and external libraries in Immich (with `**/*` exclusion so Immich won't scan them — you must also disable Immich's periodic scan, see [Setup](#setup))
 6. Optionally set up album assignment
 7. Generate a `.env` file with all the correct UUIDs and path prefixes
 
@@ -203,6 +203,16 @@ The sidecar writes asset records directly to the database. Immich sees User B's 
 
 Because the target library has the `**/*` exclusion pattern, Immich will ignore file events in that library.
 
+> **⚠️ Disable Immich's periodic scan, and never run a manual scan on a target library.**
+>
+> Library *watching* (inotify) respects the `**/*` exclusion and is safe. A *scan* is not: it crawls the target library, finds 0 files (because of the exclusion), concludes every sidecar-managed asset is missing from disk, and marks them all **offline** — soft-deleting them so the target user's shared photos disappear. A full library's worth of assets can be offlined in a single scan.
+>
+> To avoid this:
+> 1. Turn off **Administration > Settings > External Library > Periodic Scanning** (or set no cron schedule). Rely on library watching to discover new *source* files instead.
+> 2. Never click **Scan** on a target library in the UI.
+>
+> Do **not** work around this by removing the `**/*` exclusion pattern. Without it, Immich imports and runs full ML processing (thumbnails, transcoding, CLIP, faces) on every target file itself — duplicating all the work this sidecar exists to avoid. See [issue #3](https://github.com/donnchawp/immich-shared-library/issues/3).
+
 > **Note:** The sidecar does not trigger library scans itself. It relies on Immich's library watching (or manual scans) to discover new source files. If library watching doesn't work in your environment (e.g., network drives), you can trigger scans manually:
 > ```bash
 > curl -X POST "http://localhost:2283/api/libraries/SOURCE_LIBRARY_ID/scan" \
@@ -245,6 +255,8 @@ The symlink target must point to the source user's upload directory *inside the 
 3. Add `**/*` as an exclusion pattern and save
 
 > **Why a separate library?** The source user's libraries are actively scanned by Immich to discover and process new assets. The upload sync target library must *not* be scanned (Immich would create duplicate records and run redundant ML processing). The sidecar handles creating the asset records directly in the database.
+
+> **⚠️ The same scan warning applies here:** disable Immich's periodic scan and never manually scan this library, or the `**/*` exclusion will cause Immich to offline every synced asset. See the warning in the external library sync setup above and [issue #3](https://github.com/donnchawp/immich-shared-library/issues/3).
 
 **Add to `.env`:**
 
