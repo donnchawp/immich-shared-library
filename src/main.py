@@ -48,6 +48,13 @@ async def ensure_tracking_tables() -> None:
             UNIQUE (source_person_id, target_user_id)
         )
     """)
+    # Index the reverse lookup: canonical-person resolution and the reassignment
+    # cleanup both query by target_person_id (which the UNIQUE above doesn't cover).
+    # Without it those run sequential scans on every sync cycle.
+    await execute("""
+        CREATE INDEX IF NOT EXISTS idx_face_sync_person_map_target
+            ON _face_sync_person_map (target_person_id)
+    """)
     await execute("""
         CREATE TABLE IF NOT EXISTS _face_sync_skipped (
             source_asset_id UUID NOT NULL,
