@@ -145,6 +145,16 @@ async def cleanup_reassigned_faces(conn: asyncpg.Connection) -> int:
                 row["source_user_id"], row["target_user_id"],
             )
 
+        # Idempotency guard. get_or_create_target_person is the authoritative
+        # resolver: it walks the full mirror chain to the canonical person. The
+        # SELECT above only approximates that with a single hop (mir/origin), so
+        # for chained/bidirectional mirrors it flags faces that already hold the
+        # correct canonical person. Rewriting the same value every cycle is the
+        # "Updated N faces due to person reassignment" loop — only write when the
+        # resolved person genuinely differs from the current one.
+        if new_target_person_id == row["current_target_person_id"]:
+            continue
+
         await conn.execute(
             'UPDATE asset_face SET "personId" = $1 WHERE id = $2',
             new_target_person_id,
