@@ -2,6 +2,15 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Teaching Mode
+
+The user is learning Python through this project. When making code changes:
+
+- Briefly explain **what** the code does and **why**, focusing on Python concepts that may be unfamiliar (e.g., async/await, context managers, list comprehensions, type hints, decorators)
+- After making changes, ask if anything needs further explanation
+- Keep explanations concise — a sentence or two per concept, not a lecture
+- Use the actual code being changed as the teaching example, not abstract examples
+
 ## What This Is
 
 A Python sidecar service that syncs a subset of Immich photos from a source user to a target user by directly creating pre-populated asset records with copied ML data (CLIP embeddings, face detection, face recognition) and hardlinked thumbnails. This eliminates duplicate ML processing when sharing external libraries between users.
@@ -89,6 +98,8 @@ Key relationships:
 - `asset.duration` (since Immich v3): integer milliseconds (was varchar)
 - OCR results (since Immich v3): `asset_ocr` (text boxes) + `ocr_search` (search text), both CASCADE from `asset`
 - Video stream metadata (since Immich v3): `asset_video`/`asset_audio`/`asset_keyframe`, all PK on `assetId`, CASCADE from `asset`; videos also have an `encoded_video` row in `asset_file`
+- `asset.isEdited` is **derived, not authoritative**: statement-level triggers on `asset_edit` own it (`asset_edit_insert` sets it true, `asset_edit_delete` sets it false when the last edit row goes). Never INSERT it directly — copy the `asset_edit` rows and let the trigger flip it, or the flag desynchronizes from the rows it summarizes. Both delete triggers are guarded by `pg_trigger_depth() = 0`, so a CASCADE delete from `asset` skips them.
+- `asset_edit` (since Immich v3): `(assetId, action, parameters, sequence)`, unique on `(assetId, sequence)`, CASCADE from `asset`. `parameters` is pure geometry (crop x/y/w/h, rotate angle, mirror axis) — no ids or paths, so it copies verbatim.
 - Thumbnail path: `/data/thumbs/{userId}/{assetId[0:2]}/{assetId[2:4]}/{assetId}_{type}.{ext}`
 - Person thumbnail: `/data/thumbs/{userId}/{personId[0:2]}/{personId[2:4]}/{personId}.jpeg`
 

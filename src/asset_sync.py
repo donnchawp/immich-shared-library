@@ -233,13 +233,13 @@ async def sync_asset(conn: asyncpg.Connection, source: asyncpg.Record, job: Sync
                 "fileCreatedAt", "fileModifiedAt", "isFavorite", duration,
                 checksum, "checksumAlgorithm", "livePhotoVideoId", "originalFileName",
                 thumbhash, "isOffline", "libraryId", "isExternal", "localDateTime",
-                "stackId", "duplicateId", status, visibility, width, height, "isEdited"
+                "stackId", "duplicateId", status, visibility, width, height
             ) VALUES (
                 $1, $2, $3, $4,
                 $5, $6, $7, $8,
                 $9, $10, $11, $12,
                 $13, $14, $15, $16, $17,
-                $18, $19, $20, $21, $22, $23, $24
+                $18, $19, $20, $21, $22, $23
             )
             """,
             target_id,
@@ -265,7 +265,9 @@ async def sync_asset(conn: asyncpg.Connection, source: asyncpg.Record, job: Sync
             source["visibility"],
             source["width"],
             source["height"],
-            source["isEdited"],
+            # isEdited is omitted deliberately: it's a derived flag that the
+            # asset_edit_insert/asset_edit_delete triggers maintain. It defaults
+            # to false here and step 5d flips it by copying the edit rows.
         )
 
         # 2. Copy exif
@@ -335,6 +337,24 @@ async def sync_asset(conn: asyncpg.Connection, source: asyncpg.Record, job: Sync
                 target_id,
                 source_id,
             )
+
+        # 5d. Copy edit history (crop/rotate/mirror). The hardlinked thumbnails
+        # are the source's *edited* renders, so the target must claim the same
+        # edits to stay consistent. Inserting these fires asset_edit_insert,
+        # which sets asset."isEdited" = true — that's why step 1 doesn't supply
+        # it. parameters is pure geometry (no asset ids or paths), so it copies
+        # verbatim. id/updatedAt/updateId have DB defaults. Copy-once, like
+        # exif and OCR: later source edits won't propagate.
+        await conn.execute(
+            """
+            INSERT INTO asset_edit ("assetId", action, parameters, sequence)
+            SELECT $1, action, parameters, sequence
+            FROM asset_edit
+            WHERE "assetId" = $2
+            """,
+            target_id,
+            source_id,
+        )
 
         # 6. Track the mapping
         await conn.execute(

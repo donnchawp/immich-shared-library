@@ -25,7 +25,7 @@ With 1,000 shared photos, the symlink approach queues 5,000+ extra ML jobs (meta
 This sidecar connects directly to Immich's PostgreSQL database and, for each shared source asset:
 
 1. Creates a target asset record with remapped file paths
-2. Copies EXIF metadata, CLIP embeddings, face detection results, and face recognition data
+2. Copies EXIF metadata, CLIP embeddings, face detection results, face recognition data, and edit history (crop/rotate/mirror)
 3. Hardlinks thumbnail and preview files (zero extra disk space)
 4. Creates mirrored person records with hardlinked face thumbnails
 5. Pre-populates job status so Immich skips all ML processing for these assets
@@ -35,7 +35,7 @@ The target user's assets appear instantly with full search, face recognition, an
 ## Prerequisites
 
 - **Docker** with `docker compose` — the sidecar builds and runs entirely in Docker, no other development tools required
-- **Immich v3.0.1** (tested). Other v3.x versions may work but the database schema can change between releases — check the [Immich release notes](https://github.com/immich-app/immich/releases) before upgrading. Note: since v3, album ownership lives in `album_user` (role `owner`), and the sidecar copies OCR results (`asset_ocr`/`ocr_search`) and video stream metadata (`asset_video`/`asset_audio`/`asset_keyframe`) alongside CLIP embeddings.
+- **Immich v3.1.0** (tested). Other v3.x versions may work but the database schema can change between releases — check the [Immich release notes](https://github.com/immich-app/immich/releases) before upgrading. Note: since v3, album ownership lives in `album_user` (role `owner`), and the sidecar copies OCR results (`asset_ocr`/`ocr_search`) and video stream metadata (`asset_video`/`asset_audio`/`asset_keyframe`) alongside CLIP embeddings.
 - Two or more Immich users (at least one source and one target)
 - Source assets must be fully processed by Immich (metadata, faces, CLIP)
 
@@ -413,7 +413,9 @@ If the target user already has their own photos with detected faces, they'll see
 
 - **`force=true` jobs**: If someone triggers a force re-process in Immich, it will re-run ML on the target user's assets, overwriting the copied data. The sidecar will re-sync on the next cycle, but there will be temporary GPU usage.
 - **Same filesystem required**: Hardlinks only work when the sidecar container mounts the same volume as Immich. Cross-filesystem setups would need file copies instead.
-- **Direct database access**: This service writes directly to Immich's database. Tested with v3.0.1 — schema changes in other versions may require updates to this sidecar. Always back up your database before use.
+- **Regenerating a target thumbnail writes through the hardlink**: Immich overwrites thumbnail files in place rather than writing a temp file and renaming, so any job that rewrites a target asset's thumbnail at the same path (a force re-process, a regenerate-thumbnails run) also rewrites the source user's copy — they share an inode. Applying an edit is *not* affected: Immich writes the edited renders to separate `_edited` filenames, leaving the base thumbnails untouched.
+- **Edits are copied once**: Crop/rotate/mirror history (`asset_edit`) is copied when the asset is first synced, so the target's `isEdited` flag and thumbnails agree. Edits made on the source *after* that aren't propagated, the same as EXIF and OCR data.
+- **Direct database access**: This service writes directly to Immich's database. Tested with v3.1.0 — schema changes in other versions may require updates to this sidecar. Always back up your database before use.
 - **Single direction**: Sync is one-way (source → target). Changes made to target assets in Immich are not propagated back.
 
 ## Contributing

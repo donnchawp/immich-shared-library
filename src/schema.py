@@ -28,6 +28,9 @@ REQUIRED_SCHEMA: dict[str, set[str]] = {
     "asset_file": {
         "id", "assetId", "type", "path", "isEdited", "isProgressive",
     },
+    "asset_edit": {
+        "assetId", "action", "parameters", "sequence",
+    },
     "asset_job_status": {
         "assetId", "facesRecognizedAt", "metadataExtractedAt",
         "duplicatesDetectedAt", "ocrAt",
@@ -99,7 +102,6 @@ INSERTED_COLUMNS: dict[str, set[str]] = {
         "checksum", "checksumAlgorithm", "livePhotoVideoId", "originalFileName",
         "thumbhash", "isOffline", "libraryId", "isExternal", "localDateTime",
         "stackId", "duplicateId", "status", "visibility", "width", "height",
-        "isEdited",
     },
     "asset_exif": {
         "assetId", "make", "model", "exifImageWidth", "exifImageHeight",
@@ -112,6 +114,9 @@ INSERTED_COLUMNS: dict[str, set[str]] = {
     },
     "asset_file": {
         "id", "assetId", "type", "path", "isEdited", "isProgressive",
+    },
+    "asset_edit": {
+        "assetId", "action", "parameters", "sequence",
     },
     "asset_job_status": {
         "assetId", "facesRecognizedAt", "metadataExtractedAt",
@@ -162,6 +167,7 @@ INSERTED_COLUMNS: dict[str, set[str]] = {
 EXPECTED_CASCADE_CHILDREN: set[str] = {
     "asset_exif", "asset_file", "asset_face", "smart_search", "asset_job_status",
     "asset_ocr", "ocr_search", "asset_video", "asset_audio", "asset_keyframe",
+    "asset_edit",
 }
 
 # Unique/PK constraints required for ON CONFLICT clauses on Immich tables.
