@@ -124,6 +124,40 @@ async def sync_faces_for_asset(
     return count
 
 
+async def sync_faces_for_asset_guarded(
+    conn: asyncpg.Connection,
+    source_asset_id: UUID,
+    target_asset_id: UUID,
+    source_user_id: UUID,
+    target_user_id: UUID,
+) -> int | None:
+    """sync_faces_for_asset under its own savepoint.
+
+    Returns the number of faces synced, or None if the copy failed. All this
+    guarantees is that the surrounding transaction is still usable afterwards;
+    what a failure *means* — retry now, retry later, give up — is the caller's
+    to decide, because it differs per phase.
+
+    The guard is needed because catching the exception is not sufficient on
+    its own: a failed statement leaves Postgres in an aborted transaction, and
+    every later statement in it fails too. Unguarded, one bad asset takes the
+    other 499 in a Phase 1 batch down with it, and in Phase 2 it kills the
+    rest of the pass — then does so again every cycle, since a pair that
+    failed keeps its old watermark and stays in the window.
+    """
+    await conn.execute("SAVEPOINT sync_faces")
+    try:
+        count = await sync_faces_for_asset(
+            conn, source_asset_id, target_asset_id, source_user_id, target_user_id,
+        )
+        await conn.execute("RELEASE SAVEPOINT sync_faces")
+        return count
+    except Exception:
+        await conn.execute("ROLLBACK TO SAVEPOINT sync_faces")
+        logger.exception("Failed to sync faces for asset %s", source_asset_id)
+        return None
+
+
 async def sync_faces_incremental(conn: asyncpg.Connection) -> int:
     """Sync new or updated faces on already-synced assets.
 
@@ -159,10 +193,14 @@ async def sync_faces_incremental(conn: asyncpg.Connection) -> int:
 
     total = 0
     for pair in pairs:
-        count = await sync_faces_for_asset(
+        count = await sync_faces_for_asset_guarded(
             conn, pair["source_asset_id"], pair["target_asset_id"],
             pair["source_user_id"], pair["target_user_id"],
         )
+        if count is None:
+            # Leave the watermark alone: the pair is still inside the window,
+            # so the next cycle picks it up again without any extra state.
+            continue
         if count > 0:
             # Update the watermark so we don't re-check this asset next cycle
             await conn.execute(

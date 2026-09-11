@@ -6,7 +6,7 @@ from src.asset_sync import find_duplicate_filenames, get_unsynced_source_assets,
 from src.cleanup import cleanup_deleted_assets, cleanup_reassigned_faces, cleanup_stale_mappings
 from src.config import settings
 from src.db import transaction
-from src.ml_sync import sync_faces_for_asset, sync_faces_incremental
+from src.ml_sync import sync_faces_for_asset_guarded, sync_faces_incremental
 from src.person_sync import cleanup_orphaned_persons, sync_person_names, sync_person_thumbnails
 from src.schema import validate_cluster_group, validate_schema
 
@@ -21,6 +21,50 @@ def _configured_user_ids() -> list[UUID]:
             if uid not in ids:
                 ids.append(uid)
     return ids
+
+
+async def _sync_faces_guarded(
+    conn,
+    source_asset_id: UUID,
+    target_asset_id: UUID,
+    source_user_id: UUID,
+    target_user_id: UUID,
+) -> int:
+    """Phase 1's face copy, with Phase 1's recovery policy. Returns faces synced.
+
+    sync_asset releases its savepoint before returning, so this work would
+    otherwise run bare inside the batch transaction — and it writes to
+    `person`, which carries two foreign keys. One failure (Immich's
+    deleteEmptyGroups dropping a person_group between our read and
+    ensure_target_person's INSERT, say) would abort all 500 assets in the
+    batch, rolling back their mappings while their hardlinked thumbnails
+    stayed on disk.
+
+    The asset itself is kept on failure — it is complete, only its faces are
+    missing — and the mapping's watermark is rewound instead. This is where
+    Phase 1 differs from Phase 2: sync_asset has just stamped `synced_at` as
+    now, and Phase 2 only revisits pairs holding a source face newer than
+    that, so without the rewind the asset would stay faceless forever.
+    """
+    count = await sync_faces_for_asset_guarded(
+        conn, source_asset_id, target_asset_id, source_user_id, target_user_id,
+    )
+    if count is not None:
+        return count
+
+    await conn.execute(
+        """
+        UPDATE _face_sync_asset_map SET synced_at = 'epoch'
+        WHERE source_asset_id = $1 AND target_user_id = $2
+        """,
+        source_asset_id,
+        target_user_id,
+    )
+    logger.warning(
+        "Asset %s synced without faces; watermark rewound for Phase 2 to retry",
+        source_asset_id,
+    )
+    return 0
 
 
 async def run_full_sync() -> dict:
@@ -73,7 +117,7 @@ async def run_full_sync() -> dict:
                     if target_id is not None:
                         stats["assets_synced"] += 1
                         job_ids.append(target_id)
-                        stats["faces_synced"] += await sync_faces_for_asset(
+                        stats["faces_synced"] += await _sync_faces_guarded(
                             conn, source["id"], target_id,
                             job.source_user_id, job.target_user_id,
                         )

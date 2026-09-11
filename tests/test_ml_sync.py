@@ -166,3 +166,70 @@ async def test_incremental_sync_still_syncs_live_pairs(conn):
         'SELECT count(*) FROM asset_face WHERE "assetId" = $1', tgt_asset
     )
     assert copied == 1
+
+
+async def test_one_failing_pair_does_not_poison_the_incremental_phase(conn):
+    """Phase 2's loop needs the same per-item savepoint as Phase 1's.
+
+    A failed statement leaves Postgres in an aborted transaction, so one bad
+    pair used to take down the whole pass — and because a failed pair keeps
+    its old watermark, it stays in the window and kills the pass again on
+    every later cycle. The failure must be contained and the good pair must
+    still sync.
+    """
+    from src.ml_sync import sync_faces_incremental
+
+    cg = await make_cluster_group(conn)
+    src = await make_user(conn, cluster_group_id=cg)
+    tgt = await make_user(conn, cluster_group_id=cg)
+
+    doomed_src = await make_asset(conn, src)
+    doomed_tgt = await make_asset(conn, tgt)
+    good_src = await make_asset(conn, src)
+    good_tgt = await make_asset(conn, tgt)
+    for s, t in ((doomed_src, doomed_tgt), (good_src, good_tgt)):
+        await conn.execute(
+            """
+            INSERT INTO _face_sync_asset_map
+                (source_asset_id, target_asset_id, source_user_id, target_user_id, synced_at)
+            VALUES ($1, $2, $3, $4, NOW() - INTERVAL '1 day')
+            """,
+            s, t, src, tgt,
+        )
+    await make_face(conn, doomed_src, bbox=(1, 1, 9, 9))
+    await make_face(conn, good_src, bbox=(2, 2, 8, 8))
+
+    # imageWidth copies verbatim, so tagging the doomed source face makes the
+    # trigger fire for its copy and no other.
+    await conn.execute(
+        'UPDATE asset_face SET "imageWidth" = 666 WHERE "assetId" = $1', doomed_src
+    )
+    await conn.execute(
+        """
+        CREATE FUNCTION _refuse_face() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN RAISE EXCEPTION 'no faces for you'; END $$;
+        CREATE TRIGGER _refuse_face_ins BEFORE INSERT ON asset_face
+            FOR EACH ROW WHEN (NEW."imageWidth" = 666)
+            EXECUTE FUNCTION _refuse_face();
+        """
+    )
+
+    assert await sync_faces_incremental(conn) == 1
+    assert await conn.fetchval("SELECT 1") == 1
+
+    assert await conn.fetchval(
+        'SELECT count(*) FROM asset_face WHERE "assetId" = $1', good_tgt
+    ) == 1
+    assert await conn.fetchval(
+        'SELECT count(*) FROM asset_face WHERE "assetId" = $1', doomed_tgt
+    ) == 0
+
+    # The good pair's watermark moves; the doomed pair's stays in the past so
+    # the next cycle tries it again.
+    watermarks = dict(
+        (r["source_asset_id"], r["synced_at"])
+        for r in await conn.fetch(
+            "SELECT source_asset_id, synced_at FROM _face_sync_asset_map"
+        )
+    )
+    assert watermarks[good_src] > watermarks[doomed_src]

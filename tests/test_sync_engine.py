@@ -12,8 +12,9 @@ import pytest
 from src import main as main_module
 from src.cleanup import cleanup_reassigned_faces
 from src.main import _drop_person_map_table
-from src.ml_sync import sync_faces_for_asset
+from src.ml_sync import sync_faces_for_asset, sync_faces_incremental
 from src.person_sync import cleanup_orphaned_persons, sync_person_names
+from src.sync_engine import _sync_faces_guarded
 from tests.conftest import (
     make_asset, make_cluster_group, make_face, make_person, make_person_group, make_user,
 )
@@ -202,3 +203,73 @@ async def test_real_migration_path_is_a_no_op_once_already_current(
 
     table = await conn.fetchval("SELECT to_regclass('_face_sync_person_map')")
     assert table is not None
+
+
+async def test_a_face_failure_keeps_the_batch_alive_and_defers_to_phase_2(conn):
+    """Phase 1's face copy must run under its own savepoint.
+
+    sync_asset releases its savepoint before returning, so the face copy used
+    to run bare inside the batch transaction: one failure aborted all 500
+    assets in the batch and the cycle was lost. The asset itself is complete,
+    so the guard keeps it and rewinds the mapping watermark instead -- Phase 2
+    only looks at pairs where a source face is newer than synced_at, so
+    without the rewind the asset would stay faceless forever.
+    """
+    cg = await make_cluster_group(conn)
+    src = await make_user(conn, cluster_group_id=cg)
+    tgt = await make_user(conn, cluster_group_id=cg)
+    pg = await make_person_group(conn, cg)
+    await make_person(conn, src, pg)
+
+    src_asset = await make_asset(conn, src)
+    tgt_asset = await make_asset(conn, tgt)
+    await conn.execute(
+        """
+        INSERT INTO _face_sync_asset_map
+            (source_asset_id, target_asset_id, source_user_id, target_user_id, synced_at)
+        VALUES ($1, $2, $3, $4, NOW())
+        """,
+        src_asset, tgt_asset, src, tgt,
+    )
+    await make_face(conn, src_asset, person_group_id=pg, bbox=(1, 1, 9, 9))
+
+    # Fail the face INSERT the way a person_group vanishing under us would.
+    await conn.execute(
+        """
+        CREATE FUNCTION _refuse_face() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN RAISE EXCEPTION 'no faces for you'; END $$;
+        CREATE TRIGGER _refuse_face_ins BEFORE INSERT ON asset_face
+            FOR EACH ROW EXECUTE FUNCTION _refuse_face();
+        """
+    )
+
+    assert await _sync_faces_guarded(conn, src_asset, tgt_asset, src, tgt) == 0
+
+    # The batch transaction survives -- the whole point.
+    assert await conn.fetchval("SELECT 1") == 1
+
+    # And Phase 2 now picks the pair up, which it would not have done with the
+    # watermark left at NOW().
+    await conn.execute("DROP TRIGGER _refuse_face_ins ON asset_face")
+    assert await sync_faces_incremental(conn) == 1
+    assert await conn.fetchval(
+        'SELECT "personGroupId" FROM asset_face WHERE "assetId" = $1', tgt_asset
+    ) == pg
+
+
+async def test_the_face_guard_is_transparent_on_success(conn):
+    """The savepoint must not swallow the happy path."""
+    cg = await make_cluster_group(conn)
+    src = await make_user(conn, cluster_group_id=cg)
+    tgt = await make_user(conn, cluster_group_id=cg)
+    pg = await make_person_group(conn, cg)
+    await make_person(conn, src, pg)
+
+    src_asset = await make_asset(conn, src)
+    tgt_asset = await make_asset(conn, tgt)
+    await make_face(conn, src_asset, person_group_id=pg, bbox=(1, 1, 9, 9))
+
+    assert await _sync_faces_guarded(conn, src_asset, tgt_asset, src, tgt) == 1
+    assert await conn.fetchval(
+        'SELECT "personGroupId" FROM asset_face WHERE "assetId" = $1', tgt_asset
+    ) == pg
