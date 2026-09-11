@@ -5,6 +5,11 @@ table, so the sidecar no longer maps source persons to target persons. Tasks
 3-5 removed every read/write of `_face_sync_person_map`; this task retires
 the table itself.
 """
+from contextlib import asynccontextmanager
+
+import pytest
+
+from src import main as main_module
 from src.cleanup import cleanup_reassigned_faces
 from src.main import _drop_person_map_table
 from src.ml_sync import sync_faces_for_asset
@@ -86,3 +91,114 @@ async def test_drop_person_map_table_is_idempotent(conn):
 
     exists = await conn.fetchval("SELECT to_regclass('_face_sync_person_map')")
     assert exists is None
+
+
+@pytest.fixture
+def route_main_db_calls_through_conn(conn, monkeypatch):
+    """Make `src.main`'s startup DB calls hit the test's own transactional
+    connection, so the real migration entry point can be driven end to end.
+
+    `ensure_tracking_tables` / `_run_migrations` / `_migrate_v2` /
+    `_migrate_v3` are written against src.db's pool-based `execute()`,
+    `fetch_one()`, and `acquire()` helpers -- the real production path, not
+    the per-connection style the rest of the sidecar's modules use for
+    testability. Driving them for real would mean pointing src.db's global
+    connection pool at the scratch DB, which:
+      - requires network settings (DB_HOSTNAME etc.) the `make test`
+        container never sets (only TEST_DB_URL is passed; settings.
+        db_hostname defaults to "localhost", which is not reachable inside
+        that container), and
+      - issues real, non-rolled-back commits (execute()/fetch_one() are not
+        wrapped in an explicit transaction), permanently mutating the
+        shared scratch DB and breaking repeatability of `make test` without
+        `make testdb` in between.
+
+    Neither is acceptable, and the brief for this fix explicitly forbids
+    changing _run_migrations/_migrate_v3's signature to work around it. So
+    instead of changing what the code takes, this monkeypatches *where it
+    looks*: `execute`, `fetch_one`, and `acquire` are names bound into
+    `src.main`'s own module namespace by its `from src.db import ...` line,
+    and are looked up there (not on `src.db`) every time `_run_migrations`
+    etc. call them. Pointing those three names at the test's own `conn`
+    means every statement the unmodified real migration path issues lands
+    in -- and rolls back with -- the same transaction as the rest of the
+    test. No function under test is altered in any way.
+    """
+    async def patched_execute(query, *args):
+        return await conn.execute(query, *args)
+
+    async def patched_fetch_one(query, *args):
+        return await conn.fetchrow(query, *args)
+
+    @asynccontextmanager
+    async def patched_acquire():
+        yield conn
+
+    monkeypatch.setattr(main_module, "execute", patched_execute)
+    monkeypatch.setattr(main_module, "fetch_one", patched_fetch_one)
+    monkeypatch.setattr(main_module, "acquire", patched_acquire)
+
+
+async def test_real_migration_path_drops_table_and_bumps_version(
+    conn, route_main_db_calls_through_conn
+):
+    """Drive the real startup entry point (`_run_migrations`), not the
+    extracted helper, so the version gate and the migration registration are
+    proven wired up -- not just the DROP statement in isolation. A broken
+    gate, a wrong comparison, or a migration that was never registered would
+    leave `_face_sync_person_map` in place on a real upgrade; this fails if
+    any of those regress.
+    """
+    # Simulate an existing v2 deployment: the table is present, and the
+    # recorded schema version is one behind current.
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS _face_sync_person_map (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid()
+        )
+    """)
+    await conn.execute(
+        """
+        INSERT INTO _face_sync_meta (key, value) VALUES ('schema_version', '2')
+        ON CONFLICT (key) DO UPDATE SET value = '2'
+        """
+    )
+
+    await main_module._run_migrations()
+
+    table = await conn.fetchval("SELECT to_regclass('_face_sync_person_map')")
+    assert table is None
+
+    version = await conn.fetchval(
+        "SELECT value FROM _face_sync_meta WHERE key = 'schema_version'"
+    )
+    assert version == str(main_module.SCHEMA_VERSION)
+
+
+async def test_real_migration_path_is_a_no_op_once_already_current(
+    conn, route_main_db_calls_through_conn
+):
+    """The version gate must not re-run a completed migration.
+
+    A table named `_face_sync_person_map` existing at the current schema
+    version is artificial -- by definition the real migration already
+    dropped it by then -- but it is the cleanest way to observe that the
+    gate short-circuits before ever calling `_migrate_v3` again: if it
+    didn't, this table would vanish just like in the test above.
+    """
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS _face_sync_person_map (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid()
+        )
+    """)
+    await conn.execute(
+        """
+        INSERT INTO _face_sync_meta (key, value) VALUES ('schema_version', $1)
+        ON CONFLICT (key) DO UPDATE SET value = $1
+        """,
+        str(main_module.SCHEMA_VERSION),
+    )
+
+    await main_module._run_migrations()
+
+    table = await conn.fetchval("SELECT to_regclass('_face_sync_person_map')")
+    assert table is not None
