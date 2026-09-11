@@ -49,7 +49,7 @@ docker run --rm --network immich_default \
   bash -c 'pip install asyncpg httpx pydantic pydantic-settings && python test_sync.py'
 ```
 
-The repo has 33 automated tests (pytest) run against a scratch `immich_test` database built from a real schema dump. `make help` lists the targets: `test`, `testdb`, `testdb-clean`, `schema-dump`, `lint`. Postgres isn't published to the host, so `make test` runs pytest in a container on the `immich_default` network — running `pytest` directly on the host will fail to connect. `test_sync.py` remains the manual integration test that runs one full sync cycle against a real, live Immich instance and prints verification queries; its invocation is unchanged, only its printed output labels changed for v3.2.0.
+The repo has an automated test suite (pytest) run against a scratch `immich_test` database built from a real schema dump. `make help` lists the targets: `test`, `testdb`, `testdb-clean`, `schema-dump`, `lint`. Postgres isn't published to the host, so `make test` runs pytest in a container on the `immich_default` network — running `pytest` directly on the host will fail to connect. `test_sync.py` remains the manual integration test that runs one full sync cycle against a real, live Immich instance and prints verification queries; its invocation is unchanged, only its printed output labels changed for v3.2.0.
 
 ## Architecture
 

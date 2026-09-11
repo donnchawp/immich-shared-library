@@ -455,7 +455,7 @@ The utility scripts read configuration from `.env` (the same file used by `docke
 
 ### Automated Tests
 
-The project has 39 automated tests (pytest) run against a scratch `immich_test` database built from a real Immich schema dump (`tests/fixtures/schema_v3.2.0.sql`):
+The project has an automated test suite (pytest) run against a scratch `immich_test` database built from a real Immich schema dump (`tests/fixtures/schema_v3.2.0.sql`):
 
 ```bash
 make testdb   # (re)create the scratch database from the fixture
