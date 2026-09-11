@@ -36,7 +36,7 @@ The target user's assets appear instantly with full search, face recognition, an
 
 - **Docker** with `docker compose` — the sidecar builds and runs entirely in Docker, no other development tools required
 - **Immich v3.2.0** (tested). Earlier versions are not supported: v3.2.0 moved person identity into `person_group` and dropped `person.id`. Other v3.2.x versions may work but the database schema can change between releases — check the [Immich release notes](https://github.com/immich-app/immich/releases) before upgrading. Note: since v3, album ownership lives in `album_user` (role `owner`), and the sidecar copies OCR results (`asset_ocr`/`ocr_search`) and video stream metadata (`asset_video`/`asset_audio`/`asset_keyframe`) alongside CLIP embeddings.
-- **All configured users must share one Immich cluster group** (Account Settings > Sharing > Cluster group). The sidecar copies `asset_face."personGroupId"` verbatim, so source and target must resolve the same identities — it refuses to start otherwise. **Joining a cluster group requires resetting facial recognition for every member, which discards existing names and birth dates.** That's Immich's requirement, not the sidecar's — plan for it before you configure anything else.
+- **All configured users must share one Immich cluster group** (Account Settings > Sharing > Cluster group). The sidecar copies `asset_face."personGroupId"` verbatim, so source and target must resolve the same identities — it refuses to start otherwise. Joining a group does *not* delete anyone — Immich moves your existing person groups across intact. But until you run **Reset facial recognition** for the group, every member keeps their own separate person groups, so the same human stays split across members and the sidecar has no shared identity to copy. That reset is the step that costs you something: it deletes all people for all users in the group, and existing names and birth dates are lost. Plan for it before you configure anything else — and if you are upgrading an instance that already ran an older version of this sidecar, read [Upgrading from Immich v3.1.x](#upgrading-from-immich-v31x) first.
 - Two or more Immich users (at least one source and one target)
 - Source assets must be fully processed by Immich (metadata, faces, CLIP)
 
@@ -346,6 +346,54 @@ docker compose logs -f
 
 Look for "Schema validation passed" on startup and periodic sync cycle messages. If schema validation fails, the logs will tell you exactly which columns or tables changed — this usually means Immich added new required columns that the sidecar needs to supply.
 
+### Upgrading from Immich v3.1.x
+
+If you are upgrading an instance that was already running an older version of this sidecar, the order
+matters. Immich's cluster-group migration gives **every user its own new cluster group**, so the moment
+you upgrade, your configured users no longer share one and the sidecar will refuse to start until you
+join them.
+
+Your existing synced data also needs a decision. The older sidecar mirrored each source person into a
+private person row on the target user. Immich's migration turns every one of those mirrored persons
+into its own person group, so the same human ends up split between the source's group and the target's
+leftover mirror — and newly synced assets will use the source's group, leaving two entries for one
+person that drift further apart every cycle. Resetting facial recognition for the group collapses that
+split; nothing else will.
+
+1. **Stop the sidecar** before upgrading Immich. It must not be writing while Immich runs its
+   migrations.
+2. **Back up the database** (see the `pg_dump` note under [Prerequisites](#prerequisites)). Also dump
+   `_face_sync_person_map` on its own — the sidecar drops that table on its first start, and it is the
+   only record of which target person mirrored which source person:
+   ```bash
+   docker exec immich_postgres pg_dump -U postgres -d immich -t _face_sync_person_map > person_map.sql
+   ```
+3. **Save your people.** The reset in step 5 deletes every person for every member of the group, names
+   and birth dates included, and there is no undo. Export the names and copy each person's face
+   thumbnail out first, so you can re-apply them afterwards:
+   ```bash
+   docker exec immich_postgres psql -U postgres -d immich --csv -c "
+     SELECT u.name AS owner, p.name AS person_name, p.\"birthDate\", p.\"thumbnailPath\",
+            (SELECT count(*) FROM asset_face af
+              WHERE af.\"personId\" = p.id AND af.\"deletedAt\" IS NULL) AS face_count
+       FROM person p JOIN \"user\" u ON u.id = p.\"ownerId\"
+      WHERE p.name <> '' OR p.\"birthDate\" IS NOT NULL
+      ORDER BY face_count DESC;" > named_people.csv
+   ```
+   Then `docker cp immich_server:<thumbnailPath> .` for each row — without the thumbnails you are
+   re-naming thousands of unlabelled clusters from memory.
+4. **Upgrade Immich** to v3.2.0 and let its migrations finish.
+5. **Join the users into one cluster group** (Account Settings > Sharing > Cluster group), then run
+   **Reset facial recognition** for that group and wait for the re-recognition job to finish. Joining
+   alone is not enough: it preserves each member's separate person groups, so identity is still not
+   shared.
+6. **Rebuild and start the sidecar** (`docker compose up -d --build`). It validates the schema and the
+   cluster group on startup and drops the retired `_face_sync_person_map` table.
+7. **Re-apply the names** from your CSV.
+
+Leave the sidecar stopped through steps 4 and 5. Re-recognition rewrites `asset_face."personGroupId"`
+across the whole cluster group, and the sidecar's face-reassignment pass has no reason to race it.
+
 ## Configuration Reference
 
 ### config.yaml (per-job settings)
@@ -462,7 +510,7 @@ make testdb   # (re)create the scratch database from the fixture
 make test     # run the tests
 ```
 
-`make help` lists all targets (`test`, `testdb`, `testdb-clean`, `schema-dump`, `lint`). Postgres isn't published to the host, so `make test` runs pytest inside a container on the `immich_default` network — running `pytest` directly on the host will fail to connect. Narrow to one file with `make test PYTEST_ARGS=tests/test_person_sync.py`.
+`make help` lists all targets (`test`, `testdb`, `testdb-clean`, `schema-dump`, `lint`). Postgres isn't published to the host, so `make test` runs pytest inside a container on the `immich_default` network — running `pytest` directly on the host will fail to connect. Narrow to one file with `make test PYTEST_ARGS=tests/test_person_sync.py`. If your Immich network or Postgres container is named differently, override them: `NETWORK=immich_web PG=immich_postgres make test`.
 
 ### Manual Integration Testing
 
