@@ -3,6 +3,8 @@ from uuid import UUID, uuid4
 
 import asyncpg
 
+from src.person_sync import ensure_target_person
+
 logger = logging.getLogger(__name__)
 
 
@@ -33,21 +35,26 @@ async def sync_faces_for_asset(
     count = 0
     for face in source_faces:
         source_face_id = face["id"]
+        person_group_id = face["personGroupId"]
 
-        # Get or create mirrored person
-        target_person_id = None
-        if face["personId"] is not None:
-            target_person_id = await get_or_create_target_person(
-                conn, face["personId"], source_user_id, target_user_id,
-            )
+        # Identity is shared: the group id copies verbatim. We only need to make
+        # sure the target user has their own person row on that group, so
+        # Immich's deleteEmptyGroups doesn't drop it and null these faces.
+        if person_group_id is not None:
+            if await ensure_target_person(
+                conn, person_group_id, source_user_id, target_user_id,
+            ) is None:
+                # Source has no person row for this group; copy the face
+                # unassigned rather than pointing at a group that may vanish.
+                person_group_id = None
 
-        # Insert face record only if no matching bounding box exists on the target asset
-        # (atomic check-and-insert to avoid TOCTOU race)
+        # Insert face record only if no matching bounding box exists on the target
+        # asset (atomic check-and-insert to avoid TOCTOU race)
         target_face_id = uuid4()
         result = await conn.execute(
             """
             INSERT INTO asset_face (
-                id, "assetId", "personId",
+                id, "assetId", "personGroupId",
                 "imageWidth", "imageHeight",
                 "boundingBoxX1", "boundingBoxY1", "boundingBoxX2", "boundingBoxY2",
                 "sourceType", "isVisible"
@@ -64,7 +71,7 @@ async def sync_faces_for_asset(
             """,
             target_face_id,
             target_asset_id,
-            target_person_id,
+            person_group_id,
             face["imageWidth"],
             face["imageHeight"],
             face["boundingBoxX1"],
@@ -90,19 +97,23 @@ async def sync_faces_for_asset(
             source_face_id,
         )
 
-        # Set faceAssetId on the target person if not set or if the
-        # currently referenced face no longer exists
-        if target_person_id is not None:
+        # Point the target person's feature photo at a face the target owns.
+        # faceAssetId is still an FK to asset_face.id, so it must never
+        # reference the source user's face row.
+        if person_group_id is not None:
             await conn.execute(
                 """
                 UPDATE person SET "faceAssetId" = $1
-                WHERE id = $2 AND (
+                WHERE "ownerId" = $2 AND "personGroupId" = $3 AND (
                     "faceAssetId" IS NULL
-                    OR NOT EXISTS (SELECT 1 FROM asset_face WHERE id = person."faceAssetId")
+                    OR NOT EXISTS (
+                        SELECT 1 FROM asset_face WHERE id = person."faceAssetId"
+                    )
                 )
                 """,
                 target_face_id,
-                target_person_id,
+                target_user_id,
+                person_group_id,
             )
 
         count += 1
