@@ -40,3 +40,14 @@ async def test_soft_deleted_user_is_treated_as_missing(conn):
 
     with pytest.raises(SchemaValidationError, match="not found"):
         await validate_cluster_group(conn, [alice, ghost])
+
+
+async def test_person_composite_pk_is_a_startup_tripwire(conn):
+    """ensure_target_person's ON CONFLICT ("ownerId", "personGroupId") needs a
+    constraint on exactly those columns. person's PK is the newest and least
+    settled of the three the sidecar depends on -- losing it to an Immich
+    upgrade must fail at startup, not mid-sync."""
+    await conn.execute("ALTER TABLE person DROP CONSTRAINT person_pkey")
+
+    with pytest.raises(SchemaValidationError, match="person"):
+        await validate_schema(conn)

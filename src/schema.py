@@ -183,6 +183,10 @@ EXPECTED_CASCADE_CHILDREN: set[str] = {
 EXPECTED_UNIQUE_CONSTRAINTS: dict[str, list[frozenset[str]]] = {
     "face_search": [frozenset({"faceId"})],
     "album_asset": [frozenset({"albumId", "assetId"})],
+    # person's composite PK, which ensure_target_person's ON CONFLICT targets.
+    # New in v3.2.0 and the least settled of the three, so the one most worth
+    # catching at startup rather than mid-sync.
+    "person": [frozenset({"ownerId", "personGroupId"})],
 }
 
 
