@@ -39,7 +39,23 @@ fi
 
 # Gather counts
 asset_count=$(psql_cmd "SELECT COUNT(*) FROM _face_sync_asset_map" 2>/dev/null || echo "0")
-person_count=$(psql_cmd "SELECT COUNT(*) FROM _face_sync_person_map" 2>/dev/null || echo "0")
+# v3.2.0 cluster groups: there is no more person-mapping table. A
+# "mirrored person" is identified structurally, the same way
+# cleanup_orphaned_persons (src/person_sync.py) does it: a person row
+# owned by a sidecar-managed target user, on a personGroupId that the
+# paired source user (per _face_sync_asset_map) also has a person row
+# for. This count is a preview only (matches the DELETE's scoping
+# predicate below, but not its face-guard, since the guard's answer
+# changes once assets are deleted a few steps from now).
+person_count=$(psql_cmd "
+    SELECT COUNT(*) FROM person t
+    WHERE EXISTS (
+        SELECT 1 FROM _face_sync_asset_map m
+        JOIN person s ON s.\"personGroupId\" = t.\"personGroupId\"
+                      AND s.\"ownerId\" = m.source_user_id
+        WHERE m.target_user_id = t.\"ownerId\"
+    )
+" 2>/dev/null || echo "0")
 skipped_count=$(psql_cmd "SELECT COUNT(*) FROM _face_sync_skipped" 2>/dev/null || echo "0")
 
 echo "Database:"
@@ -69,7 +85,7 @@ echo ""
 echo "This will:"
 echo "  1. Stop the sidecar container"
 echo "  2. Delete $asset_count synced asset(s) from Immich"
-echo "  3. Delete $person_count mirrored person(s) from Immich"
+echo "  3. Delete up to $person_count mirrored person(s) from Immich"
 echo "  4. Drop all sidecar tracking tables"
 [[ ${#symlinks[@]} -gt 0 ]] && echo "  5. Remove ${#symlinks[@]} symlink(s)"
 echo ""
@@ -93,11 +109,28 @@ if [[ "$asset_count" -gt 0 ]]; then
     "
 fi
 
-# Delete mirrored persons
+# Delete mirrored persons (runs after asset deletion above, so any faces
+# that lived only on synced assets are already gone; the NOT EXISTS guard
+# below still protects any target person whose group has faces from the
+# target's own non-synced assets, since deleting that row would silently
+# unassign them via Immich's deleteEmptyGroups)
 if [[ "$person_count" -gt 0 ]]; then
-    echo "Deleting $person_count mirrored person(s)..."
+    echo "Deleting up to $person_count mirrored person(s)..."
     psql_cmd "
-        DELETE FROM person WHERE id IN (SELECT target_person_id FROM _face_sync_person_map);
+        DELETE FROM person t
+        WHERE EXISTS (
+            SELECT 1 FROM _face_sync_asset_map m
+            JOIN person s ON s.\"personGroupId\" = t.\"personGroupId\"
+                          AND s.\"ownerId\" = m.source_user_id
+            WHERE m.target_user_id = t.\"ownerId\"
+        )
+        AND NOT EXISTS (
+            SELECT 1 FROM asset_face af
+            JOIN asset a ON a.id = af.\"assetId\"
+            WHERE af.\"personGroupId\" = t.\"personGroupId\"
+              AND a.\"ownerId\" = t.\"ownerId\"
+              AND af.\"deletedAt\" IS NULL
+        );
     "
 fi
 

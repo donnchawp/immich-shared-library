@@ -64,11 +64,25 @@ async def get_synced_assets(target_user_id) -> list[dict]:
 
 
 async def get_mirrored_persons(target_user_id) -> list[dict]:
-    """Get all mirrored persons for a target user."""
+    """Get sidecar-created target persons for a target user.
+
+    v3.2.0 cluster groups: person identity is Immich's shared person_group,
+    so there is no more person-mapping table. A "mirrored person" is
+    identified structurally, the same way cleanup_orphaned_persons
+    (src/person_sync.py) does: a person row owned by this target user, on
+    a personGroupId that a paired source user (per _face_sync_asset_map)
+    also has a person row for.
+    """
     rows = await fetch_all("""
-        SELECT m.source_person_id, m.target_person_id
-        FROM _face_sync_person_map m
-        WHERE m.target_user_id = $1
+        SELECT t."personGroupId" AS person_group_id
+        FROM person t
+        WHERE t."ownerId" = $1
+          AND EXISTS (
+              SELECT 1 FROM _face_sync_asset_map m
+              JOIN person s ON s."personGroupId" = t."personGroupId"
+                            AND s."ownerId" = m.source_user_id
+              WHERE m.target_user_id = $1
+          )
     """, target_user_id)
     return [dict(r) for r in rows]
 
@@ -114,32 +128,56 @@ async def delete_synced_asset(conn, target_asset_id) -> bool:
         return False
 
 
-async def delete_mirrored_person(conn, target_person_id) -> bool:
-    """Delete a mirrored person and its thumbnail hardlink."""
+async def delete_mirrored_person(conn, target_user_id, person_group_id) -> str:
+    """Delete a mirrored person's row and its thumbnail hardlink.
+
+    person's PK is now ("ownerId", "personGroupId") - there is no
+    person.id. Guarded the same way cleanup_orphaned_persons
+    (src/person_sync.py) is: refuse to delete while the target user still
+    has faces assigned to this group, since Immich's deleteEmptyGroups
+    nulls a group's faces when its last person row goes.
+
+    Returns "deleted", "skipped" (faces still assigned, or row already
+    gone), or "failed".
+    """
     try:
-        # Get the person's thumbnail path before deleting
         person = await conn.fetchrow(
-            'SELECT "thumbnailPath" FROM person WHERE id = $1',
-            target_person_id,
+            'SELECT "thumbnailPath" FROM person WHERE "ownerId" = $1 AND "personGroupId" = $2',
+            target_user_id, person_group_id,
         )
-        if person and person["thumbnailPath"]:
+        if person is None:
+            return "skipped"
+
+        has_faces = await conn.fetchval(
+            """
+            SELECT EXISTS (
+                SELECT 1 FROM asset_face af
+                JOIN asset a ON a.id = af."assetId"
+                WHERE af."personGroupId" = $1
+                  AND a."ownerId" = $2
+                  AND af."deletedAt" IS NULL
+            )
+            """,
+            person_group_id, target_user_id,
+        )
+        if has_faces:
+            return "skipped"
+
+        if person["thumbnailPath"]:
             remove_hardlinks([person["thumbnailPath"]])
 
-        # Delete the person record (cascades to face associations)
-        await conn.execute("DELETE FROM person WHERE id = $1", target_person_id)
-
-        # Remove the mapping
+        # Delete the person record
         await conn.execute(
-            "DELETE FROM _face_sync_person_map WHERE target_person_id = $1",
-            target_person_id,
+            'DELETE FROM person WHERE "ownerId" = $1 AND "personGroupId" = $2',
+            target_user_id, person_group_id,
         )
 
-        return True
+        return "deleted"
     except Exception:
         logging.getLogger(__name__).exception(
-            "Failed to delete mirrored person %s", target_person_id
+            "Failed to delete mirrored person %s for user %s", person_group_id, target_user_id
         )
-        return False
+        return "failed"
 
 
 async def main():
@@ -210,7 +248,7 @@ async def main():
             print(f"    ... and {len(assets) - 20} more")
         print(f"  {len(persons)} mirrored person(s)")
         for p in persons[:20]:
-            print(f"    DELETE target_person={p['target_person_id']}")
+            print(f"    DELETE person_group={p['person_group_id']}")
         if len(persons) > 20:
             print(f"    ... and {len(persons) - 20} more")
         print("\nNo changes made.")
@@ -241,15 +279,18 @@ async def main():
     if persons:
         print(f"\nDeleting {len(persons)} mirrored person(s)...")
         deleted_persons = 0
+        skipped_persons = 0
         failed_persons = 0
         async with transaction() as conn:
             for p in persons:
-                ok = await delete_mirrored_person(conn, p["target_person_id"])
-                if ok:
+                result = await delete_mirrored_person(conn, target_user_id, p["person_group_id"])
+                if result == "deleted":
                     deleted_persons += 1
+                elif result == "skipped":
+                    skipped_persons += 1
                 else:
                     failed_persons += 1
-        print(f"Persons: {deleted_persons} deleted, {failed_persons} failed.")
+        print(f"Persons: {deleted_persons} deleted, {skipped_persons} skipped (faces still assigned), {failed_persons} failed.")
 
     print("\nDone.")
     await close_pool()
