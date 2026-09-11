@@ -40,6 +40,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 from src.db import init_pool, close_pool, fetch_all, fetch_one, transaction
 from src.file_ops import remove_hardlinks
 from src.main import ensure_tracking_tables
+from src.person_sync import delete_target_person_in_shared_group
 
 
 async def get_target_users() -> list[dict]:
@@ -68,10 +69,14 @@ async def get_mirrored_persons(target_user_id) -> list[dict]:
 
     v3.2.0 cluster groups: person identity is Immich's shared person_group,
     so there is no more person-mapping table. A "mirrored person" is
-    identified structurally, the same way cleanup_orphaned_persons
-    (src/person_sync.py) does: a person row owned by this target user, on
-    a personGroupId that a paired source user (per _face_sync_asset_map)
-    also has a person row for.
+    identified structurally: a person row owned by this target user, on a
+    personGroupId that a paired source user (per _face_sync_asset_map) also
+    has a person row for.
+
+    Note this is the inverse of cleanup_orphaned_persons' selection, which
+    wants groups no mapped source holds any more. This listing is advisory
+    only — the same condition is re-checked inside the delete, because the
+    user is prompted in between.
     """
     rows = await fetch_all("""
         SELECT t."personGroupId" AS person_group_id
@@ -101,10 +106,19 @@ async def delete_synced_asset(conn, target_asset_id) -> bool:
     """
     await conn.execute("SAVEPOINT delete_synced_asset")
     try:
-        # Get file paths before deleting records
+        # Get file paths before deleting records.
+        #
+        # Sidecar (XMP) rows are excluded for the same reason as in
+        # cleanup_deleted_assets (src/cleanup.py): a sidecar row points into
+        # the external library, where the target's directory is a symlink to
+        # the source's, so unlinking the target's XMP path destroys the SOURCE
+        # user's own file. remove_hardlinks' validate_path_within_upload guard
+        # happens to reject those paths today, but that is a backstop, not the
+        # reason — this tool must not be relying on it.
         files = await conn.fetch(
-            'SELECT path FROM asset_file WHERE "assetId" = $1',
+            'SELECT path FROM asset_file WHERE "assetId" = $1 AND type <> $2',
             target_asset_id,
+            "sidecar",
         )
         file_paths = [f["path"] for f in files]
 
@@ -139,14 +153,24 @@ async def delete_synced_asset(conn, target_asset_id) -> bool:
 async def delete_mirrored_person(conn, target_user_id, person_group_id) -> str:
     """Delete a mirrored person's row and its thumbnail hardlink.
 
-    person's PK is now ("ownerId", "personGroupId") - there is no
-    person.id. Guarded the same way cleanup_orphaned_persons
-    (src/person_sync.py) is: refuse to delete while the target user still
-    has faces assigned to this group, since Immich's deleteEmptyGroups
-    nulls a group's faces when its last person row goes.
+    person's PK is now ("ownerId", "personGroupId") - there is no person.id.
 
-    Returns "deleted", "skipped" (faces still assigned, or row already
-    gone), or "failed".
+    The guard lives in delete_target_person_in_shared_group
+    (src/person_sync.py), which is where its two conditions are explained and
+    tested. It is NOT the same shape as cleanup_orphaned_persons' guard, and
+    an earlier version of this docstring claimed it was: this one requires a
+    mapped source to still hold a person row on the group (which is what
+    stops deleteEmptyGroups nulling the group's faces) and only then refuses
+    on the target's own remaining faces.
+
+    Returns "deleted", "skipped" (guard refused, or row already gone), or
+    "failed".
+
+    The thumbnail hardlink goes only once the row is confirmed deleted. That
+    inverts cleanup.py's files-before-records rule, deliberately: the guard
+    can refuse, and unlinking the thumbnail of a person we then keep is worse
+    than the alternative failure here, which is an orphaned hardlink costing
+    nothing.
 
     SAVEPOINT for the same reason as delete_synced_asset: the caller runs a
     whole batch inside one transaction(), and a bare except would leave the
@@ -162,30 +186,14 @@ async def delete_mirrored_person(conn, target_user_id, person_group_id) -> str:
             await conn.execute("RELEASE SAVEPOINT delete_mirrored_person")
             return "skipped"
 
-        has_faces = await conn.fetchval(
-            """
-            SELECT EXISTS (
-                SELECT 1 FROM asset_face af
-                JOIN asset a ON a.id = af."assetId"
-                WHERE af."personGroupId" = $1
-                  AND a."ownerId" = $2
-                  AND af."deletedAt" IS NULL
-            )
-            """,
-            person_group_id, target_user_id,
-        )
-        if has_faces:
+        if not await delete_target_person_in_shared_group(
+            conn, target_user_id, person_group_id,
+        ):
             await conn.execute("RELEASE SAVEPOINT delete_mirrored_person")
             return "skipped"
 
         if person["thumbnailPath"]:
             remove_hardlinks([person["thumbnailPath"]])
-
-        # Delete the person record
-        await conn.execute(
-            'DELETE FROM person WHERE "ownerId" = $1 AND "personGroupId" = $2',
-            target_user_id, person_group_id,
-        )
 
         await conn.execute("RELEASE SAVEPOINT delete_mirrored_person")
         return "deleted"
