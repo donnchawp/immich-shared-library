@@ -91,13 +91,16 @@ async def test_sets_face_asset_id_on_the_target_person(conn):
     tgt_asset = await make_asset(conn, tgt)
     await make_face(conn, src_asset, person_group_id=pg)
 
-    await sync_faces_for_asset(conn, src_asset, tgt_asset, src, tgt)
+    count = await sync_faces_for_asset(conn, src_asset, tgt_asset, src, tgt)
+    assert count == 1
+
+    target_face_id = await conn.fetchval(
+        'SELECT id FROM asset_face WHERE "assetId" = $1', tgt_asset
+    )
+    assert target_face_id is not None, "no face was copied to the target asset"
 
     face_asset_id = await conn.fetchval(
         'SELECT "faceAssetId" FROM person WHERE "ownerId" = $1 AND "personGroupId" = $2',
         tgt, pg,
-    )
-    target_face_id = await conn.fetchval(
-        'SELECT id FROM asset_face WHERE "assetId" = $1', tgt_asset
     )
     assert face_asset_id == target_face_id
