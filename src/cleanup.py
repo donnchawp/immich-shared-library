@@ -118,6 +118,14 @@ async def cleanup_reassigned_faces(conn: asyncpg.Connection) -> int:
       Postgres picks one arbitrarily for the join.
     - If the target user edits a copied face's bounding box, the match fails
       on every future cycle and that face is never reconciled again.
+
+    Like ``sync_faces_for_asset`` (src/ml_sync.py), this refuses to point a
+    target face at a group the target user has no ``person`` row on: with no
+    row, Immich's ``deleteEmptyGroups`` can drop the group and null the face.
+    Phase 2 normally creates that row via ``ensure_target_person``, but Phase 2
+    runs in its own transaction (src/sync_engine.py) and may have failed, so
+    the guard is stated here rather than assumed. An unassignment
+    (``sf."personGroupId" IS NULL``) needs no person row and still propagates.
     """
     updated = await conn.fetch(
         """
@@ -132,6 +140,14 @@ async def cleanup_reassigned_faces(conn: asyncpg.Connection) -> int:
           AND tf."boundingBoxX2" = sf."boundingBoxX2"
           AND tf."boundingBoxY2" = sf."boundingBoxY2"
           AND tf."personGroupId" IS DISTINCT FROM sf."personGroupId"
+          AND (
+              sf."personGroupId" IS NULL
+              OR EXISTS (
+                  SELECT 1 FROM person p
+                  WHERE p."ownerId" = m.target_user_id
+                    AND p."personGroupId" = sf."personGroupId"
+              )
+          )
         RETURNING tf.id, tf."personGroupId"
         """,
     )

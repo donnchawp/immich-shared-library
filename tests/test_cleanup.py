@@ -29,6 +29,9 @@ async def test_propagates_a_source_reassignment(conn):
     # Source face now points at new_pg; target still has old_pg
     await make_face(conn, src_asset, person_group_id=new_pg, bbox=(1, 1, 9, 9))
     await make_face(conn, tgt_asset, person_group_id=old_pg, bbox=(1, 1, 9, 9))
+    # Phase 2 (ensure_target_person) normally creates this; the reassignment is
+    # gated on it, so a face is never pointed at a group the target has no row on.
+    await make_person(conn, tgt, new_pg)
 
     updated = await cleanup_reassigned_faces(conn)
 
@@ -81,3 +84,31 @@ async def test_propagates_an_unassignment(conn):
         'SELECT "personGroupId" FROM asset_face WHERE "assetId" = $1', tgt_asset
     )
     assert now is None
+
+
+async def test_does_not_assign_a_group_the_target_has_no_person_row_on(conn):
+    """Phase 4 must not point a target face at a group the target user has no
+    ``person`` row on: with no row, Immich's deleteEmptyGroups can drop the
+    group and null the face. Phase 2 creates that row, but it runs in its own
+    transaction and may have failed, so Phase 4 states the precondition itself.
+    """
+    cg = await make_cluster_group(conn)
+    src = await make_user(conn, cluster_group_id=cg)
+    tgt = await make_user(conn, cluster_group_id=cg)
+    old_pg = await make_person_group(conn, cg)
+    new_pg = await make_person_group(conn, cg)
+
+    src_asset = await make_asset(conn, src)
+    tgt_asset = await make_asset(conn, tgt)
+    await _link(conn, src_asset, tgt_asset, src, tgt)
+    await make_face(conn, src_asset, person_group_id=new_pg, bbox=(1, 1, 9, 9))
+    await make_face(conn, tgt_asset, person_group_id=old_pg, bbox=(1, 1, 9, 9))
+    # Deliberately no person row for tgt on new_pg. The *source* has one, to
+    # prove the gate checks the target's ownership and not merely existence.
+    await make_person(conn, src, new_pg)
+
+    assert await cleanup_reassigned_faces(conn) == 0
+    still = await conn.fetchval(
+        'SELECT "personGroupId" FROM asset_face WHERE "assetId" = $1', tgt_asset
+    )
+    assert still == old_pg
