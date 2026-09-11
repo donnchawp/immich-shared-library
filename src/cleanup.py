@@ -3,7 +3,6 @@ import logging
 import asyncpg
 
 from src.file_ops import remove_hardlinks
-from src.person_sync import get_or_create_target_person
 
 logger = logging.getLogger(__name__)
 
