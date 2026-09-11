@@ -130,3 +130,39 @@ async def test_cleanup_never_unlinks_a_sidecar_path(conn, monkeypatch):
 
     assert handed_over, "cleanup did not run"
     assert all(".xmp" not in p for p in handed_over), handed_over
+
+
+async def test_delete_synced_never_unlinks_a_sidecar_path(conn, monkeypatch):
+    """The same guarantee as above, for the interactive bulk-delete tool.
+
+    delete_synced.py is the higher-consequence path -- it removes every synced
+    asset for a user in one go -- and it kept handing XMP paths to
+    remove_hardlinks long after cleanup.py stopped. remove_hardlinks rejects
+    them today via validate_path_within_upload, so this test pins the
+    behaviour at the SQL, where the reason lives, rather than at the backstop.
+    """
+    import delete_synced as delete_synced_mod
+
+    cg = await make_cluster_group(conn)
+    src = await make_user(conn, cluster_group_id=cg)
+    tgt = await make_user(conn, cluster_group_id=cg)
+    tgt_asset = await make_asset(conn, tgt)
+
+    await _add_file(conn, tgt_asset, "thumbnail", "/data/thumbs/t/aa/bb/x_thumbnail.webp")
+    await _add_file(conn, tgt_asset, "sidecar", f"{TGT_PREFIX}p.jpg.xmp")
+    await conn.execute(
+        """
+        INSERT INTO _face_sync_asset_map
+            (source_asset_id, target_asset_id, source_user_id, target_user_id, synced_at)
+        VALUES ($1, $2, $3, $4, NOW())
+        """,
+        await make_asset(conn, src), tgt_asset, src, tgt,
+    )
+
+    handed_over: list[str] = []
+    monkeypatch.setattr(delete_synced_mod, "remove_hardlinks", handed_over.extend)
+
+    assert await delete_synced_mod.delete_synced_asset(conn, tgt_asset) is True
+
+    assert handed_over, "delete_synced_asset handed over no paths at all"
+    assert all(".xmp" not in p for p in handed_over), handed_over

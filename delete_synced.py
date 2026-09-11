@@ -18,19 +18,23 @@ from pathlib import Path
 # Add project root to path
 sys.path.insert(0, os.path.dirname(__file__))
 
-# Load .env file
-env_file = Path(__file__).parent / ".env"
-if not env_file.exists():
-    print("Error: .env not found. Copy env.example to .env and fill in your values.")
-    sys.exit(1)
+# Load .env before importing anything from src: src.config builds its settings
+# singleton at import time, so the environment has to be populated first.
+#
+# A missing .env is not fatal here, only in main(). Importing this module must
+# stay side-effect-free enough for the test suite to reach the functions below
+# — .env is gitignored, so an import-time sys.exit would make every test of
+# this file pass only on a machine that happens to have one.
+ENV_FILE = Path(__file__).parent / ".env"
 
-for line in env_file.read_text().splitlines():
-    line = line.strip()
-    if not line or line.startswith("#"):
-        continue
-    key, _, value = line.partition("=")
-    if key and value:
-        os.environ.setdefault(key.strip(), value.strip())
+if ENV_FILE.exists():
+    for line in ENV_FILE.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, _, value = line.partition("=")
+        if key and value:
+            os.environ.setdefault(key.strip(), value.strip())
 
 os.environ.setdefault("SYNC_INTERVAL_SECONDS", "9999")
 
@@ -206,6 +210,10 @@ async def delete_mirrored_person(conn, target_user_id, person_group_id) -> str:
 
 
 async def main():
+    if not ENV_FILE.exists():
+        print("Error: .env not found. Copy env.example to .env and fill in your values.")
+        sys.exit(1)
+
     from src.config import settings
     print(f"Connecting to {settings.db_hostname}:{settings.db_port}/{settings.db_database_name}")
     await init_pool()
