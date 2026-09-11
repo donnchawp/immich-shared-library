@@ -1,4 +1,6 @@
-from src.cleanup import cleanup_reassigned_faces
+from uuid import uuid4
+
+from src.cleanup import cleanup_deleted_assets, cleanup_reassigned_faces
 from tests.conftest import (
     make_cluster_group, make_asset, make_face, make_person, make_person_group, make_user,
 )
@@ -112,3 +114,52 @@ async def test_does_not_assign_a_group_the_target_has_no_person_row_on(conn):
         'SELECT "personGroupId" FROM asset_face WHERE "assetId" = $1', tgt_asset
     )
     assert still == old_pg
+
+
+async def test_one_undeletable_asset_does_not_poison_the_cleanup_transaction(conn):
+    """A per-asset failure must roll back to a savepoint, not just be logged.
+
+    Catching the exception without ``ROLLBACK TO SAVEPOINT`` leaves Postgres in
+    an aborted transaction: every later iteration fails with
+    InFailedSQLTransactionError, each logged as its own "failure", and the
+    whole cleanup unwinds. This is the bug c263e97 fixed in delete_synced.py;
+    the production path had the same shape.
+    """
+    src = await make_user(conn)
+    tgt = await make_user(conn)
+
+    # Two mappings whose source assets no longer exist -- both are orphans.
+    doomed = await make_asset(conn, tgt)
+    good = await make_asset(conn, tgt)
+    await _link(conn, uuid4(), doomed, src, tgt)
+    await _link(conn, uuid4(), good, src, tgt)
+
+    # Make one target asset undeletable, the way a NO ACTION foreign key from a
+    # table the sidecar does not know about would.
+    await conn.execute(
+        'UPDATE asset SET "originalFileName" = $1 WHERE id = $2', "boom.jpg", doomed
+    )
+    await conn.execute(
+        """
+        CREATE FUNCTION _refuse_delete() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN RAISE EXCEPTION 'refusing to delete %', OLD.id; END $$;
+        CREATE TRIGGER _refuse_delete_boom BEFORE DELETE ON asset
+            FOR EACH ROW WHEN (OLD."originalFileName" = 'boom.jpg')
+            EXECUTE FUNCTION _refuse_delete();
+        """
+    )
+
+    count = await cleanup_deleted_assets(conn)
+
+    # The transaction must still be usable. Order-independent: whichever asset
+    # the LEFT JOIN returns first, an unrolled-back failure poisons everything
+    # after it and this query raises.
+    assert await conn.fetchval("SELECT 1") == 1
+
+    assert count == 1
+    assert await conn.fetchval("SELECT 1 FROM asset WHERE id = $1", good) is None
+    assert await conn.fetchval("SELECT 1 FROM asset WHERE id = $1", doomed) == 1
+    # The doomed mapping survives so the next cycle retries it.
+    assert await conn.fetchval(
+        "SELECT count(*) FROM _face_sync_asset_map WHERE target_asset_id = $1", doomed
+    ) == 1

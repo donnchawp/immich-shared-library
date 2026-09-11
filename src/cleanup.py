@@ -30,6 +30,12 @@ async def cleanup_deleted_assets(conn: asyncpg.Connection) -> int:
         target_id = row["target_asset_id"]
         source_id = row["source_asset_id"]
 
+        # Per-asset savepoint, same pattern as sync_asset. Catching the
+        # exception is not enough on its own: a failed statement leaves
+        # Postgres in an aborted transaction, so without the rollback every
+        # later iteration dies with InFailedSQLTransactionError and the whole
+        # cleanup unwinds because of one bad asset.
+        await conn.execute("SAVEPOINT cleanup_asset")
         try:
             # Get file paths before deleting records.
             #
@@ -68,10 +74,12 @@ async def cleanup_deleted_assets(conn: asyncpg.Connection) -> int:
                 target_id,
             )
 
+            await conn.execute("RELEASE SAVEPOINT cleanup_asset")
             logger.info("Cleaned up deleted asset: source=%s target=%s", source_id, target_id)
             count += 1
 
         except Exception:
+            await conn.execute("ROLLBACK TO SAVEPOINT cleanup_asset")
             logger.exception("Failed to clean up target asset %s", target_id)
 
     return count
