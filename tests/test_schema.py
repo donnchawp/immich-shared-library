@@ -1,7 +1,11 @@
 import pytest
 
-from src.schema import SchemaValidationError, validate_cluster_group
+from src.schema import SchemaValidationError, validate_cluster_group, validate_schema
 from tests.conftest import make_cluster_group, make_user
+
+
+async def test_validate_schema_passes_against_real_v3_2_0_schema(conn):
+    await validate_schema(conn)  # must not raise
 
 
 async def test_same_cluster_group_passes(conn):

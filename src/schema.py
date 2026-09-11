@@ -60,7 +60,7 @@ REQUIRED_SCHEMA: dict[str, set[str]] = {
         "packetCount", "outputFrames",
     },
     "asset_face": {
-        "id", "assetId", "personId", "imageWidth", "imageHeight",
+        "id", "assetId", "personGroupId", "imageWidth", "imageHeight",
         "boundingBoxX1", "boundingBoxY1", "boundingBoxX2", "boundingBoxY2",
         "sourceType", "deletedAt", "updatedAt", "isVisible",
     },
@@ -153,7 +153,7 @@ INSERTED_COLUMNS: dict[str, set[str]] = {
         "packetCount", "outputFrames",
     },
     "asset_face": {
-        "id", "assetId", "personId", "imageWidth", "imageHeight",
+        "id", "assetId", "personGroupId", "imageWidth", "imageHeight",
         "boundingBoxX1", "boundingBoxY1", "boundingBoxX2", "boundingBoxY2",
         "sourceType", "isVisible",
     },
