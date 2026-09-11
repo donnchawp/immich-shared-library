@@ -289,3 +289,58 @@ async def cleanup_orphaned_persons(conn: asyncpg.Connection) -> int:
         logger.info("Cleaned up %d orphaned target persons", len(deleted))
 
     return len(deleted)
+
+
+async def delete_target_person_in_shared_group(
+    conn: asyncpg.Connection, target_user_id: UUID, person_group_id: UUID,
+) -> bool:
+    """Teardown: drop one target person row from a group a source still holds.
+
+    For the teardown tools (``delete_synced.py``, ``reset.sh``), not the sync
+    cycle. Returns True if a row was actually deleted.
+
+    This is the mirror image of ``cleanup_orphaned_persons``, and the two
+    guards are deliberately not the same shape — the difference is worth
+    stating, because it reads like drift and is not:
+
+    * The ``EXISTS`` requires a *mapped source* to still hold a person row on
+      the group. That, not the face guard, is what makes this safe: the group
+      keeps a row, so Immich's ``deleteEmptyGroups`` cannot drop it and null
+      every face in it. ``cleanup_orphaned_persons`` requires the opposite
+      (``NOT EXISTS``) because it runs when the sidecar's persons are the last
+      ones left, and so it needs the group-scoped face guard instead.
+    * The face guard here is therefore free to be *owner-scoped*: "is the
+      target still using this person?". Group-scoped, as in
+      ``cleanup_orphaned_persons``, it would match the source's faces on the
+      source's own photos — the normal state during teardown — and refuse
+      every deletion, making both tools silent no-ops.
+
+    One statement, so both conditions are evaluated at delete time.
+    ``delete_synced.py`` lists its candidates before an interactive prompt,
+    which leaves a human-scale window in which the source's person row could
+    go; re-checking here closes it.
+    """
+    deleted = await conn.fetchval(
+        """
+        DELETE FROM person t
+        WHERE t."ownerId" = $1
+          AND t."personGroupId" = $2
+          AND EXISTS (
+              SELECT 1 FROM _face_sync_asset_map m
+              JOIN person s ON s."personGroupId" = t."personGroupId"
+                           AND s."ownerId" = m.source_user_id
+              WHERE m.target_user_id = t."ownerId"
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM asset_face af
+              JOIN asset a ON a.id = af."assetId"
+              WHERE af."personGroupId" = t."personGroupId"
+                AND a."ownerId" = t."ownerId"
+                AND af."deletedAt" IS NULL
+          )
+        RETURNING t."personGroupId"
+        """,
+        target_user_id,
+        person_group_id,
+    )
+    return deleted is not None

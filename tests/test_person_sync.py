@@ -357,3 +357,98 @@ async def test_sync_person_names_skips_groups_no_synced_asset_carries(conn):
     assert await conn.fetchval(
         'SELECT name FROM person WHERE "ownerId" = $1 AND "personGroupId" = $2', tgt, own_only
     ) == ""
+
+
+async def test_teardown_deletes_the_target_row_when_a_source_still_holds_the_group(conn):
+    from src.person_sync import delete_target_person_in_shared_group
+
+    cg = await make_cluster_group(conn)
+    src = await make_user(conn, cluster_group_id=cg)
+    tgt = await make_user(conn, cluster_group_id=cg)
+    pg = await make_person_group(conn, cg)
+    await make_person(conn, src, pg)
+    await make_person(conn, tgt, pg)
+    await _map_synced_pair(conn, src, tgt)
+
+    assert await delete_target_person_in_shared_group(conn, tgt, pg) is True
+    assert await conn.fetchval(
+        'SELECT count(*) FROM person WHERE "ownerId" = $1', tgt
+    ) == 0
+    # The source keeps its own row, so the group never empties.
+    assert await conn.fetchval(
+        'SELECT count(*) FROM person WHERE "ownerId" = $1', src
+    ) == 1
+
+
+async def test_teardown_refuses_when_no_mapped_source_holds_the_group(conn):
+    """This is the guard that stops the group emptying, not the face guard.
+
+    Deleting the last person row on a group lets Immich's deleteEmptyGroups
+    drop it and null every face in it -- the source user's included. Requiring
+    a mapped source to still hold a row is what makes that impossible. It is
+    re-checked here at delete time because delete_synced.py lists its
+    candidates before an interactive prompt, so the source row can disappear
+    between the listing and the delete.
+    """
+    from src.person_sync import delete_target_person_in_shared_group
+
+    cg = await make_cluster_group(conn)
+    src = await make_user(conn, cluster_group_id=cg)
+    tgt = await make_user(conn, cluster_group_id=cg)
+    pg = await make_person_group(conn, cg)
+    await make_person(conn, tgt, pg)  # source row is gone
+    await _map_synced_pair(conn, src, tgt)
+
+    assert await delete_target_person_in_shared_group(conn, tgt, pg) is False
+    assert await conn.fetchval(
+        'SELECT count(*) FROM person WHERE "ownerId" = $1', tgt
+    ) == 1
+
+
+async def test_teardown_refuses_while_the_target_still_has_faces_in_the_group(conn):
+    from src.person_sync import delete_target_person_in_shared_group
+
+    cg = await make_cluster_group(conn)
+    src = await make_user(conn, cluster_group_id=cg)
+    tgt = await make_user(conn, cluster_group_id=cg)
+    pg = await make_person_group(conn, cg)
+    await make_person(conn, src, pg)
+    await make_person(conn, tgt, pg)
+    await _map_synced_pair(conn, src, tgt)
+
+    tgt_asset = await make_asset(conn, tgt)
+    await make_face(conn, tgt_asset, person_group_id=pg)
+
+    assert await delete_target_person_in_shared_group(conn, tgt, pg) is False
+    assert await conn.fetchval(
+        'SELECT count(*) FROM person WHERE "ownerId" = $1', tgt
+    ) == 1
+
+
+async def test_teardown_face_guard_is_owner_scoped_not_group_scoped(conn):
+    """Deliberately unlike cleanup_orphaned_persons, which is group-scoped.
+
+    Teardown runs while the source still owns faces in the group -- that is
+    the normal state -- so a group-scoped face guard would refuse every
+    deletion and make the teardown scripts silent no-ops. It is safe here
+    precisely because the EXISTS above keeps a source person row on the group,
+    so nothing can empty it.
+    """
+    from src.person_sync import delete_target_person_in_shared_group
+
+    cg = await make_cluster_group(conn)
+    src = await make_user(conn, cluster_group_id=cg)
+    tgt = await make_user(conn, cluster_group_id=cg)
+    pg = await make_person_group(conn, cg)
+    await make_person(conn, src, pg)
+    await make_person(conn, tgt, pg)
+    await _map_synced_pair(conn, src, tgt)
+
+    src_asset = await make_asset(conn, src)
+    await make_face(conn, src_asset, person_group_id=pg)
+
+    assert await delete_target_person_in_shared_group(conn, tgt, pg) is True
+    # The source's face survives, still assigned, because the group kept a row.
+    assert await conn.fetchval(
+        'SELECT "personGroupId" FROM asset_face WHERE "assetId" = $1', src_asset
+    ) == pg

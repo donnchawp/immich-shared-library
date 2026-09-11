@@ -109,11 +109,20 @@ if [[ "$asset_count" -gt 0 ]]; then
     "
 fi
 
-# Delete mirrored persons (runs after asset deletion above, so any faces
-# that lived only on synced assets are already gone; the NOT EXISTS guard
-# below still protects any target person whose group has faces from the
-# target's own non-synced assets, since deleting that row would silently
-# unassign them via Immich's deleteEmptyGroups)
+# Delete mirrored persons (runs after asset deletion above, so any faces that
+# lived only on synced assets are already gone).
+#
+# Two guards, and it is the EXISTS that matters most. Requiring a mapped
+# source to still hold a person row on the group is what keeps the group
+# non-empty after this delete, so Immich's deleteEmptyGroups cannot drop it
+# and unassign every face in it — the source user's own included.
+#
+# The NOT EXISTS is then free to be owner-scoped: it spares any target person
+# still carrying faces from the target's own non-synced assets. Group-scoped,
+# as in cleanup_orphaned_persons (src/person_sync.py), it would match the
+# source's faces on the source's own photos and refuse every deletion here.
+# Same predicate as delete_target_person_in_shared_group, which is where it
+# is documented and tested; keep the two in step.
 if [[ "$person_count" -gt 0 ]]; then
     echo "Deleting up to $person_count mirrored person(s)..."
     psql_cmd "
