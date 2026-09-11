@@ -45,12 +45,48 @@ from src.main import ensure_tracking_tables
 from src.sync_engine import run_full_sync
 
 
+async def _source_face_health(source_user_ids):
+    """Count each source user's own faces, and how many are unassigned.
+
+    This is the canary for the one failure mode where the sidecar damages the
+    account it is only supposed to read from. Immich's ``deleteEmptyGroups``
+    removes any ``person_group`` with no ``person`` row, and
+    ``asset_face."personGroupId"`` is ON DELETE SET NULL — so if the sidecar
+    ever deletes the last person row on a shared group, every face in that
+    group is silently unassigned, including the source user's faces on the
+    source user's own photos.
+
+    Nothing else printed by this script would show that: the target side would
+    look perfectly healthy. Sample before and after the cycle and compare.
+    """
+    from src.db import fetch_all
+
+    return {
+        row["ownerId"]: (row["unassigned"], row["total"])
+        for row in await fetch_all(
+            """
+            SELECT a."ownerId",
+                   COUNT(*) FILTER (WHERE af."personGroupId" IS NULL) AS unassigned,
+                   COUNT(*) AS total
+            FROM asset_face af
+            JOIN asset a ON a.id = af."assetId"
+            WHERE a."ownerId" = ANY($1)
+              AND af."deletedAt" IS NULL
+              AND a."deletedAt" IS NULL
+            GROUP BY a."ownerId"
+            """,
+            list(source_user_ids),
+        )
+    }
+
+
 async def main():
     # Use first sync job's target user for verification queries
     if not settings.sync_jobs:
         print("Error: No sync jobs configured. Check your config.yaml or .env.")
         sys.exit(1)
     target_user_id = settings.sync_jobs[0].target_user_id
+    source_user_ids = {job.source_user_id for job in settings.sync_jobs}
 
     print("=== Initializing database pool ===")
     await init_pool()
@@ -58,9 +94,42 @@ async def main():
     print("\n=== Ensuring tracking tables ===")
     await ensure_tracking_tables()
 
+    print("\n=== Source face health (before) ===")
+    before = await _source_face_health(source_user_ids)
+    for uid, (unassigned, total) in sorted(before.items(), key=lambda kv: str(kv[0])):
+        print(f"  source {uid}: {unassigned} unassigned of {total} faces")
+    if not before:
+        print("  (no source faces found — nothing to compare against)")
+
     print("\n=== Running full sync ===")
     stats = await run_full_sync()
     print(f"\n=== Sync results: {stats} ===")
+
+    print("\n=== Source face health (after) ===")
+    after = await _source_face_health(source_user_ids)
+    regressed = False
+    for uid in sorted(set(before) | set(after), key=str):
+        was_unassigned, was_total = before.get(uid, (0, 0))
+        now_unassigned, now_total = after.get(uid, (0, 0))
+        delta = now_unassigned - was_unassigned
+        print(
+            f"  source {uid}: {now_unassigned} unassigned of {now_total} faces "
+            f"(was {was_unassigned} of {was_total}, delta {delta:+d})"
+        )
+        if delta > 0:
+            regressed = True
+
+    if regressed:
+        print(
+            "\n  *** STOP: a source user's own faces lost their person assignment. ***\n"
+            "  The sidecar must never write to the source account. This is the\n"
+            "  signature of a shared person_group being emptied — Immich's\n"
+            "  deleteEmptyGroups then nulls every face in that group.\n"
+            "  Do not run another cycle. Restore from your pre-run pg_dump and\n"
+            "  report which statement ran, from the DEBUG log above."
+        )
+    else:
+        print("\n  OK — no source faces lost their person assignment.")
 
     # Verify results
     from src.db import fetch_all, fetch_one
