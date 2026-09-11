@@ -139,6 +139,14 @@ async def sync_person_names(conn: asyncpg.Connection) -> int:
     Only fills empty names. Names are per-user in v3.2.0 by design — if the
     target user has named someone themselves, that is their choice and the
     sidecar must not stomp it.
+
+    The fill-only rule bounds the damage but not the reach, so this carries the
+    same synced-asset guard as ``sync_person_visibility``. Under cluster groups
+    Immich puts both users' faces into shared ``person_group`` rows by
+    construction, so "same group + mapped owner pair" is not a sidecar
+    footprint — it covers people the target discovered entirely on their own
+    photos. The second ``EXISTS`` narrows it to groups actually carried by a
+    synced asset.
     """
     updated = await conn.fetch(
         """
@@ -152,6 +160,13 @@ async def sync_person_names(conn: asyncpg.Connection) -> int:
               SELECT 1 FROM _face_sync_asset_map m
               WHERE m.source_user_id = s."ownerId"
                 AND m.target_user_id = t."ownerId"
+          )
+          AND EXISTS (
+              SELECT 1 FROM _face_sync_asset_map m2
+              JOIN asset_face af ON af."assetId" = m2.target_asset_id
+              WHERE m2.target_user_id = t."ownerId"
+                AND af."personGroupId" = t."personGroupId"
+                AND af."deletedAt" IS NULL
           )
         RETURNING t."ownerId", t."personGroupId", t.name
         """,

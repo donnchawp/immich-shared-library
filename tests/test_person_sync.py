@@ -88,7 +88,7 @@ async def test_sync_person_names_fills_empty_name(conn):
     pg = await make_person_group(conn, cg)
     await make_person(conn, src, pg, name="Granny")
     await make_person(conn, tgt, pg, name="")
-    await _map_synced_pair(conn, src, tgt)
+    await _map_synced_pair(conn, src, tgt, person_group_id=pg)
 
     updated = await sync_person_names(conn)
 
@@ -341,3 +341,39 @@ async def test_sync_person_visibility_skips_groups_no_synced_asset_carries(conn)
         'SELECT "isHidden" FROM person WHERE "ownerId" = $1 AND "personGroupId" = $2',
         tgt, own_pg,
     ) is False
+
+
+async def test_sync_person_names_skips_groups_no_synced_asset_carries(conn):
+    """Names must only reach person groups the sidecar actually synced.
+
+    Under cluster groups Immich puts both users' faces into the same
+    person_group by construction, so "same group + mapped owner pair" is not a
+    sidecar footprint. Without the synced-asset guard, the source's name lands
+    on a person the target discovered entirely on their own photos.
+    """
+    cg = await make_cluster_group(conn)
+    src = await make_user(conn, cluster_group_id=cg)
+    tgt = await make_user(conn, cluster_group_id=cg)
+
+    carried = await make_person_group(conn, cg)      # reached via a synced asset
+    own_only = await make_person_group(conn, cg)     # target's own discovery
+
+    for pg in (carried, own_only):
+        await make_person(conn, src, pg, name="Granny")
+        await make_person(conn, tgt, pg, name="")
+
+    # Only `carried` is present on the synced target asset.
+    await _map_synced_pair(conn, src, tgt, person_group_id=carried)
+
+    # The target's own photo carries `own_only`. It is not a synced asset.
+    own_asset = await make_asset(conn, tgt)
+    await make_face(conn, own_asset, person_group_id=own_only, bbox=(2, 2, 8, 8))
+
+    assert await sync_person_names(conn) == 1
+
+    assert await conn.fetchval(
+        'SELECT name FROM person WHERE "ownerId" = $1 AND "personGroupId" = $2', tgt, carried
+    ) == "Granny"
+    assert await conn.fetchval(
+        'SELECT name FROM person WHERE "ownerId" = $1 AND "personGroupId" = $2', tgt, own_only
+    ) == ""
