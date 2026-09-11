@@ -1,5 +1,5 @@
-PG          := immich_postgres
-NETWORK     := immich_default
+PG          ?= immich_postgres
+NETWORK     ?= immich_default
 TEST_DB_URL := postgresql://postgres:postgres@$(PG):5432/immich_test
 
 .PHONY: help test testdb testdb-clean lint schema-dump

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPTS=("test_sync.py" "dedup_synced.py" "delete_synced.py")
-NETWORK="immich_default"
+NETWORK="${NETWORK:-immich_default}"
 IMAGE="python:3.12-slim"
 
 usage() {
