@@ -16,7 +16,8 @@ from src.ml_sync import sync_faces_for_asset, sync_faces_incremental
 from src.person_sync import cleanup_orphaned_persons, sync_person_names
 from src.sync_engine import _sync_faces_guarded
 from tests.conftest import (
-    make_asset, make_cluster_group, make_face, make_person, make_person_group, make_user,
+    make_asset, make_cluster_group, make_face, make_person, make_person_group,
+    make_synced_pair, make_user,
 )
 
 
@@ -30,13 +31,9 @@ async def test_full_face_flow_converges(conn):
 
     src_asset = await make_asset(conn, src)
     tgt_asset = await make_asset(conn, tgt)
-    await conn.execute(
-        """
-        INSERT INTO _face_sync_asset_map
-            (source_asset_id, target_asset_id, source_user_id, target_user_id, synced_at)
-        VALUES ($1, $2, $3, $4, NOW())
-        """,
-        src_asset, tgt_asset, src, tgt,
+    await make_synced_pair(
+        conn, src, tgt,
+        source_asset_id=src_asset, target_asset_id=tgt_asset,
     )
     await make_face(conn, src_asset, person_group_id=pg, bbox=(1, 1, 9, 9))
 
@@ -223,13 +220,9 @@ async def test_a_face_failure_keeps_the_batch_alive_and_defers_to_phase_2(conn):
 
     src_asset = await make_asset(conn, src)
     tgt_asset = await make_asset(conn, tgt)
-    await conn.execute(
-        """
-        INSERT INTO _face_sync_asset_map
-            (source_asset_id, target_asset_id, source_user_id, target_user_id, synced_at)
-        VALUES ($1, $2, $3, $4, NOW())
-        """,
-        src_asset, tgt_asset, src, tgt,
+    await make_synced_pair(
+        conn, src, tgt,
+        source_asset_id=src_asset, target_asset_id=tgt_asset,
     )
     await make_face(conn, src_asset, person_group_id=pg, bbox=(1, 1, 9, 9))
 

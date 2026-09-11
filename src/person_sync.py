@@ -10,6 +10,35 @@ from src.file_ops import validate_path_within_upload
 
 logger = logging.getLogger(__name__)
 
+# The scope shared by every cross-user write below: a person group the sidecar
+# actually put on this pair's synced assets.
+#
+# Both halves are load-bearing. The first bounds the write to managed user
+# pairs. The second is the one that is easy to talk yourself out of: cluster
+# groups make Immich file BOTH users' faces into the same person_group by
+# construction, so "same group + mapped pair" also matches people the target
+# found entirely on their own photos. Without it the source's metadata lands
+# on strangers.
+#
+# Written as semi-joins, not joins. _face_sync_asset_map holds one row per
+# synced asset, so joining it directly fans every person row out across the
+# whole library. Interpolated rather than shared as a view because these run
+# against Immich's database, which the sidecar does not own the schema of.
+_SYNCED_GROUP_SCOPE = """
+          AND EXISTS (
+              SELECT 1 FROM _face_sync_asset_map m
+              WHERE m.source_user_id = s."ownerId"
+                AND m.target_user_id = t."ownerId"
+          )
+          AND EXISTS (
+              SELECT 1 FROM _face_sync_asset_map m2
+              JOIN asset_face af ON af."assetId" = m2.target_asset_id
+              WHERE m2.target_user_id = t."ownerId"
+                AND af."personGroupId" = t."personGroupId"
+                AND af."deletedAt" IS NULL
+          )
+"""
+
 
 def _hardlink_person_thumbnail(
     person_group_id: UUID,
@@ -140,13 +169,8 @@ async def sync_person_names(conn: asyncpg.Connection) -> int:
     target user has named someone themselves, that is their choice and the
     sidecar must not stomp it.
 
-    The fill-only rule bounds the damage but not the reach, so this carries the
-    same synced-asset guard as ``sync_person_visibility``. Under cluster groups
-    Immich puts both users' faces into shared ``person_group`` rows by
-    construction, so "same group + mapped owner pair" is not a sidecar
-    footprint — it covers people the target discovered entirely on their own
-    photos. The second ``EXISTS`` narrows it to groups actually carried by a
-    synced asset.
+    The fill-only rule bounds the damage but not the reach, so this carries
+    ``_SYNCED_GROUP_SCOPE`` like the other cross-user writes.
     """
     updated = await conn.fetch(
         """
@@ -156,18 +180,9 @@ async def sync_person_names(conn: asyncpg.Connection) -> int:
         WHERE s."personGroupId" = t."personGroupId"
           AND s.name <> ''
           AND t.name = ''
-          AND EXISTS (
-              SELECT 1 FROM _face_sync_asset_map m
-              WHERE m.source_user_id = s."ownerId"
-                AND m.target_user_id = t."ownerId"
-          )
-          AND EXISTS (
-              SELECT 1 FROM _face_sync_asset_map m2
-              JOIN asset_face af ON af."assetId" = m2.target_asset_id
-              WHERE m2.target_user_id = t."ownerId"
-                AND af."personGroupId" = t."personGroupId"
-                AND af."deletedAt" IS NULL
-          )
+        """
+        + _SYNCED_GROUP_SCOPE
+        + """
         RETURNING t."ownerId", t."personGroupId", t.name
         """,
     )
@@ -186,11 +201,9 @@ async def sync_person_names(conn: asyncpg.Connection) -> int:
 async def sync_person_thumbnails(conn: asyncpg.Connection) -> int:
     """Hardlink thumbnails for target persons that still have none.
 
-    Scoped like ``sync_person_visibility``: without the synced-asset ``EXISTS``
-    this would hardlink the source's face crop onto people the target
-    discovered on their own photos, purely because cluster groups put both
-    users in the same ``person_group``. Fill-only on ``thumbnailPath = ''``,
-    but it creates files on disk, so the reach is worth bounding.
+    Carries ``_SYNCED_GROUP_SCOPE`` like the other cross-user writes. It is
+    fill-only on ``thumbnailPath = ''``, but it creates files on disk, so the
+    reach is worth bounding.
     """
     rows = await conn.fetch(
         """
@@ -201,18 +214,9 @@ async def sync_person_thumbnails(conn: asyncpg.Connection) -> int:
         JOIN person s ON s."personGroupId" = t."personGroupId"
         WHERE s."thumbnailPath" <> ''
           AND t."thumbnailPath" = ''
-          AND EXISTS (
-              SELECT 1 FROM _face_sync_asset_map m
-              WHERE m.source_user_id = s."ownerId"
-                AND m.target_user_id = t."ownerId"
-          )
-          AND EXISTS (
-              SELECT 1 FROM _face_sync_asset_map m2
-              JOIN asset_face af ON af."assetId" = m2.target_asset_id
-              WHERE m2.target_user_id = t."ownerId"
-                AND af."personGroupId" = t."personGroupId"
-                AND af."deletedAt" IS NULL
-          )
+        """
+        + _SYNCED_GROUP_SCOPE
+        + """
         """,
     )
 

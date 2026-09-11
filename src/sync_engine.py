@@ -88,6 +88,20 @@ async def run_full_sync() -> dict:
     # Track new target asset IDs per job (for per-job album assignment)
     job_target_ids: dict[str, list[UUID]] = {}
 
+    # Phase 0: Prune mappings whose target asset is gone, before anything reads
+    # the map.
+    #
+    # This runs first so the rest of the cycle can assume every mapping points
+    # at a live target asset. It used to run at the end of Phase 4, which meant
+    # a hard-deleted target wedged the sidecar permanently: Phase 2 hit a
+    # foreign key violation inserting a face for the vanished asset, the cycle
+    # aborted, and the prune that would have fixed it never ran — identically,
+    # every cycle after. Consumers still guard themselves, but as belt and
+    # braces rather than as the only thing standing between a deleted photo and
+    # a stuck sidecar.
+    async with transaction() as conn:
+        stats["stale_mappings_pruned"] = await cleanup_stale_mappings(conn)
+
     # Phase 1: Sync new assets (per job, in batches to limit memory usage)
     for job in settings.sync_jobs:
         job_ids: list[UUID] = []
@@ -146,9 +160,9 @@ async def run_full_sync() -> dict:
         stats["persons_updated"] += await sync_person_names(conn)
         stats["persons_updated"] += await sync_person_thumbnails(conn)
 
-    # Phase 4: Handle deletions and person merges
+    # Phase 4: Handle deletions and person merges. Stale mappings were pruned
+    # in Phase 0, before any phase read the map.
     async with transaction() as conn:
-        stats["stale_mappings_pruned"] = await cleanup_stale_mappings(conn)
         stats["assets_cleaned"] = await cleanup_deleted_assets(conn)
         stats["faces_reassigned"] = await cleanup_reassigned_faces(conn)
         stats["persons_cleaned"] = await cleanup_orphaned_persons(conn)

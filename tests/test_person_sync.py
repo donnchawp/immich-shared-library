@@ -1,8 +1,10 @@
 from tests.conftest import (
-    make_cluster_group, make_asset, make_face, make_person, make_person_group, make_user,
+    make_cluster_group, make_asset, make_face, make_person, make_person_group,
+    make_synced_pair, make_user,
 )
 from src.person_sync import (
     cleanup_orphaned_persons,
+    delete_target_person_in_shared_group,
     ensure_target_person,
     sync_person_names,
     sync_person_thumbnails,
@@ -17,19 +19,13 @@ async def _map_synced_pair(conn, src, tgt, *, person_group_id=None):
     Pass ``person_group_id`` to also put a face in that group on the synced
     target asset, which is what brings the group itself into scope for the
     metadata syncs. Returns the target asset id.
+
+    Thin wrapper over ``make_synced_pair`` kept for the shorter return value,
+    which most tests in this file want.
     """
-    src_asset = await make_asset(conn, src)
-    tgt_asset = await make_asset(conn, tgt)
-    await conn.execute(
-        """
-        INSERT INTO _face_sync_asset_map
-            (source_asset_id, target_asset_id, source_user_id, target_user_id, synced_at)
-        VALUES ($1, $2, $3, $4, NOW())
-        """,
-        src_asset, tgt_asset, src, tgt,
+    _, tgt_asset = await make_synced_pair(
+        conn, src, tgt, person_group_id=person_group_id,
     )
-    if person_group_id is not None:
-        await make_face(conn, tgt_asset, person_group_id=person_group_id)
     return tgt_asset
 
 
@@ -360,7 +356,6 @@ async def test_sync_person_names_skips_groups_no_synced_asset_carries(conn):
 
 
 async def test_teardown_deletes_the_target_row_when_a_source_still_holds_the_group(conn):
-    from src.person_sync import delete_target_person_in_shared_group
 
     cg = await make_cluster_group(conn)
     src = await make_user(conn, cluster_group_id=cg)
@@ -390,7 +385,6 @@ async def test_teardown_refuses_when_no_mapped_source_holds_the_group(conn):
     candidates before an interactive prompt, so the source row can disappear
     between the listing and the delete.
     """
-    from src.person_sync import delete_target_person_in_shared_group
 
     cg = await make_cluster_group(conn)
     src = await make_user(conn, cluster_group_id=cg)
@@ -406,7 +400,6 @@ async def test_teardown_refuses_when_no_mapped_source_holds_the_group(conn):
 
 
 async def test_teardown_refuses_while_the_target_still_has_faces_in_the_group(conn):
-    from src.person_sync import delete_target_person_in_shared_group
 
     cg = await make_cluster_group(conn)
     src = await make_user(conn, cluster_group_id=cg)
@@ -434,7 +427,6 @@ async def test_teardown_face_guard_is_owner_scoped_not_group_scoped(conn):
     precisely because the EXISTS above keeps a source person row on the group,
     so nothing can empty it.
     """
-    from src.person_sync import delete_target_person_in_shared_group
 
     cg = await make_cluster_group(conn)
     src = await make_user(conn, cluster_group_id=cg)

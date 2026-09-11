@@ -2,18 +2,16 @@ from uuid import uuid4
 
 from src.cleanup import cleanup_deleted_assets, cleanup_reassigned_faces
 from tests.conftest import (
-    make_cluster_group, make_asset, make_face, make_person, make_person_group, make_user,
+    make_cluster_group, make_asset, make_face, make_person, make_person_group,
+    make_synced_pair, make_user,
 )
 
 
 async def _link(conn, src_asset, tgt_asset, src_user, tgt_user):
-    await conn.execute(
-        """
-        INSERT INTO _face_sync_asset_map
-            (source_asset_id, target_asset_id, source_user_id, target_user_id, synced_at)
-        VALUES ($1, $2, $3, $4, NOW())
-        """,
-        src_asset, tgt_asset, src_user, tgt_user,
+    """Map two assets this file already made. See conftest.make_synced_pair."""
+    await make_synced_pair(
+        conn, src_user, tgt_user,
+        source_asset_id=src_asset, target_asset_id=tgt_asset,
     )
 
 

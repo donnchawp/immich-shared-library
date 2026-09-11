@@ -16,7 +16,7 @@ Two things follow, and both have bitten:
 from uuid import uuid4
 
 from src.config import SyncJob
-from tests.conftest import make_asset, make_cluster_group, make_user
+from tests.conftest import make_asset, make_cluster_group, make_synced_pair, make_user
 
 SRC_PREFIX = "/external_library/donncha/shared/"
 TGT_PREFIX = "/external_library/tester/donncha/"
@@ -113,13 +113,9 @@ async def test_cleanup_never_unlinks_a_sidecar_path(conn, monkeypatch):
     await _add_file(conn, tgt_asset, "sidecar", f"{TGT_PREFIX}p.jpg.xmp")
 
     # Map the pair, then hard-delete the source so cleanup targets it.
-    await conn.execute(
-        """
-        INSERT INTO _face_sync_asset_map
-            (source_asset_id, target_asset_id, source_user_id, target_user_id, synced_at)
-        VALUES ($1, $2, $3, $4, NOW())
-        """,
-        src_asset, tgt_asset, src, tgt,
+    await make_synced_pair(
+        conn, src, tgt,
+        source_asset_id=src_asset, target_asset_id=tgt_asset,
     )
     await conn.execute("DELETE FROM asset WHERE id = $1", src_asset)
 

@@ -42,7 +42,7 @@ import logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", stream=sys.stdout)
 
 from src.db import init_pool, close_pool, fetch_all, fetch_one, transaction
-from src.file_ops import remove_hardlinks
+from src.file_ops import owned_file_paths, remove_hardlinks
 from src.main import ensure_tracking_tables
 from src.person_sync import delete_target_person_in_shared_group
 
@@ -110,21 +110,9 @@ async def delete_synced_asset(conn, target_asset_id) -> bool:
     """
     await conn.execute("SAVEPOINT delete_synced_asset")
     try:
-        # Get file paths before deleting records.
-        #
-        # Sidecar (XMP) rows are excluded for the same reason as in
-        # cleanup_deleted_assets (src/cleanup.py): a sidecar row points into
-        # the external library, where the target's directory is a symlink to
-        # the source's, so unlinking the target's XMP path destroys the SOURCE
-        # user's own file. remove_hardlinks' validate_path_within_upload guard
-        # happens to reject those paths today, but that is a backstop, not the
-        # reason — this tool must not be relying on it.
-        files = await conn.fetch(
-            'SELECT path FROM asset_file WHERE "assetId" = $1 AND type <> $2',
-            target_asset_id,
-            "sidecar",
-        )
-        file_paths = [f["path"] for f in files]
+        # Paths we created and may delete — excludes the XMP sidecar, which
+        # is not ours. See file_ops.owned_file_paths.
+        file_paths = await owned_file_paths(conn, target_asset_id)
 
         # Remove hardlinked files first
         remove_hardlinks(file_paths)

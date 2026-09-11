@@ -1,6 +1,7 @@
 from src.ml_sync import sync_faces_for_asset
 from tests.conftest import (
-    make_cluster_group, make_asset, make_face, make_person, make_person_group, make_user,
+    make_cluster_group, make_asset, make_face, make_person, make_person_group,
+    make_synced_pair, make_user,
 )
 
 
@@ -127,13 +128,10 @@ async def test_incremental_sync_skips_mappings_whose_target_asset_is_gone(conn):
     missing_target = uuid4()  # never inserted into asset
 
     # synced_at in the past so the source face counts as updated since
-    await conn.execute(
-        """
-        INSERT INTO _face_sync_asset_map
-            (source_asset_id, target_asset_id, source_user_id, target_user_id, synced_at)
-        VALUES ($1, $2, $3, $4, NOW() - INTERVAL '1 day')
-        """,
-        src_asset, missing_target, src, tgt,
+    await make_synced_pair(
+        conn, src, tgt,
+        source_asset_id=src_asset, target_asset_id=missing_target,
+        synced_at="NOW() - INTERVAL '1 day'",
     )
     await make_face(conn, src_asset, bbox=(1, 1, 9, 9))
 
@@ -151,13 +149,10 @@ async def test_incremental_sync_still_syncs_live_pairs(conn):
 
     src_asset = await make_asset(conn, src)
     tgt_asset = await make_asset(conn, tgt)
-    await conn.execute(
-        """
-        INSERT INTO _face_sync_asset_map
-            (source_asset_id, target_asset_id, source_user_id, target_user_id, synced_at)
-        VALUES ($1, $2, $3, $4, NOW() - INTERVAL '1 day')
-        """,
-        src_asset, tgt_asset, src, tgt,
+    await make_synced_pair(
+        conn, src, tgt,
+        source_asset_id=src_asset, target_asset_id=tgt_asset,
+        synced_at="NOW() - INTERVAL '1 day'",
     )
     await make_face(conn, src_asset, bbox=(2, 2, 8, 8))
 
@@ -188,13 +183,10 @@ async def test_one_failing_pair_does_not_poison_the_incremental_phase(conn):
     good_src = await make_asset(conn, src)
     good_tgt = await make_asset(conn, tgt)
     for s, t in ((doomed_src, doomed_tgt), (good_src, good_tgt)):
-        await conn.execute(
-            """
-            INSERT INTO _face_sync_asset_map
-                (source_asset_id, target_asset_id, source_user_id, target_user_id, synced_at)
-            VALUES ($1, $2, $3, $4, NOW() - INTERVAL '1 day')
-            """,
-            s, t, src, tgt,
+        await make_synced_pair(
+            conn, src, tgt,
+            source_asset_id=s, target_asset_id=t,
+            synced_at="NOW() - INTERVAL '1 day'",
         )
     await make_face(conn, doomed_src, bbox=(1, 1, 9, 9))
     await make_face(conn, good_src, bbox=(2, 2, 8, 8))

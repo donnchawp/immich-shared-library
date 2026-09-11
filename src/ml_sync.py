@@ -166,14 +166,14 @@ async def sync_faces_incremental(conn: asyncpg.Connection) -> int:
     """
     # Find synced asset pairs where the source has faces updated after synced_at.
     #
-    # The target-asset guard is load-bearing, not defensive padding. When the
-    # target user hard-deletes a synced asset the mapping row outlives it until
-    # Phase 4's cleanup_stale_mappings prunes it — and Phase 4 runs *after* this
-    # phase. Without the guard, inserting a face for a vanished asset raises
-    # ForeignKeyViolationError, which aborts the whole cycle before the cleanup
-    # that would have fixed it ever runs. The sidecar then fails identically on
-    # every subsequent cycle, permanently. Skipping the pair here lets Phase 4
-    # prune it in this same cycle and Phase 1 re-sync the source in the next.
+    # The target-asset guard is belt and braces. Phase 0 prunes mappings whose
+    # target asset is gone before any phase reads the map, so this should find
+    # nothing — but a target deleted mid-cycle would still land here, and
+    # inserting a face for a vanished asset raises ForeignKeyViolationError.
+    # That used to be fatal rather than merely annoying: the prune ran at the
+    # end of Phase 4, so the abort killed the cycle before the fix could run,
+    # every cycle, permanently. Keep the guard; it is now cheap insurance
+    # rather than the only thing holding the cycle together.
     pairs = await conn.fetch(
         """
         SELECT m.source_asset_id, m.target_asset_id, m.synced_at,

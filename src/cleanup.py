@@ -2,7 +2,7 @@ import logging
 
 import asyncpg
 
-from src.file_ops import remove_hardlinks
+from src.file_ops import owned_file_paths, remove_hardlinks
 
 logger = logging.getLogger(__name__)
 
@@ -37,21 +37,9 @@ async def cleanup_deleted_assets(conn: asyncpg.Connection) -> int:
         # cleanup unwinds because of one bad asset.
         await conn.execute("SAVEPOINT cleanup_asset")
         try:
-            # Get file paths before deleting records.
-            #
-            # Sidecar (XMP) rows are excluded deliberately, and this is a
-            # safety guard, not tidiness. A sidecar row points at the external
-            # library, where the target's directory is a symlink to the
-            # source's — so unlinking the target's XMP path destroys the SOURCE
-            # user's own file. The asset_file row still goes, via the CASCADE
-            # from asset; only the file on disk is left alone, because it was
-            # never ours to create or remove.
-            files = await conn.fetch(
-                'SELECT path FROM asset_file WHERE "assetId" = $1 AND type <> $2',
-                target_id,
-                "sidecar",
-            )
-            file_paths = [f["path"] for f in files]
+            # Paths we created and may delete — excludes the XMP sidecar,
+            # which is not ours. See file_ops.owned_file_paths.
+            file_paths = await owned_file_paths(conn, target_id)
 
             # Remove hardlinked files first — if this fails, DB records stay
             # and we can retry next cycle. If DB delete fails after file removal,

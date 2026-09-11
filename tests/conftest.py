@@ -91,3 +91,49 @@ async def make_face(conn, asset_id: UUID, *, person_group_id: UUID | None = None
         fid, asset_id, person_group_id, x1, y1, x2, y2,
     )
     return fid
+
+
+async def make_synced_pair(
+    conn,
+    source_user_id: UUID,
+    target_user_id: UUID,
+    *,
+    source_asset_id: UUID | None = None,
+    target_asset_id: UUID | None = None,
+    person_group_id: UUID | None = None,
+    synced_at: str = "NOW()",
+) -> tuple[UUID, UUID]:
+    """Record a synced source/target asset pair, as Phase 1 would.
+
+    This is what puts a user pair in scope for the cross-user sync and cleanup
+    queries: they all reach the pair through _face_sync_asset_map.
+
+    Pass ``person_group_id`` to also put a face in that group on the synced
+    target asset, which is what brings the *group* into scope for the person
+    metadata syncs. That second step is easy to forget, and forgetting it makes
+    a test pass against a no-op, so it lives here rather than at each call site.
+
+    ``synced_at`` takes a SQL expression so callers can backdate the watermark
+    (e.g. "NOW() - INTERVAL '1 day'") to make source faces look newer.
+
+    Pass ``source_asset_id`` / ``target_asset_id`` to map assets you made
+    yourself, when the test needs control over them — a specific originalPath,
+    or an id deliberately absent from ``asset`` to simulate a hard delete.
+
+    Returns (source_asset_id, target_asset_id).
+    """
+    if source_asset_id is None:
+        source_asset_id = await make_asset(conn, source_user_id)
+    if target_asset_id is None:
+        target_asset_id = await make_asset(conn, target_user_id)
+    await conn.execute(
+        f"""
+        INSERT INTO _face_sync_asset_map
+            (source_asset_id, target_asset_id, source_user_id, target_user_id, synced_at)
+        VALUES ($1, $2, $3, $4, {synced_at})
+        """,
+        source_asset_id, target_asset_id, source_user_id, target_user_id,
+    )
+    if person_group_id is not None:
+        await make_face(conn, target_asset_id, person_group_id=person_group_id)
+    return source_asset_id, target_asset_id
