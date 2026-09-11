@@ -75,23 +75,23 @@ async def main():
         print(f"  {a['id']} — {a['originalFileName']} — {a['originalPath']}")
 
     target_faces = await fetch_all("""
-        SELECT af.id, af."assetId", af."personId", p.name as person_name
+        SELECT af.id, af."assetId", af."personGroupId", p.name as person_name
         FROM asset_face af
         JOIN asset a ON a.id = af."assetId"
-        LEFT JOIN person p ON p.id = af."personId"
+        LEFT JOIN person p ON p."personGroupId" = af."personGroupId" AND p."ownerId" = a."ownerId"
         WHERE a."ownerId" = $1 AND af."deletedAt" IS NULL
     """, target_user_id)
     print(f"\nTarget user's faces: {len(target_faces)}")
     for f in target_faces:
-        print(f"  face={f['id']} asset={f['assetId']} person={f['personId']} name={f['person_name']}")
+        print(f"  face={f['id']} asset={f['assetId']} person_group={f['personGroupId']} name={f['person_name']}")
 
     target_persons = await fetch_all(
-        "SELECT id, name FROM person WHERE \"ownerId\" = $1",
+        "SELECT \"personGroupId\", name FROM person WHERE \"ownerId\" = $1",
         target_user_id,
     )
     print(f"\nTarget user's persons: {len(target_persons)}")
     for p in target_persons:
-        print(f"  {p['id']} — name='{p['name']}'")
+        print(f"  group={p['personGroupId']} — name='{p['name']}'")
 
     smart_count = await fetch_one("""
         SELECT COUNT(*) as cnt FROM smart_search ss
@@ -105,10 +105,20 @@ async def main():
     for m in mappings:
         print(f"  {m['source_asset_id']} -> {m['target_asset_id']}")
 
-    person_mappings = await fetch_all("SELECT * FROM _face_sync_person_map")
-    print(f"\nPerson mappings: {len(person_mappings)}")
-    for m in person_mappings:
-        print(f"  {m['source_person_id']} -> {m['target_person_id']}")
+    # v3.2.0 cluster-group port: there is no longer a sidecar-owned person
+    # mapping table — person identity is shared directly via Immich's
+    # person_group table. Show that invariant instead: a person_group with
+    # person rows owned by more than one user is a group the sidecar has
+    # linked across the source/target pair.
+    shared_groups = await fetch_all("""
+        SELECT "personGroupId", COUNT(DISTINCT "ownerId") AS owners
+        FROM person
+        GROUP BY "personGroupId"
+        HAVING COUNT(DISTINCT "ownerId") > 1
+    """)
+    print(f"\nShared person groups (identity linked across users): {len(shared_groups)}")
+    for g in shared_groups:
+        print(f"  group={g['personGroupId']} shared by {g['owners']} users")
 
     await close_pool()
     print("\n=== Done ===")
