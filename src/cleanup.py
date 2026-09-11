@@ -105,6 +105,19 @@ async def cleanup_reassigned_faces(conn: asyncpg.Connection) -> int:
 
     The UPDATE is idempotent: once the target matches the source the WHERE
     clause stops selecting it, so repeated cycles converge.
+
+    The source is authoritative. If the target user reassigns a copied face
+    to a different person themselves, this reverts it on the next cycle,
+    because the bounding box still matches and the group ids now differ
+    again. That is intentional — the same principle as source-authoritative
+    name/visibility sync elsewhere in this sidecar — not a bug.
+
+    Known limitations, left unhandled because they are edge cases rather than
+    correctness defects:
+    - If the source asset has two faces with identical bounding boxes,
+      Postgres picks one arbitrarily for the join.
+    - If the target user edits a copied face's bounding box, the match fails
+      on every future cycle and that face is never reconciled again.
     """
     updated = await conn.fetch(
         """

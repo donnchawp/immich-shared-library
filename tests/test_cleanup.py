@@ -38,9 +38,17 @@ async def test_propagates_a_source_reassignment(conn):
     )
     assert now == new_pg
 
+    # Convergence: running the same cycle again after a real write must do
+    # nothing — regression guard for bug 851005b (non-convergent reassignment
+    # loop that kept re-flagging the same faces forever).
+    assert await cleanup_reassigned_faces(conn) == 0
+
 
 async def test_is_a_no_op_when_already_in_sync(conn):
-    """Must converge — this is what bug 851005b was about."""
+    """A no-op stays a no-op. Weaker than the convergence guard in
+    test_propagates_a_source_reassignment (which proves a real write does not
+    get re-flagged on the next cycle — the actual shape of bug 851005b); this
+    only covers the case where there was never anything to reconcile."""
     cg = await make_cluster_group(conn)
     src = await make_user(conn, cluster_group_id=cg)
     tgt = await make_user(conn, cluster_group_id=cg)
