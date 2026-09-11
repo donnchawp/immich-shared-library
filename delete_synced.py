@@ -93,7 +93,13 @@ async def delete_synced_asset(conn, target_asset_id) -> bool:
     Follows the same pattern as cleanup_deleted_assets:
     remove hardlinks -> delete album_asset -> delete asset (cascades) -> delete mapping.
     Does NOT insert into _face_sync_skipped.
+
+    Caller batches these inside one transaction(), so the failure path needs a
+    SAVEPOINT: without one, Postgres aborts the whole transaction on the first
+    error and every later statement raises InFailedSQLTransactionError. Same
+    pattern as sync_asset (src/asset_sync.py).
     """
+    await conn.execute("SAVEPOINT delete_synced_asset")
     try:
         # Get file paths before deleting records
         files = await conn.fetch(
@@ -120,8 +126,10 @@ async def delete_synced_asset(conn, target_asset_id) -> bool:
             target_asset_id,
         )
 
+        await conn.execute("RELEASE SAVEPOINT delete_synced_asset")
         return True
     except Exception:
+        await conn.execute("ROLLBACK TO SAVEPOINT delete_synced_asset")
         logging.getLogger(__name__).exception(
             "Failed to delete synced asset %s", target_asset_id
         )
@@ -139,13 +147,19 @@ async def delete_mirrored_person(conn, target_user_id, person_group_id) -> str:
 
     Returns "deleted", "skipped" (faces still assigned, or row already
     gone), or "failed".
+
+    SAVEPOINT for the same reason as delete_synced_asset: the caller runs a
+    whole batch inside one transaction(), and a bare except would leave the
+    transaction aborted for every later item.
     """
+    await conn.execute("SAVEPOINT delete_mirrored_person")
     try:
         person = await conn.fetchrow(
             'SELECT "thumbnailPath" FROM person WHERE "ownerId" = $1 AND "personGroupId" = $2',
             target_user_id, person_group_id,
         )
         if person is None:
+            await conn.execute("RELEASE SAVEPOINT delete_mirrored_person")
             return "skipped"
 
         has_faces = await conn.fetchval(
@@ -161,6 +175,7 @@ async def delete_mirrored_person(conn, target_user_id, person_group_id) -> str:
             person_group_id, target_user_id,
         )
         if has_faces:
+            await conn.execute("RELEASE SAVEPOINT delete_mirrored_person")
             return "skipped"
 
         if person["thumbnailPath"]:
@@ -172,8 +187,10 @@ async def delete_mirrored_person(conn, target_user_id, person_group_id) -> str:
             target_user_id, person_group_id,
         )
 
+        await conn.execute("RELEASE SAVEPOINT delete_mirrored_person")
         return "deleted"
     except Exception:
+        await conn.execute("ROLLBACK TO SAVEPOINT delete_mirrored_person")
         logging.getLogger(__name__).exception(
             "Failed to delete mirrored person %s for user %s", person_group_id, target_user_id
         )

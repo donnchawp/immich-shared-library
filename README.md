@@ -451,13 +451,11 @@ The utility scripts read configuration from `.env` (the same file used by `docke
 - **`dedup_synced.py`** — Detect and remove synced assets that duplicate the target user's own uploads (matched by filename + capture date). Use `--match-time` to compare the full timestamp (with TZ normalisation) instead of just the date. Marks duplicates as skipped so the sync engine won't recreate them.
 - **`reset.sh`** — Full reset: stops the sidecar container, deletes all synced assets and mirrored persons from Immich, drops the tracking tables, and removes symlinks from the external library directory. Run directly on the host (not via `run-utility.sh`). Shows a summary and prompts for confirmation before making changes.
 
-> **Known issue (v3.2.0 port):** `delete_synced.py` and `reset.sh` still query `_face_sync_person_map`, which no longer exists — `_migrate_v3` drops it, since person identity is now shared via `person_group` instead of mirrored. These two scripts need a follow-up fix; they were out of scope for the cluster-group documentation pass. `dedup_synced.py` and `test_sync.py` are unaffected.
-
 `delete_synced.py` and `dedup_synced.py` are interactive: they show a summary and prompt for confirmation before making changes, with a dry-run option.
 
 ### Automated Tests
 
-The project has 33 automated tests (pytest) run against a scratch `immich_test` database built from a real Immich schema dump (`tests/fixtures/schema_v3.2.0.sql`):
+The project has 39 automated tests (pytest) run against a scratch `immich_test` database built from a real Immich schema dump (`tests/fixtures/schema_v3.2.0.sql`):
 
 ```bash
 make testdb   # (re)create the scratch database from the fixture
