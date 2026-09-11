@@ -3,8 +3,6 @@ from uuid import UUID, uuid4
 
 import asyncpg
 
-from src.person_sync import get_or_create_target_person
-
 logger = logging.getLogger(__name__)
 
 

@@ -144,12 +144,15 @@ async def sync_person_names(conn: asyncpg.Connection) -> int:
         """
         UPDATE person t
         SET name = s.name
-        FROM person s, _face_sync_asset_map m
+        FROM person s
         WHERE s."personGroupId" = t."personGroupId"
-          AND s."ownerId" = m.source_user_id
-          AND t."ownerId" = m.target_user_id
           AND s.name <> ''
-          AND (t.name = '' OR t.name IS NULL)
+          AND t.name = ''
+          AND EXISTS (
+              SELECT 1 FROM _face_sync_asset_map m
+              WHERE m.source_user_id = s."ownerId"
+                AND m.target_user_id = t."ownerId"
+          )
         RETURNING t."ownerId", t."personGroupId", t.name
         """,
     )
@@ -169,11 +172,14 @@ async def sync_person_visibility(conn: asyncpg.Connection) -> int:
         """
         UPDATE person t
         SET "isHidden" = s."isHidden"
-        FROM person s, _face_sync_asset_map m
+        FROM person s
         WHERE s."personGroupId" = t."personGroupId"
-          AND s."ownerId" = m.source_user_id
-          AND t."ownerId" = m.target_user_id
           AND t."isHidden" IS DISTINCT FROM s."isHidden"
+          AND EXISTS (
+              SELECT 1 FROM _face_sync_asset_map m
+              WHERE m.source_user_id = s."ownerId"
+                AND m.target_user_id = t."ownerId"
+          )
         RETURNING t."personGroupId"
         """,
     )
@@ -188,11 +194,14 @@ async def sync_person_thumbnails(conn: asyncpg.Connection) -> int:
                t."personGroupId" AS person_group_id,
                s."thumbnailPath" AS source_thumb
         FROM person t
-        JOIN _face_sync_asset_map m ON m.target_user_id = t."ownerId"
         JOIN person s ON s."personGroupId" = t."personGroupId"
-            AND s."ownerId" = m.source_user_id
         WHERE s."thumbnailPath" <> ''
-          AND (t."thumbnailPath" = '' OR t."thumbnailPath" IS NULL)
+          AND t."thumbnailPath" = ''
+          AND EXISTS (
+              SELECT 1 FROM _face_sync_asset_map m
+              WHERE m.source_user_id = s."ownerId"
+                AND m.target_user_id = t."ownerId"
+          )
         """,
     )
 
@@ -239,12 +248,14 @@ async def cleanup_orphaned_persons(conn: asyncpg.Connection) -> int:
     deleted = await conn.fetch(
         """
         DELETE FROM person t
-        USING _face_sync_asset_map m
-        WHERE t."ownerId" = m.target_user_id
-          AND NOT EXISTS (
-              SELECT 1 FROM person s
-              WHERE s."personGroupId" = t."personGroupId"
-                AND s."ownerId" = m.source_user_id
+        WHERE EXISTS (
+              SELECT 1 FROM _face_sync_asset_map m
+              WHERE m.target_user_id = t."ownerId"
+                AND NOT EXISTS (
+                    SELECT 1 FROM person s
+                    WHERE s."personGroupId" = t."personGroupId"
+                      AND s."ownerId" = m.source_user_id
+                )
           )
           AND NOT EXISTS (
               SELECT 1 FROM asset_face af
