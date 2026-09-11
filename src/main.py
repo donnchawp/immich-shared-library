@@ -224,6 +224,20 @@ async def validate_user_and_library_ids() -> None:
                     f"{album['owner_id']}, not target_user_id {job.target_user_id}"
                 )
 
+    # Reciprocal pairs (A -> B and B -> A) are a supported setup (see README
+    # "Example scenario"), but both directions claim authority over the same
+    # shared person groups, so isHidden can flip back and forth once per cycle.
+    pairs = {(job.source_user_id, job.target_user_id) for job in settings.sync_jobs}
+    for source_id, target_id in sorted(pairs):
+        if (target_id, source_id) in pairs and str(source_id) < str(target_id):
+            logger.warning(
+                "Reciprocal sync configured between %s and %s: person visibility "
+                "(isHidden) is source-authoritative in both directions, so a "
+                "disagreement will oscillate between the two accounts, one flip "
+                "per cycle. Names and thumbnails are fill-only and unaffected.",
+                source_id, target_id,
+            )
+
     logger.info("Configuration validated: users, libraries, and albums exist and are correctly associated")
 
 

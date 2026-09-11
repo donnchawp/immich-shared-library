@@ -167,7 +167,21 @@ async def sync_person_names(conn: asyncpg.Connection) -> int:
 
 
 async def sync_person_visibility(conn: asyncpg.Connection) -> int:
-    """Copy source ``isHidden`` onto target persons in the same group."""
+    """Copy source ``isHidden`` onto target persons in the same group.
+
+    Unlike the name sync this overwrites, so its reach matters. Under cluster
+    groups Immich puts both users' faces into shared ``person_group`` rows by
+    construction, so "same group + mapped owner pair" is not a sidecar
+    footprint — it covers people the target discovered entirely on their own
+    photos. The second ``EXISTS`` narrows it to groups actually carried by a
+    synced asset.
+
+    Caveat for reciprocal job pairs (A -> B and B -> A, a supported setup):
+    both directions are source-authoritative over the same groups, so an
+    ``isHidden`` disagreement can oscillate between the two accounts, one
+    flip per cycle. ``main.validate_user_and_library_ids`` logs a startup
+    warning when such a pair is configured.
+    """
     updated = await conn.fetch(
         """
         UPDATE person t
@@ -180,6 +194,13 @@ async def sync_person_visibility(conn: asyncpg.Connection) -> int:
               WHERE m.source_user_id = s."ownerId"
                 AND m.target_user_id = t."ownerId"
           )
+          AND EXISTS (
+              SELECT 1 FROM _face_sync_asset_map m2
+              JOIN asset_face af ON af."assetId" = m2.target_asset_id
+              WHERE m2.target_user_id = t."ownerId"
+                AND af."personGroupId" = t."personGroupId"
+                AND af."deletedAt" IS NULL
+          )
         RETURNING t."personGroupId"
         """,
     )
@@ -187,7 +208,14 @@ async def sync_person_visibility(conn: asyncpg.Connection) -> int:
 
 
 async def sync_person_thumbnails(conn: asyncpg.Connection) -> int:
-    """Hardlink thumbnails for target persons that still have none."""
+    """Hardlink thumbnails for target persons that still have none.
+
+    Scoped like ``sync_person_visibility``: without the synced-asset ``EXISTS``
+    this would hardlink the source's face crop onto people the target
+    discovered on their own photos, purely because cluster groups put both
+    users in the same ``person_group``. Fill-only on ``thumbnailPath = ''``,
+    but it creates files on disk, so the reach is worth bounding.
+    """
     rows = await conn.fetch(
         """
         SELECT DISTINCT t."ownerId" AS target_user_id,
@@ -201,6 +229,13 @@ async def sync_person_thumbnails(conn: asyncpg.Connection) -> int:
               SELECT 1 FROM _face_sync_asset_map m
               WHERE m.source_user_id = s."ownerId"
                 AND m.target_user_id = t."ownerId"
+          )
+          AND EXISTS (
+              SELECT 1 FROM _face_sync_asset_map m2
+              JOIN asset_face af ON af."assetId" = m2.target_asset_id
+              WHERE m2.target_user_id = t."ownerId"
+                AND af."personGroupId" = t."personGroupId"
+                AND af."deletedAt" IS NULL
           )
         """,
     )
@@ -226,18 +261,25 @@ async def sync_person_thumbnails(conn: asyncpg.Connection) -> int:
 async def cleanup_orphaned_persons(conn: asyncpg.Connection) -> int:
     """Remove sidecar-created person rows that no longer have any faces.
 
-    Safety: only delete a person row with NO remaining faces in its group owned
-    by that user. Immich sets ``asset_face."personGroupId"`` to NULL when the
-    last person row in a group goes (``deleteEmptyGroups``), so deleting a row
-    whose faces survive would silently unassign them.
+    Safety: only delete a person row when its group has NO remaining faces at
+    all, owned by anyone. Immich sets ``asset_face."personGroupId"`` to NULL
+    when the last person row in a group goes (``deleteEmptyGroups``), and it
+    does so for *every* face in the group, not just the deleting user's. This
+    is the only statement in the sidecar that can empty a group, so it is the
+    only path that could write into the source user's own library — hence the
+    face guard is group-scoped, not owner-scoped. Anything narrower risks
+    silently unassigning the source user's faces on their own photos.
 
-    Scope: restricted to (source_user_id, target_user_id) pairs the sidecar
-    actually manages, via ``_face_sync_asset_map``, plus a ``NOT EXISTS``
-    guard that the source has no person row left for the group. Without both
-    of these the sweep would touch every account in the database, including
-    the source user's own persons and users the sidecar has no relationship
-    with at all — this table is the only durable record of "the sidecar
-    created assets/persons for this pair."
+    Scope: restricted to target users the sidecar actually manages, via
+    ``_face_sync_asset_map``, plus a ``NOT EXISTS`` guard that *no* mapped
+    source for that target still has a person row for the group. The negation
+    must wrap the whole map lookup: nested inside the ``EXISTS`` it would be
+    satisfied by any single mapped source lacking a row, which with two jobs
+    sharing a target makes every group deletion-eligible. Compare the
+    mirror-image shape in ``delete_synced.py`` / ``reset.sh``, which require a
+    source row to *exist*. Without this scoping the sweep would touch every
+    account in the database — this table is the only durable record of "the
+    sidecar created assets/persons for this pair."
 
     Note: a target person row can exist for one cycle before the map gains a
     row for that pair (e.g. if person-metadata sync ever ran ahead of the
@@ -251,20 +293,19 @@ async def cleanup_orphaned_persons(conn: asyncpg.Connection) -> int:
         WHERE EXISTS (
               SELECT 1 FROM _face_sync_asset_map m
               WHERE m.target_user_id = t."ownerId"
-                AND NOT EXISTS (
-                    SELECT 1 FROM person s
-                    WHERE s."personGroupId" = t."personGroupId"
-                      AND s."ownerId" = m.source_user_id
-                )
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM _face_sync_asset_map m
+              JOIN person s ON s."personGroupId" = t."personGroupId"
+                           AND s."ownerId" = m.source_user_id
+              WHERE m.target_user_id = t."ownerId"
           )
           AND NOT EXISTS (
               SELECT 1 FROM asset_face af
-              JOIN asset a ON a.id = af."assetId"
               WHERE af."personGroupId" = t."personGroupId"
-                AND a."ownerId" = t."ownerId"
                 AND af."deletedAt" IS NULL
           )
-        RETURNING t."personGroupId"
+        RETURNING t."ownerId", t."personGroupId"
         """,
     )
 
