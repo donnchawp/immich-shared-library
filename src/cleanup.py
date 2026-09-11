@@ -31,10 +31,19 @@ async def cleanup_deleted_assets(conn: asyncpg.Connection) -> int:
         source_id = row["source_asset_id"]
 
         try:
-            # Get file paths before deleting records
+            # Get file paths before deleting records.
+            #
+            # Sidecar (XMP) rows are excluded deliberately, and this is a
+            # safety guard, not tidiness. A sidecar row points at the external
+            # library, where the target's directory is a symlink to the
+            # source's — so unlinking the target's XMP path destroys the SOURCE
+            # user's own file. The asset_file row still goes, via the CASCADE
+            # from asset; only the file on disk is left alone, because it was
+            # never ours to create or remove.
             files = await conn.fetch(
-                'SELECT path FROM asset_file WHERE "assetId" = $1',
+                'SELECT path FROM asset_file WHERE "assetId" = $1 AND type <> $2',
                 target_id,
+                "sidecar",
             )
             file_paths = [f["path"] for f in files]
 

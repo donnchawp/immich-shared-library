@@ -45,6 +45,22 @@ def _remap_asset_path(source_path: str, job: SyncJob) -> str:
     return os.path.normpath(source_path)
 
 
+def _remap_sidecar_path(source_path: str, job: SyncJob) -> str | None:
+    """Remap a sidecar (XMP) file path, or None if the job's prefixes don't cover it.
+
+    Unlike _remap_asset_path, which falls back to returning the source path
+    unchanged, this returns None. A sidecar row is a pointer: writing the
+    source's own path into the target's asset_file would make the target
+    reference a file in the source user's tree, which cleanup could then try
+    to unlink. Better to have no sidecar row than a wrong one.
+    """
+    if not (job.source_path_prefix and job.target_path_prefix):
+        return None
+    if not source_path.startswith(job.source_path_prefix):
+        return None
+    return _remap_asset_path(source_path, job)
+
+
 async def get_unsynced_source_assets(
     conn: asyncpg.Connection, job: SyncJob, limit: int = 500
 ) -> list[asyncpg.Record]:
@@ -274,7 +290,9 @@ async def sync_asset(conn: asyncpg.Connection, source: asyncpg.Record, job: Sync
         await _copy_exif(conn, source_id, target_id)
 
         # 3. Hardlink thumbnails/previews and create asset_files records
-        created_files = await _sync_asset_files(conn, source_id, target_id, source["ownerId"], target_user_id)
+        created_files = await _sync_asset_files(
+            conn, source_id, target_id, source["ownerId"], target_user_id, job
+        )
 
         # 4. Set job status to mark as fully processed.
         # ocrAt comes from the source row: if the source hasn't been OCR'd
@@ -439,15 +457,48 @@ async def _sync_asset_files(
     target_id: UUID,
     source_user_id: UUID,
     target_user_id: UUID,
+    job: SyncJob,
 ) -> list[str]:
     """Hardlink source asset files and create records for target asset.
 
     Returns the list of created target file paths (for rollback cleanup).
+    Sidecar paths are deliberately excluded from that list — see below.
     """
     files = await conn.fetch(
         'SELECT id, "assetId", type, path, "isEdited", "isProgressive" FROM asset_file WHERE "assetId" = $1',
         source_id,
     )
+    if not files:
+        return []
+
+    # Sidecar (XMP) files are not hardlinked. They live beside the original in
+    # the external library rather than under the upload location, and the
+    # target's library directory is a symlink to the source's — so the file is
+    # already present at the remapped target path. Only the pointer row needs
+    # creating. Hardlinking would fail the upload-directory check and lose the
+    # row entirely, which is how target assets ended up with no XMP reference.
+    sidecars = [f for f in files if f["type"] == "sidecar"]
+    files = [f for f in files if f["type"] != "sidecar"]
+
+    for sc in sidecars:
+        target_sidecar = _remap_sidecar_path(sc["path"], job)
+        if target_sidecar is None:
+            logger.warning(
+                "Sidecar %s is outside job %s's path prefixes; target asset %s "
+                "will have no XMP reference",
+                sc["path"], job.name, target_id,
+            )
+            continue
+        await conn.execute(
+            """
+            INSERT INTO asset_file (id, "assetId", type, path, "isEdited", "isProgressive")
+            VALUES ($1, $2, $3, $4, $5, $6)
+            """,
+            uuid4(), target_id, sc["type"], target_sidecar,
+            sc["isEdited"], sc["isProgressive"],
+        )
+        logger.debug("Linked sidecar reference %s -> %s", sc["path"], target_sidecar)
+
     if not files:
         return []
 
