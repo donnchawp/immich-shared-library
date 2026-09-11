@@ -222,21 +222,30 @@ async def cleanup_orphaned_persons(conn: asyncpg.Connection) -> int:
     last person row in a group goes (``deleteEmptyGroups``), so deleting a row
     whose faces survive would silently unassign them.
 
-    Scope: restricted to users who belong to a cluster group. A person row can
-    only be created by ``ensure_target_person`` (or Immich itself) for a user
-    participating in cluster-group identity sharing, so this keeps the sweep
-    away from persons belonging to accounts the sidecar has no business
-    touching. Deliberately not scoped through ``_face_sync_asset_map``: an
-    empty target person row can exist before any asset has ever synced for
-    that pair (e.g. Phase 3 ran ahead of Phase 1 finding new assets), and the
-    map only gains a row once an asset does.
+    Scope: restricted to (source_user_id, target_user_id) pairs the sidecar
+    actually manages, via ``_face_sync_asset_map``, plus a ``NOT EXISTS``
+    guard that the source has no person row left for the group. Without both
+    of these the sweep would touch every account in the database, including
+    the source user's own persons and users the sidecar has no relationship
+    with at all — this table is the only durable record of "the sidecar
+    created assets/persons for this pair."
+
+    Note: a target person row can exist for one cycle before the map gains a
+    row for that pair (e.g. if person-metadata sync ever ran ahead of the
+    asset sync that produces the first mapped asset). That row is simply
+    skipped by this sweep until the map catches up — harmless and
+    self-correcting, unlike widening the DELETE's scope to compensate.
     """
     deleted = await conn.fetch(
         """
         DELETE FROM person t
-        USING "user" u
-        WHERE t."ownerId" = u.id
-          AND u."clusterGroupId" IS NOT NULL
+        USING _face_sync_asset_map m
+        WHERE t."ownerId" = m.target_user_id
+          AND NOT EXISTS (
+              SELECT 1 FROM person s
+              WHERE s."personGroupId" = t."personGroupId"
+                AND s."ownerId" = m.source_user_id
+          )
           AND NOT EXISTS (
               SELECT 1 FROM asset_face af
               JOIN asset a ON a.id = af."assetId"
