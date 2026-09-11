@@ -96,72 +96,34 @@ async def cleanup_stale_mappings(conn: asyncpg.Connection) -> int:
 
 
 async def cleanup_reassigned_faces(conn: asyncpg.Connection) -> int:
-    """Handle person merges: when source faces are reassigned to different persons.
+    """Propagate source-side face reassignment to the target copy.
 
-    Detects when a source face's personId no longer matches the expected mapping
-    and updates the target face accordingly.
-    Returns the number of faces updated.
+    Under cluster groups the person group id is shared, so this is a straight
+    copy — no mapping table, no canonical resolution, no mirror-of-mirror loop.
+    Matching is by exact bounding box, which is how the face was copied in the
+    first place.
+
+    The UPDATE is idempotent: once the target matches the source the WHERE
+    clause stops selecting it, so repeated cycles converge.
     """
-    # Find target faces where the source face's person has changed.
-    # User IDs are derived from the tracking table instead of global settings.
-    #
-    # The expected target person is computed the same way get_or_create_target_person
-    # resolves it, so mirror faces don't get flagged as mismatched every cycle:
-    #   - `origin` catches the loop-guard case: the source face's person is itself
-    #     a sidecar mirror whose canonical origin lives in the target account, so
-    #     the face maps straight to that real person.
-    #   - `pm` is the normal mirror mapping keyed on the source person.
-    mismatched = await conn.fetch(
+    updated = await conn.fetch(
         """
-        SELECT
-            tf.id AS target_face_id,
-            sf."personId" AS new_source_person_id,
-            tf."personId" AS current_target_person_id,
-            m.source_user_id,
-            m.target_user_id
+        UPDATE asset_face tf
+        SET "personGroupId" = sf."personGroupId"
         FROM _face_sync_asset_map m
         JOIN asset_face sf ON sf."assetId" = m.source_asset_id AND sf."deletedAt" IS NULL
-        JOIN asset_face tf ON tf."assetId" = m.target_asset_id AND tf."deletedAt" IS NULL
-            AND tf."boundingBoxX1" = sf."boundingBoxX1"
-            AND tf."boundingBoxY1" = sf."boundingBoxY1"
-            AND tf."boundingBoxX2" = sf."boundingBoxX2"
-            AND tf."boundingBoxY2" = sf."boundingBoxY2"
-        LEFT JOIN _face_sync_person_map pm ON pm.source_person_id = sf."personId"
-            AND pm.target_user_id = m.target_user_id
-        LEFT JOIN _face_sync_person_map mir ON mir.target_person_id = sf."personId"
-        LEFT JOIN person origin ON origin.id = mir.source_person_id
-            AND origin."ownerId" = m.target_user_id
-        WHERE tf."personId" IS DISTINCT FROM COALESCE(origin.id, pm.target_person_id)
+        WHERE tf."assetId" = m.target_asset_id
+          AND tf."deletedAt" IS NULL
+          AND tf."boundingBoxX1" = sf."boundingBoxX1"
+          AND tf."boundingBoxY1" = sf."boundingBoxY1"
+          AND tf."boundingBoxX2" = sf."boundingBoxX2"
+          AND tf."boundingBoxY2" = sf."boundingBoxY2"
+          AND tf."personGroupId" IS DISTINCT FROM sf."personGroupId"
+        RETURNING tf.id, tf."personGroupId"
         """,
     )
 
-    count = 0
-    for row in mismatched:
-        new_target_person_id = None
-        if row["new_source_person_id"] is not None:
-            new_target_person_id = await get_or_create_target_person(
-                conn, row["new_source_person_id"],
-                row["source_user_id"], row["target_user_id"],
-            )
+    if updated:
+        logger.info("Reassigned %d target faces to match source", len(updated))
 
-        # Idempotency guard. get_or_create_target_person is the authoritative
-        # resolver: it walks the full mirror chain to the canonical person. The
-        # SELECT above only approximates that with a single hop (mir/origin), so
-        # for chained/bidirectional mirrors it flags faces that already hold the
-        # correct canonical person. Rewriting the same value every cycle is the
-        # "Updated N faces due to person reassignment" loop — only write when the
-        # resolved person genuinely differs from the current one.
-        if new_target_person_id == row["current_target_person_id"]:
-            continue
-
-        await conn.execute(
-            'UPDATE asset_face SET "personId" = $1 WHERE id = $2',
-            new_target_person_id,
-            row["target_face_id"],
-        )
-        count += 1
-
-    if count > 0:
-        logger.info("Updated %d faces due to person reassignment", count)
-
-    return count
+    return len(updated)
