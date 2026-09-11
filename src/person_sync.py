@@ -181,45 +181,6 @@ async def sync_person_names(conn: asyncpg.Connection) -> int:
     return len(updated)
 
 
-async def sync_person_visibility(conn: asyncpg.Connection) -> int:
-    """Copy source ``isHidden`` onto target persons in the same group.
-
-    Unlike the name sync this overwrites, so its reach matters. Under cluster
-    groups Immich puts both users' faces into shared ``person_group`` rows by
-    construction, so "same group + mapped owner pair" is not a sidecar
-    footprint — it covers people the target discovered entirely on their own
-    photos. The second ``EXISTS`` narrows it to groups actually carried by a
-    synced asset.
-
-    Caveat for reciprocal job pairs (A -> B and B -> A, a supported setup):
-    both directions are source-authoritative over the same groups, so an
-    ``isHidden`` disagreement can oscillate between the two accounts, one
-    flip per cycle. ``main.validate_user_and_library_ids`` logs a startup
-    warning when such a pair is configured.
-    """
-    updated = await conn.fetch(
-        """
-        UPDATE person t
-        SET "isHidden" = s."isHidden"
-        FROM person s
-        WHERE s."personGroupId" = t."personGroupId"
-          AND t."isHidden" IS DISTINCT FROM s."isHidden"
-          AND EXISTS (
-              SELECT 1 FROM _face_sync_asset_map m
-              WHERE m.source_user_id = s."ownerId"
-                AND m.target_user_id = t."ownerId"
-          )
-          AND EXISTS (
-              SELECT 1 FROM _face_sync_asset_map m2
-              JOIN asset_face af ON af."assetId" = m2.target_asset_id
-              WHERE m2.target_user_id = t."ownerId"
-                AND af."personGroupId" = t."personGroupId"
-                AND af."deletedAt" IS NULL
-          )
-        RETURNING t."personGroupId"
-        """,
-    )
-    return len(updated)
 
 
 async def sync_person_thumbnails(conn: asyncpg.Connection) -> int:

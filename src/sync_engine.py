@@ -7,7 +7,7 @@ from src.cleanup import cleanup_deleted_assets, cleanup_reassigned_faces, cleanu
 from src.config import settings
 from src.db import transaction
 from src.ml_sync import sync_faces_for_asset, sync_faces_incremental
-from src.person_sync import cleanup_orphaned_persons, sync_person_names, sync_person_thumbnails, sync_person_visibility
+from src.person_sync import cleanup_orphaned_persons, sync_person_names, sync_person_thumbnails
 from src.schema import validate_cluster_group, validate_schema
 
 logger = logging.getLogger(__name__)
@@ -95,10 +95,11 @@ async def run_full_sync() -> dict:
     async with transaction() as conn:
         stats["faces_synced"] += await sync_faces_incremental(conn)
 
-    # Phase 3: Sync person metadata changes (names, visibility, thumbnails)
+    # Phase 3: Sync person metadata changes (names and thumbnails).
+    # Visibility (isHidden) is deliberately absent: it is per-user, and a
+    # boolean has no "unset" sentinel, so there is no fill-only option.
     async with transaction() as conn:
         stats["persons_updated"] += await sync_person_names(conn)
-        stats["persons_updated"] += await sync_person_visibility(conn)
         stats["persons_updated"] += await sync_person_thumbnails(conn)
 
     # Phase 4: Handle deletions and person merges

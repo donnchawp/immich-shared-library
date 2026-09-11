@@ -56,9 +56,10 @@ flowchart TD
     %% ── Phase 3: Person Metadata ──
     P3_START["Phase 3 · Person Metadata Sync"]
     P3_START --> P3a[Sync person names<br/><i>fills empty names only,<br/>never overwrites</i>]
-    P3a --> P3b[Sync isHidden visibility<br/><i>overwrites unconditionally</i>]
-    P3b --> P3c[Hardlink missing person thumbnails]
-    P3c --> P4_START
+    P3a --> P3b[Hardlink missing person thumbnails<br/><i>fill-only</i>]
+    P3b --> P4_START
+    P3_NOTE["isHidden is NOT synced<br/><i>per-user; inherited once at person creation</i>"]
+    P3_START -.-> P3_NOTE
 
     %% ── Phase 4: Cleanup ──
     P4_START["Phase 4 · Cleanup"]

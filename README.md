@@ -400,7 +400,7 @@ Each sync cycle runs five phases:
 1. **New assets** — For each configured sync job (external library, uploads), finds fully-processed source assets not yet synced. Creates target asset records with copied EXIF, CLIP embeddings, faces, and hardlinked thumbnails.
 1b. **Album assignment** — Adds newly synced assets to the target album (if configured). Backfills any previously synced assets that are missing from the album.
 2. **Incremental faces** — Detects face updates on already-synced assets (using a watermark timestamp) and copies new faces.
-3. **Person metadata** — Fills in empty target person names from source, syncs visibility (`isHidden`) unconditionally, and hardlinks missing thumbnails.
+3. **Person metadata** — Fills in empty target person names from source and hardlinks missing thumbnails. Visibility is not synced; see below.
 4. **Cleanup** — Removes target assets (and their album entries) whose source was deleted or trashed. Reassigns target faces back to the source's `personGroupId` if they've drifted. Removes orphaned target persons.
 
 ## How Faces Are Handled
@@ -409,8 +409,8 @@ Under cluster groups, person identity (`personGroupId`) is shared between source
 
 After that, per-cycle sync is asymmetric by design:
 - **Names**: only fills an *empty* target name. If the target user has named the person themselves, the sidecar never overwrites it — names are per-user in v3.2.0.
-- **Visibility** (`isHidden`): copied from source unconditionally, every cycle.
-- **Face reassignment**: the source is authoritative. If the target user reassigns a synced face to a different person, the sidecar reverts it on the next cycle (matching by bounding box) — the same principle as source-authoritative name/visibility sync, not a bug.
+- **Visibility** (`isHidden`): inherited once when the target's `person` row is created, then owned by the target user. Nothing in a cycle overwrites it, so each user can show or hide the same person independently. Unlike `name`, a boolean has no "unset" value to test, so there is no fill-only middle ground — it is either synced or not, and it is not.
+- **Face reassignment**: the source is authoritative. If the target user reassigns a synced face to a different person, the sidecar reverts it on the next cycle (matching by bounding box). This is the one place the source still wins over a target-side edit.
 
 Because identity is shared rather than mirrored, there's no merge step and no duplicate-person cleanup to perform — a face either belongs to the same `person_group` on both accounts, or it doesn't.
 
@@ -504,7 +504,7 @@ src/
   sync_engine.py   — Orchestrates 5-phase sync cycle
   asset_sync.py    — Asset record creation, EXIF copy, path remapping
   ml_sync.py       — Face and embedding sync (copies `personGroupId` verbatim)
-  person_sync.py   — Target person creation, name/visibility/thumbnail sync, orphan cleanup
+  person_sync.py   — Target person creation, name/thumbnail sync, orphan cleanup
   album_sync.py    — Album assignment and backfill
   cleanup.py       — Deletion detection, face reassignment, and cleanup
   file_ops.py      — Hardlink creation and removal

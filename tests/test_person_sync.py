@@ -5,7 +5,7 @@ from src.person_sync import (
     cleanup_orphaned_persons,
     ensure_target_person,
     sync_person_names,
-    sync_person_visibility,
+    sync_person_thumbnails,
 )
 
 
@@ -118,7 +118,41 @@ async def test_does_not_overwrite_a_name_the_target_already_set(conn):
     assert name == "Nana"
 
 
-async def test_sync_person_visibility_copies_from_source(conn):
+async def test_is_hidden_is_inherited_when_the_person_row_is_created(conn):
+    """A hidden source person starts hidden for the target too."""
+    cg = await make_cluster_group(conn)
+    src = await make_user(conn, cluster_group_id=cg)
+    tgt = await make_user(conn, cluster_group_id=cg)
+    pg = await make_person_group(conn, cg)
+    await conn.execute(
+        'INSERT INTO person ("ownerId", "personGroupId", name, "isHidden") VALUES ($1, $2, $3, TRUE)',
+        src, pg, "Granny",
+    )
+
+    await ensure_target_person(conn, pg, src, tgt)
+
+    is_hidden = await conn.fetchval(
+        'SELECT "isHidden" FROM person WHERE "ownerId" = $1 AND "personGroupId" = $2', tgt, pg
+    )
+    assert is_hidden is True
+
+
+async def test_no_cycle_function_overwrites_the_target_visibility(conn):
+    """Visibility is per-user. Nothing a sync cycle runs may overwrite it.
+
+    isHidden is a plain boolean with no "unset" sentinel, so there is no
+    fill-only middle ground the way there is for name. Either the sidecar owns
+    it or the user does, and the user does.
+
+    This calls every public ``async def f(conn)`` in person_sync rather than a
+    fixed list, so a newly added sync function is covered automatically — which
+    is the actual regression risk, since removing this behaviour was a
+    deliberate decision someone could just as deliberately undo.
+    """
+    import inspect
+
+    import src.person_sync as person_sync
+
     cg = await make_cluster_group(conn)
     src = await make_user(conn, cluster_group_id=cg)
     tgt = await make_user(conn, cluster_group_id=cg)
@@ -129,18 +163,24 @@ async def test_sync_person_visibility_copies_from_source(conn):
     )
     await conn.execute(
         'INSERT INTO person ("ownerId", "personGroupId", name, "isHidden") VALUES ($1, $2, $3, FALSE)',
-        tgt, pg, "Nana",
+        tgt, pg, "",
     )
     await _map_synced_pair(conn, src, tgt, person_group_id=pg)
 
-    updated = await sync_person_visibility(conn)
+    called = []
+    for name, fn in inspect.getmembers(person_sync, inspect.iscoroutinefunction):
+        if name.startswith("_"):
+            continue
+        if list(inspect.signature(fn).parameters) != ["conn"]:
+            continue
+        await fn(conn)
+        called.append(name)
 
-    assert updated == 1
+    assert "sync_person_names" in called, called  # the discovery actually found things
     is_hidden = await conn.fetchval(
         'SELECT "isHidden" FROM person WHERE "ownerId" = $1 AND "personGroupId" = $2', tgt, pg
     )
-    assert is_hidden is True
-
+    assert is_hidden is False, f"visibility overwritten by one of: {called}"
 
 async def test_returns_none_when_source_has_no_person_row(conn):
     cg = await make_cluster_group(conn)
@@ -281,66 +321,6 @@ async def test_sync_person_names_ignores_unmapped_user_pairs(conn):
     assert name == ""
 
 
-async def test_sync_person_visibility_ignores_unmapped_user_pairs(conn):
-    await _decoy_map_row(conn)
-
-    cg = await make_cluster_group(conn)
-    stranger_a = await make_user(conn, cluster_group_id=cg)
-    stranger_b = await make_user(conn, cluster_group_id=cg)
-    pg = await make_person_group(conn, cg)
-    await conn.execute(
-        'INSERT INTO person ("ownerId", "personGroupId", name, "isHidden") '
-        'VALUES ($1, $2, $3, TRUE)', stranger_a, pg, "Granny",
-    )
-    await conn.execute(
-        'INSERT INTO person ("ownerId", "personGroupId", name, "isHidden") '
-        'VALUES ($1, $2, $3, FALSE)', stranger_b, pg, "Granny",
-    )
-
-    assert await sync_person_visibility(conn) == 0
-    hidden = await conn.fetchval(
-        'SELECT "isHidden" FROM person WHERE "ownerId" = $1 AND "personGroupId" = $2',
-        stranger_b, pg,
-    )
-    assert hidden is False
-
-
-async def test_sync_person_visibility_skips_groups_no_synced_asset_carries(conn):
-    """Cluster groups put both users' faces in the same person_group by
-    construction, so a mapped owner pair is not by itself a sidecar footprint.
-    Someone the target discovered entirely on their own photos must keep their
-    own isHidden, even though the source is hiding the same person."""
-    cg = await make_cluster_group(conn)
-    src = await make_user(conn, cluster_group_id=cg)
-    tgt = await make_user(conn, cluster_group_id=cg)
-    synced_pg = await make_person_group(conn, cg)
-    own_pg = await make_person_group(conn, cg)
-
-    for pg in (synced_pg, own_pg):
-        await conn.execute(
-            'INSERT INTO person ("ownerId", "personGroupId", name, "isHidden") '
-            'VALUES ($1, $2, $3, TRUE)', src, pg, "Granny",
-        )
-        await conn.execute(
-            'INSERT INTO person ("ownerId", "personGroupId", name, "isHidden") '
-            'VALUES ($1, $2, $3, FALSE)', tgt, pg, "Granny",
-        )
-
-    # Only synced_pg appears on a synced asset. own_pg lives on a photo of the
-    # target's own, which the sidecar never touched.
-    await _map_synced_pair(conn, src, tgt, person_group_id=synced_pg)
-    own_asset = await make_asset(conn, tgt)
-    await make_face(conn, own_asset, person_group_id=own_pg)
-
-    assert await sync_person_visibility(conn) == 1
-    assert await conn.fetchval(
-        'SELECT "isHidden" FROM person WHERE "ownerId" = $1 AND "personGroupId" = $2',
-        tgt, synced_pg,
-    ) is True
-    assert await conn.fetchval(
-        'SELECT "isHidden" FROM person WHERE "ownerId" = $1 AND "personGroupId" = $2',
-        tgt, own_pg,
-    ) is False
 
 
 async def test_sync_person_names_skips_groups_no_synced_asset_carries(conn):

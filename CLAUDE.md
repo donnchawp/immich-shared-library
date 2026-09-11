@@ -61,7 +61,7 @@ The repo has 33 automated tests (pytest) run against a scratch `immich_test` dat
 
 2. **Incremental face sync** (`ml_sync.py`): Watermark-based — only checks assets where `asset_face.updatedAt > _face_sync_asset_map.synced_at`.
 
-3. **Person metadata sync** (`person_sync.py`): `sync_person_names` only fills an *empty* target name — it never overwrites a name the target user set (names are per-user by design in v3.2.0). `sync_person_visibility` copies `isHidden` unconditionally — that asymmetry with names is intentional. `sync_person_thumbnails` hardlinks thumbnails that are still empty.
+3. **Person metadata sync** (`person_sync.py`): `sync_person_names` only fills an *empty* target name — it never overwrites a name the target user set (names are per-user by design in v3.2.0). `sync_person_thumbnails` hardlinks thumbnails that are still empty. **Visibility is deliberately not synced**: `isHidden` is a plain boolean with no "unset" sentinel, so there is no fill-only option, and each user owns their own. The target inherits the source's `isHidden` once, at person creation. `tests/test_person_sync.py::test_no_cycle_function_overwrites_the_target_visibility` discovers and runs every public `async def f(conn)` in `person_sync` to guard this.
 
 4. **Cleanup** (`cleanup.py`, `person_sync.py`): Prunes mappings whose target asset was hard-deleted in Immich (so the source re-syncs next cycle; trashed targets keep their mapping), removes target assets whose source was deleted/trashed, reassigns target faces back to the source's `personGroupId` when they've drifted (`cleanup_reassigned_faces` — the source is authoritative, so a target-side reassignment is reverted next cycle), removes orphaned target persons.
 
@@ -70,7 +70,7 @@ The repo has 33 automated tests (pytest) run against a scratch `immich_test` dat
 - `sync_engine.py` — Orchestrates the 5 phases, returns stats dict
 - `asset_sync.py` — Asset record creation with savepoint rollback, idempotency check, path remapping
 - `ml_sync.py` — Face record copying with bounding-box dedup, face_search embedding copy, `personGroupId` copied verbatim
-- `person_sync.py` — Target person row creation (`ensure_target_person`), thumbnail hardlinking, name/visibility sync, orphan cleanup (~250 lines; shrank from 422 when person mirroring was removed)
+- `person_sync.py` — Target person row creation (`ensure_target_person`), thumbnail hardlinking, name sync, orphan cleanup (~300 lines; shrank from 422 when person mirroring was removed)
 - `cleanup.py` — Deletion detection (LEFT JOIN on source), hardlink removal before DB deletion, source-authoritative face reassignment
 - `file_ops.py` — Hardlink creation/removal, path remapping by exact UUID component matching
 - `db.py` — asyncpg pool (min=2, max=10), `transaction()` context manager, query helpers
