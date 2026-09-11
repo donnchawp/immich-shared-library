@@ -33,7 +33,7 @@ Verified against the live DB:
 
 The migration ran `UPDATE person SET "personGroupId" = "id"`, so old `person.id` values became `person_group.id` values. Nothing in the tracking tables is orphaned — source and target persons are simply still separate groups in separate cluster groups, which the FR reset in Task 8 will merge.
 
-**Pin your Immich version.** `IMMICH_VERSION=v3` floats and will keep silently migrating your schema out from under the sidecar. Set `IMMICH_VERSION=v3.2.0` in `../immich-app/.env`.
+**`IMMICH_VERSION=v3` floats, deliberately.** This is a dev instance, so the floating tag is the early-warning system for breaking Immich changes — `validate_schema` and `validate_cluster_group` fail closed at startup rather than letting the sidecar write against a schema it no longer understands. The cost is that `tests/fixtures/schema_v3.2.0.sql` is a snapshot: once Immich floats forward, the suite keeps passing against a stale schema while the live database has moved. Re-run `make schema-dump && make testdb` after any Immich upgrade.
 
 ## Global Constraints
 
