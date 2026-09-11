@@ -5,11 +5,11 @@ import sys
 import asyncpg
 
 from src.config import settings
-from src.db import close_pool, execute, fetch_one, init_pool, reset_pool
+from src.db import acquire, close_pool, execute, fetch_one, init_pool, reset_pool
 from src.health import start_health_server, stop_health_server
 from src.immich_api import ImmichAPI
-from src.schema import validate_schema
-from src.sync_engine import run_full_sync
+from src.schema import validate_cluster_group, validate_schema
+from src.sync_engine import _configured_user_ids, run_full_sync
 
 logger = logging.getLogger(__name__)
 
@@ -292,6 +292,8 @@ async def main() -> None:
     await init_pool()
     await ensure_tracking_tables()
     await validate_schema()
+    async with acquire() as conn:
+        await validate_cluster_group(conn, _configured_user_ids())
     await validate_user_and_library_ids()
 
     await start_health_server()

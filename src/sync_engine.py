@@ -8,9 +8,19 @@ from src.config import settings
 from src.db import transaction
 from src.ml_sync import sync_faces_for_asset, sync_faces_incremental
 from src.person_sync import cleanup_orphaned_persons, sync_person_names, sync_person_thumbnails, sync_person_visibility
-from src.schema import validate_schema
+from src.schema import validate_cluster_group, validate_schema
 
 logger = logging.getLogger(__name__)
+
+
+def _configured_user_ids() -> list[UUID]:
+    """Every distinct user the sidecar touches, across all jobs."""
+    ids: list[UUID] = []
+    for job in settings.sync_jobs:
+        for uid in (job.source_user_id, job.target_user_id):
+            if uid not in ids:
+                ids.append(uid)
+    return ids
 
 
 async def run_full_sync() -> dict:
@@ -42,6 +52,7 @@ async def run_full_sync() -> dict:
                 source_assets = await get_unsynced_source_assets(conn, job)
                 if source_assets and not schema_validated:
                     await validate_schema(conn)
+                    await validate_cluster_group(conn, _configured_user_ids())
                     schema_validated = True
 
                 # Duplicate detection: skip source assets already in target by filename + capture time

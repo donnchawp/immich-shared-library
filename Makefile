@@ -21,7 +21,7 @@ testdb-clean:  ## Drop the scratch test database
 test:  ## Run the tests in a container on the Immich network (PYTEST_ARGS=tests/x.py to narrow)
 	docker run --rm --network $(NETWORK) -v $(PWD):/app -w /app \
 	  -e TEST_DB_URL=$(TEST_DB_URL) python:3.12-slim \
-	  bash -c 'pip install -q asyncpg pytest pytest-asyncio && python -m pytest -v $(PYTEST_ARGS)'
+	  bash -c 'pip install -q asyncpg pytest pytest-asyncio pydantic pydantic-settings httpx pyyaml && python -m pytest -v $(PYTEST_ARGS)'
 
 lint:  ## Syntax-check all source files
 	python3 -m py_compile src/*.py

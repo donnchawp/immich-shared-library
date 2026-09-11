@@ -6,6 +6,7 @@ breaking schema changes from Immich upgrades.
 """
 
 import logging
+from uuid import UUID
 
 import asyncpg
 
@@ -67,8 +68,14 @@ REQUIRED_SCHEMA: dict[str, set[str]] = {
         "faceId", "embedding",
     },
     "person": {
-        "id", "ownerId", "name", "thumbnailPath", "isHidden", "birthDate",
-        "faceAssetId", "isFavorite", "color",
+        "ownerId", "personGroupId", "name", "thumbnailPath", "isHidden",
+        "birthDate", "faceAssetId", "isFavorite", "color",
+    },
+    "person_group": {
+        "id", "clusterGroupId",
+    },
+    "cluster_group": {
+        "id",
     },
     "album": {
         "id", "updatedAt", "deletedAt",
@@ -83,7 +90,7 @@ REQUIRED_SCHEMA: dict[str, set[str]] = {
         "id", "ownerId", "deletedAt",
     },
     "user": {
-        "id", "deletedAt",
+        "id", "deletedAt", "clusterGroupId",
     },
 }
 
@@ -154,8 +161,8 @@ INSERTED_COLUMNS: dict[str, set[str]] = {
         "faceId", "embedding",
     },
     "person": {
-        "id", "ownerId", "name", "thumbnailPath", "isHidden", "birthDate",
-        "faceAssetId", "isFavorite", "color",
+        "ownerId", "personGroupId", "name", "thumbnailPath", "isHidden",
+        "birthDate", "isFavorite", "color",
     },
     "album_asset": {
         "albumId", "assetId",
@@ -318,3 +325,37 @@ async def validate_schema(conn: asyncpg.Connection | None = None) -> None:
     else:
         async with acquire() as c:
             await _check(c)
+
+
+async def validate_cluster_group(conn: asyncpg.Connection, user_ids: list[UUID]) -> None:
+    """Assert every user shares one cluster group.
+
+    The sidecar copies ``asset_face."personGroupId"`` verbatim from source to
+    target. A ``person_group`` belongs to exactly one ``cluster_group``, and
+    Immich scopes face search and recognition by the acting user's
+    ``clusterGroupId``. If the users are in different cluster groups the copied
+    identity is invisible to the target and Immich's cleanup will eventually
+    null the faces, so refuse to start.
+    """
+    rows = await conn.fetch(
+        'SELECT id, "clusterGroupId" FROM "user" WHERE id = ANY($1)',
+        list(user_ids),
+    )
+    found = {row["id"]: row["clusterGroupId"] for row in rows}
+
+    missing = [str(uid) for uid in user_ids if uid not in found]
+    if missing:
+        raise SchemaValidationError(
+            f"Configured user(s) not found in Immich: {', '.join(missing)}"
+        )
+
+    groups = set(found.values())
+    if len(groups) > 1:
+        detail = ", ".join(f"{uid}={found[uid]}" for uid in user_ids)
+        raise SchemaValidationError(
+            "All configured users must share one cluster group so face identity "
+            f"can be copied between them. Found {len(groups)} groups: {detail}. "
+            "Fix this in Immich under Account Settings > Sharing > Cluster group. "
+            "Note that joining a group requires resetting facial recognition for "
+            "every member, which discards existing names and birth dates."
+        )
