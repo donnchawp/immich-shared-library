@@ -1,0 +1,21 @@
+# Normalise text to LF in the repository. Files are converted as they are
+# staged, so existing CRLF files stay as they are until someone edits them —
+# no repo-wide reformat, and no full-file diff on a file nobody touched.
+* text=auto eol=lf
+
+# Never touch these. A "fix" to a binary file's line endings corrupts it.
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.webp  binary
+*.gif   binary
+*.ico   binary
+*.pdf   binary
+
+# The schema fixture is a pg_dump. Keep it byte-identical to what pg_dump
+# writes so `make schema-dump` produces a clean diff or none at all.
+tests/fixtures/*.sql -text
+
+# Shell scripts must be LF regardless of platform: a CRLF shebang line makes
+# the kernel look for an interpreter with a trailing carriage return.
+*.sh    text eol=lf
