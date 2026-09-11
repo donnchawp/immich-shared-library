@@ -14,7 +14,7 @@ from src.sync_engine import _configured_user_ids, run_full_sync
 logger = logging.getLogger(__name__)
 
 
-SCHEMA_VERSION = 2  # Bump when tracking table schema changes
+SCHEMA_VERSION = 3  # Bump when tracking table schema changes
 
 
 async def ensure_tracking_tables() -> None:
@@ -38,22 +38,14 @@ async def ensure_tracking_tables() -> None:
             UNIQUE (source_asset_id, target_user_id)
         )
     """)
+    # Supports the EXISTS semi-joins in person_sync.py (Task 3), which
+    # correlate on both target_user_id and source_user_id. target_user_id
+    # first: the semi-joins filter on the target side. Without this, those
+    # queries are sequential scans that grow with the library (one row per
+    # synced asset).
     await execute("""
-        CREATE TABLE IF NOT EXISTS _face_sync_person_map (
-            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-            source_person_id UUID NOT NULL,
-            target_person_id UUID NOT NULL,
-            source_user_id UUID NOT NULL,
-            target_user_id UUID NOT NULL,
-            UNIQUE (source_person_id, target_user_id)
-        )
-    """)
-    # Index the reverse lookup: canonical-person resolution and the reassignment
-    # cleanup both query by target_person_id (which the UNIQUE above doesn't cover).
-    # Without it those run sequential scans on every sync cycle.
-    await execute("""
-        CREATE INDEX IF NOT EXISTS idx_face_sync_person_map_target
-            ON _face_sync_person_map (target_person_id)
+        CREATE INDEX IF NOT EXISTS _face_sync_asset_map_user_pair_idx
+            ON _face_sync_asset_map (target_user_id, source_user_id)
     """)
     await execute("""
         CREATE TABLE IF NOT EXISTS _face_sync_skipped (
@@ -81,6 +73,9 @@ async def _run_migrations() -> None:
 
     if current < 2:
         await _migrate_v2()
+
+    if current < 3:
+        await _migrate_v3()
 
     await execute(
         """
@@ -137,6 +132,27 @@ async def _migrate_v2() -> None:
             END IF;
         END $$
     """)
+
+
+async def _drop_person_map_table(conn: asyncpg.Connection) -> None:
+    """Drop the retired _face_sync_person_map table.
+
+    v3.2.0 cluster-group port: person identity is now shared via Immich's
+    person_group table, so the sidecar no longer maps source persons to
+    target persons (Tasks 3-5 removed every read/write of this table).
+    Idempotent (IF EXISTS), so safe to run on every migration pass.
+
+    Takes an explicit connection (rather than using the module-level
+    `execute()` pool helper) so the statement itself can be exercised
+    directly in tests against a transactional test connection.
+    """
+    await conn.execute("DROP TABLE IF EXISTS _face_sync_person_map")
+
+
+async def _migrate_v3() -> None:
+    """v3.2.0 cluster-group port: drop the retired person mapping table."""
+    async with acquire() as conn:
+        await _drop_person_map_table(conn)
 
 
 async def validate_user_and_library_ids() -> None:
