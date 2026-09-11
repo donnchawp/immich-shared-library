@@ -387,6 +387,18 @@ split; nothing else will.
    **Reset facial recognition** for that group and wait for the re-recognition job to finish. Joining
    alone is not enough: it preserves each member's separate person groups, so identity is still not
    shared.
+   
+   Watch for table bloat while it runs. Nulling every `personGroupId` leaves one dead tuple per face, and
+   each reassignment adds another. Autovacuum reclaims them only if nothing pins the vacuum horizon — a
+   stalled Immich sync stream (`state = active`, `wait_event = ClientRead`) will, and then every recognition
+   query walks the dead index entries instead of the live ones. On a ~950k-face library that was the
+   difference between 132 and 1,000 faces/minute. Check for it with:
+   ```bash
+   docker exec immich_postgres psql -U postgres -d immich -c "select pid, now()-xact_start as age,
+     wait_event from pg_stat_activity where datname='immich' and xact_start < now() - interval '5 minutes';"
+   ```
+   Then `pg_terminate_backend(<pid>)` — `pg_cancel_backend` does nothing to a backend parked in `ClientRead`,
+   since there is no running query to cancel — followed by `VACUUM (ANALYZE) asset_face;`.
 6. **Rebuild and start the sidecar** (`docker compose up -d --build`). It validates the schema and the
    cluster group on startup and drops the retired `_face_sync_person_map` table.
 7. **Re-apply the names** from your CSV.
@@ -470,6 +482,7 @@ Because identity is shared rather than mirrored, there's no merge step and no du
 - **Edits are copied once**: Crop/rotate/mirror history (`asset_edit`) is copied when the asset is first synced, so the target's `isEdited` flag and thumbnails agree. Edits made on the source *after* that aren't propagated, the same as EXIF and OCR data.
 - **Direct database access**: This service writes directly to Immich's database. Tested with v3.2.0 — schema changes in other versions may require updates to this sidecar. Always back up your database before use.
 - **Cluster group is enforced, not just recommended**: the sidecar checks `user.clusterGroupId` for every configured user on startup (and again at the start of each cycle, once there's new work) and refuses to run if they don't match.
+- **A facial-recognition reset re-does the sidecar's work, and skews clustering**: copied faces carry byte-identical embeddings — a copy sits at distance 0 from its source — so a cluster-group *Reset facial recognition* re-recognizes the original *and* every copy. On an instance where a quarter of the faces are synced copies, a quarter of that run is redundant. The bigger cost is quality: each real face now votes twice, so a person appearing in two synced photos reaches the default `minFaces` threshold of 3 and becomes a person who should not exist. Expect to prune spurious people afterwards. To avoid it, delete the copies' `asset_face` rows before the reset and let Phase 2 rebuild them — the incremental face sync re-inserts any face whose bounding box is missing on the target, and `face_search` rows cascade on delete.
 - **Single direction**: Sync is one-way (source → target). Changes made to target assets in Immich are not propagated back.
 
 ## Contributing
