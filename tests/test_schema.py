@@ -26,3 +26,13 @@ async def test_missing_user_raises(conn):
 
     with pytest.raises(SchemaValidationError, match="not found"):
         await validate_cluster_group(conn, [alice, uuid4()])
+
+
+async def test_soft_deleted_user_is_treated_as_missing(conn):
+    cg = await make_cluster_group(conn)
+    alice = await make_user(conn, cluster_group_id=cg)
+    ghost = await make_user(conn)  # different cluster group
+    await conn.execute('UPDATE "user" SET "deletedAt" = NOW() WHERE id = $1', ghost)
+
+    with pytest.raises(SchemaValidationError, match="not found"):
+        await validate_cluster_group(conn, [alice, ghost])

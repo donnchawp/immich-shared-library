@@ -338,7 +338,7 @@ async def validate_cluster_group(conn: asyncpg.Connection, user_ids: list[UUID])
     null the faces, so refuse to start.
     """
     rows = await conn.fetch(
-        'SELECT id, "clusterGroupId" FROM "user" WHERE id = ANY($1)',
+        'SELECT id, "clusterGroupId" FROM "user" WHERE id = ANY($1) AND "deletedAt" IS NULL',
         list(user_ids),
     )
     found = {row["id"]: row["clusterGroupId"] for row in rows}
