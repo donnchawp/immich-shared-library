@@ -12,6 +12,34 @@ from src.schema import validate_cluster_group, validate_schema
 
 logger = logging.getLogger(__name__)
 
+# Phase 1 reads unsynced source assets in batches of this size. A short batch
+# means the source is exhausted and the job is done.
+BATCH_SIZE = 500
+
+
+async def _cleanup_step(conn, savepoint: str, fn) -> int:
+    """Run one Phase 4 cleanup inside its own savepoint. Returns its count, or 0.
+
+    The steps share a transaction but must not share a fate.
+    cleanup_deleted_assets removes hardlinked thumbnails *before* deleting the
+    rows that name them, and the filesystem does not roll back — so a failure
+    in a later step would restore asset rows whose files are already gone and
+    leave Immich showing broken assets, indefinitely if the failure is
+    deterministic. This is the same reasoning _sync_faces_guarded applies to
+    Phase 1; it just hadn't been carried down here.
+
+    `savepoint` is a literal supplied by the caller below, never user input.
+    """
+    await conn.execute(f"SAVEPOINT {savepoint}")
+    try:
+        count = await fn(conn)
+    except Exception:
+        await conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+        logger.exception("Phase 4 step '%s' failed; the rest of the cycle stands", savepoint)
+        return 0
+    await conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+    return count
+
 
 def _configured_user_ids() -> list[UUID]:
     """Every distinct user the sidecar touches, across all jobs."""
@@ -106,6 +134,15 @@ async def run_full_sync() -> dict:
     for job in settings.sync_jobs:
         job_ids: list[UUID] = []
         while True:
+            # A batch that changes nothing durable returns the identical rows
+            # next time round: sync_asset's catch-all returns None without
+            # recording anything, so a full batch of persistently failing
+            # assets (a path that won't remap, a NOT NULL column that slipped
+            # past validation) would spin here forever, inside a process whose
+            # only other liveness signal is a health server that keeps
+            # answering. Only a duplicate record or a successful sync counts
+            # as progress, because only those shrink the next query's result.
+            progressed = False
             async with transaction() as conn:
                 source_assets = await get_unsynced_source_assets(conn, job)
                 if source_assets and not schema_validated:
@@ -118,6 +155,7 @@ async def run_full_sync() -> dict:
                 if duplicates:
                     await record_skipped_duplicates(conn, duplicates, job.target_user_id)
                     stats["assets_skipped_duplicate"] += len(duplicates)
+                    progressed = True
                     logger.warning(
                         "Job %s: skipping %d duplicate(s) by filename+date",
                         job.name, len(duplicates),
@@ -129,13 +167,22 @@ async def run_full_sync() -> dict:
                         continue
                     target_id = await sync_asset(conn, source, job)
                     if target_id is not None:
+                        progressed = True
                         stats["assets_synced"] += 1
                         job_ids.append(target_id)
                         stats["faces_synced"] += await _sync_faces_guarded(
                             conn, source["id"], target_id,
                             job.source_user_id, job.target_user_id,
                         )
-            if len(source_assets) < 500:
+            if len(source_assets) < BATCH_SIZE:
+                break
+            if not progressed:
+                logger.error(
+                    "Job %s: a full batch of %d assets synced nothing; stopping this "
+                    "cycle's asset sync. The next cycle retries, so a transient fault "
+                    "recovers on its own — a persistent one needs the logged exceptions.",
+                    job.name, len(source_assets),
+                )
                 break
         if job_ids:
             job_target_ids[job.name] = job_ids
@@ -160,12 +207,16 @@ async def run_full_sync() -> dict:
         stats["persons_updated"] += await sync_person_names(conn)
         stats["persons_updated"] += await sync_person_thumbnails(conn)
 
-    # Phase 4: Handle deletions and person merges. Stale mappings were pruned
-    # in Phase 0, before any phase read the map.
+    # Phase 4: Handle deletions and face/person drift. Stale mappings were
+    # pruned in Phase 0, before any phase read the map. Each step is
+    # savepointed — see _cleanup_step for why they must not share a fate.
     async with transaction() as conn:
-        stats["assets_cleaned"] = await cleanup_deleted_assets(conn)
-        stats["faces_reassigned"] = await cleanup_reassigned_faces(conn)
-        stats["persons_cleaned"] = await cleanup_orphaned_persons(conn)
+        stats["assets_cleaned"] = await _cleanup_step(
+            conn, "cleanup_assets", cleanup_deleted_assets)
+        stats["faces_reassigned"] = await _cleanup_step(
+            conn, "cleanup_faces", cleanup_reassigned_faces)
+        stats["persons_cleaned"] = await _cleanup_step(
+            conn, "cleanup_persons", cleanup_orphaned_persons)
 
     if any(v > 0 for v in stats.values()):
         logger.info("Sync complete: %s", stats)

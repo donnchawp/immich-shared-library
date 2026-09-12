@@ -14,6 +14,7 @@ from src.cleanup import cleanup_reassigned_faces
 from src.main import _drop_person_map_table
 from src.ml_sync import sync_faces_for_asset, sync_faces_incremental
 from src.person_sync import cleanup_orphaned_persons, sync_person_names
+from src import sync_engine
 from src.sync_engine import _sync_faces_guarded
 from tests.conftest import (
     make_asset, make_cluster_group, make_face, make_person, make_person_group,
@@ -362,3 +363,99 @@ async def test_v4_migration_is_idempotent(conn):
 
     assert first == (1, 1)
     assert second == (0, 0)
+
+
+async def test_phase_0_prunes_the_stale_mapping_before_phase_2_reads_it(conn, monkeypatch):
+    """Ordering, not just presence: the prune must precede every map reader.
+
+    Both placements pass a test that only checks the mapping is gone by the
+    end of the cycle, which is why the original bug survived review. What
+    matters is that nothing reads _face_sync_asset_map while a mapping points
+    at a hard-deleted asset, so this records the order the phases actually run
+    in and asserts the prune came first. Move cleanup_stale_mappings back to
+    Phase 4 and this fails.
+
+    The phase bodies are replaced with recorders because the ordering is the
+    subject; each phase's own behaviour is tested elsewhere.
+    """
+    calls: list[str] = []
+
+    @asynccontextmanager
+    async def patched_transaction():
+        yield conn
+
+    def recorder(name, result=0):
+        async def record(*args, **kwargs):
+            calls.append(name)
+            return result
+        return record
+
+    monkeypatch.setattr(sync_engine, "transaction", patched_transaction)
+    monkeypatch.setattr(sync_engine.settings, "sync_jobs", [])
+    monkeypatch.setattr(sync_engine, "cleanup_stale_mappings", recorder("phase0"))
+    monkeypatch.setattr(sync_engine, "sync_faces_incremental", recorder("phase2"))
+    monkeypatch.setattr(sync_engine, "sync_person_names", recorder("phase3_names"))
+    monkeypatch.setattr(sync_engine, "sync_person_thumbnails", recorder("phase3_thumbs"))
+    monkeypatch.setattr(sync_engine, "cleanup_deleted_assets", recorder("phase4_assets"))
+    monkeypatch.setattr(sync_engine, "cleanup_reassigned_faces", recorder("phase4_faces"))
+    monkeypatch.setattr(sync_engine, "cleanup_orphaned_persons", recorder("phase4_persons"))
+
+    await sync_engine.run_full_sync()
+
+    assert calls[0] == "phase0", f"the prune must run first, got {calls}"
+    assert calls.index("phase0") < calls.index("phase2")
+    assert calls.index("phase0") < calls.index("phase4_assets")
+
+
+async def test_a_failed_phase_4_step_does_not_undo_the_deletions_before_it(conn, monkeypatch):
+    """Phase 4's steps share a transaction but must not share a fate.
+
+    cleanup_deleted_assets unlinks thumbnails before deleting the rows that
+    name them, and the filesystem does not roll back. Without a savepoint per
+    step, a failure in cleanup_reassigned_faces restores asset rows whose
+    files are already gone and Immich shows broken assets — indefinitely, if
+    the failure is deterministic. The marker row here stands in for that
+    committed-in-spirit work: it must survive the later failure.
+    """
+    cg = await make_cluster_group(conn)
+    src = await make_user(conn, cluster_group_id=cg)
+    tgt = await make_user(conn, cluster_group_id=cg)
+    orphan = await make_asset(conn, tgt)
+    await make_synced_pair(conn, src, tgt, target_asset_id=orphan)
+
+    @asynccontextmanager
+    async def patched_transaction():
+        yield conn
+
+    async def deletes_a_row(c):
+        await c.execute("DELETE FROM _face_sync_asset_map WHERE target_asset_id = $1", orphan)
+        return 1
+
+    async def always_fails(c):
+        raise RuntimeError("Immich dropped the group between our read and our write")
+
+    monkeypatch.setattr(sync_engine, "transaction", patched_transaction)
+    monkeypatch.setattr(sync_engine.settings, "sync_jobs", [])
+    monkeypatch.setattr(sync_engine, "cleanup_stale_mappings", lambda c: _zero())
+    monkeypatch.setattr(sync_engine, "sync_faces_incremental", lambda c: _zero())
+    monkeypatch.setattr(sync_engine, "sync_person_names", lambda c: _zero())
+    monkeypatch.setattr(sync_engine, "sync_person_thumbnails", lambda c: _zero())
+    monkeypatch.setattr(sync_engine, "cleanup_deleted_assets", deletes_a_row)
+    monkeypatch.setattr(sync_engine, "cleanup_reassigned_faces", always_fails)
+    monkeypatch.setattr(sync_engine, "cleanup_orphaned_persons", lambda c: _zero())
+
+    stats = await sync_engine.run_full_sync()
+
+    # The cycle completed instead of raising, the failed step reported nothing,
+    # and the earlier step's delete stands.
+    assert stats["assets_cleaned"] == 1
+    assert stats["faces_reassigned"] == 0
+    assert await conn.fetchval(
+        "SELECT count(*) FROM _face_sync_asset_map WHERE target_asset_id = $1", orphan
+    ) == 0
+    # The transaction is still usable, which is the point of ROLLBACK TO.
+    assert await conn.fetchval("SELECT 1") == 1
+
+
+async def _zero():
+    return 0
