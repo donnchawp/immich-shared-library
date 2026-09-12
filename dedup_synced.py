@@ -16,15 +16,17 @@ import sys
 # Add project root to path
 sys.path.insert(0, os.path.dirname(__file__))
 
-from src.env_bootstrap import bootstrap
+from src.env_bootstrap import ENV_FILE, bootstrap
 
-if not bootstrap():
-    print("Error: .env not found. Copy env.example to .env and fill in your values.")
-    sys.exit(1)
+# Deferred rather than exiting here, matching delete_synced.py: importing this
+# module must stay side-effect-free enough for the test suite to reach the
+# functions in it. main() does the check before it touches the database.
+bootstrap()
 
 import logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", stream=sys.stdout)
 
+from src.asset_sync import record_skipped_duplicates
 from src.cleanup import delete_target_asset
 from src.db import init_pool, close_pool, fetch_all, fetch_one
 from src.main import ensure_tracking_tables
@@ -84,7 +86,7 @@ async def find_duplicates(target_user_id, *, match_time: bool = False) -> list[d
     return [dict(r) for r in rows]
 
 
-async def delete_synced_asset(conn, source_asset_id, target_asset_id) -> bool:
+async def delete_synced_asset(conn, source_asset_id, target_asset_id, target_user_id) -> bool:
     """Delete a synced target asset and record the source as skipped.
 
     The deletion itself is cleanup.delete_target_asset -- the same one the sync
@@ -92,20 +94,27 @@ async def delete_synced_asset(conn, source_asset_id, target_asset_id) -> bool:
     which selected every asset_file path and handed the XMP sidecar to
     remove_hardlinks; the target's sidecar path resolves through the
     external-library symlink to the SOURCE user's own file.
+
+    The skip record is asset_sync.record_skipped_duplicates, for the same
+    reason: this file's own INSERT named only source_asset_id, and
+    _face_sync_skipped is keyed on (source_asset_id, target_user_id) with
+    target_user_id NOT NULL.
+
+    The two halves are deliberately not one atomic unit. delete_target_asset
+    unlinks thumbnails before deleting the rows that name them and the
+    filesystem does not roll back, so rolling the delete back on a failed skip
+    record would restore an asset whose files are gone. Losing only the skip
+    record is recoverable: the sync engine recreates the asset next cycle and
+    the tool finds it again, which is the state the user was in before running
+    it. So the delete stands, and the INSERT gets its own savepoint to keep a
+    failure off the batch.
     """
     if not await delete_target_asset(conn, target_asset_id):
         return False
 
     try:
-        # Record the source asset as skipped so the sync engine won't recreate it
-        await conn.execute(
-            """
-            INSERT INTO _face_sync_skipped (source_asset_id, reason)
-            VALUES ($1, 'duplicate_filename')
-            ON CONFLICT (source_asset_id) DO NOTHING
-            """,
-            source_asset_id,
-        )
+        async with conn.transaction():
+            await record_skipped_duplicates(conn, {source_asset_id}, target_user_id)
         return True
     except Exception:
         logging.getLogger(__name__).exception(
@@ -116,6 +125,10 @@ async def delete_synced_asset(conn, source_asset_id, target_asset_id) -> bool:
 
 
 async def main(match_time: bool = False):
+    if not ENV_FILE.exists():
+        print("Error: .env not found. Copy env.example to .env and fill in your values.")
+        sys.exit(1)
+
     from src.config import settings
     print(f"Connecting to {settings.db_hostname}:{settings.db_port}/{settings.db_database_name}")
     if match_time:
@@ -198,7 +211,9 @@ async def main(match_time: bool = False):
         batch = duplicates[batch_start:batch_start + batch_size]
         async with transaction() as conn:
             for d in batch:
-                ok = await delete_synced_asset(conn, d["source_asset_id"], d["target_asset_id"])
+                ok = await delete_synced_asset(
+                    conn, d["source_asset_id"], d["target_asset_id"], target_user["id"],
+                )
                 if ok:
                     deleted += 1
                 else:
