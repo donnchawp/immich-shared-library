@@ -388,6 +388,11 @@ split; nothing else will.
    alone is not enough: it preserves each member's separate person groups, so identity is still not
    shared.
    
+   If you are coming from a sidecar older than schema v4, start the sidecar *before* the reset so
+   `_migrate_v4()` can strip the copied embeddings first — otherwise every synced face votes twice and the
+   reset invents people that should not exist. (This is the one step where the sidecar runs early; it only
+   touches its own copied rows.)
+
    Watch for table bloat while it runs. Nulling every `personGroupId` leaves one dead tuple per face, and
    each reassignment adds another. Autovacuum reclaims them only if nothing pins the vacuum horizon — a
    stalled Immich sync stream (`state = active`, `wait_event = ClientRead`) will, and then every recognition
@@ -482,7 +487,7 @@ Because identity is shared rather than mirrored, there's no merge step and no du
 - **Edits are copied once**: Crop/rotate/mirror history (`asset_edit`) is copied when the asset is first synced, so the target's `isEdited` flag and thumbnails agree. Edits made on the source *after* that aren't propagated, the same as EXIF and OCR data.
 - **Direct database access**: This service writes directly to Immich's database. Tested with v3.2.0 — schema changes in other versions may require updates to this sidecar. Always back up your database before use.
 - **Cluster group is enforced, not just recommended**: the sidecar checks `user.clusterGroupId` for every configured user on startup (and again at the start of each cycle, once there's new work) and refuses to run if they don't match.
-- **A facial-recognition reset re-does the sidecar's work, and skews clustering**: copied faces carry byte-identical embeddings — a copy sits at distance 0 from its source — so a cluster-group *Reset facial recognition* re-recognizes the original *and* every copy. On an instance where a quarter of the faces are synced copies, a quarter of that run is redundant. The bigger cost is quality: each real face now votes twice, so a person appearing in two synced photos reaches the default `minFaces` threshold of 3 and becomes a person who should not exist. Expect to prune spurious people afterwards. To avoid it, delete the copies' `asset_face` rows before the reset and let Phase 2 rebuild them — the incremental face sync re-inserts any face whose bounding box is missing on the target, and `face_search` rows cascade on delete.
+- **Copied faces are invisible to Immich's facial recognition, on purpose**: a copy gets no `face_search` row and `sourceType = 'manual'`. Without both, a cluster-group *Reset facial recognition* double-counts every shared face — a copied embedding is byte-identical to its source, so it sits at distance 0 and votes a second time when recognition checks `minFaces`, turning a person in two synced photos into a person who should not exist. Sidecars before schema v4 did copy embeddings; `_migrate_v4()` strips them from existing copies on upgrade. The trade-off is that the target's faces can no longer be recognized independently — the source owns their identity — so leaving the cluster group needs a face-detection re-run.
 - **Single direction**: Sync is one-way (source → target). Changes made to target assets in Immich are not propagated back.
 
 ## Contributing

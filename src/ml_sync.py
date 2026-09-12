@@ -34,7 +34,6 @@ async def sync_faces_for_asset(
 
     count = 0
     for face in source_faces:
-        source_face_id = face["id"]
         person_group_id = face["personGroupId"]
 
         # Identity is shared: the group id copies verbatim. We only need to make
@@ -48,6 +47,29 @@ async def sync_faces_for_asset(
                 # unassigned rather than pointing at a group that may vanish.
                 person_group_id = None
 
+        # Two deliberate departures from copying the source row verbatim, both
+        # to keep this copy out of Immich's facial recognition:
+        #
+        # No face_search row. searchFaces() inner-joins face_search, so a face
+        # without an embedding is never a candidate. That matters because a copied
+        # embedding is byte-identical to its source — a distance-0 twin — and
+        # recognition counts matches to decide whether a cluster reaches minFaces.
+        # Copying it made every shared face vote twice, so a person in two synced
+        # photos cleared a threshold of 3 and became a person who should not exist.
+        #
+        # sourceType 'manual', not the source's 'machine-learning'. getAllFaces()
+        # only queues machine-learning faces and handleRecognizeFaces() skips
+        # anything else *before* it checks for an embedding, so this is what stops
+        # the copies being queued and failing. It pairs with the missing embedding:
+        # drop one without the other and a cluster-wide reset queues every copy,
+        # each failing with "does not have an embedding".
+        #
+        # Not 'exif' — metadata extraction deletes every exif-sourced face on an
+        # asset and rebuilds it from XMP regions, and the sidecar syncs XMP.
+        #
+        # The cost: the target's faces can no longer be recognized independently.
+        # That is the design (the source is authoritative for identity), but it
+        # means leaving the cluster group needs a face-detection re-run.
         # Insert face record only if no matching bounding box exists on the target
         # asset (atomic check-and-insert to avoid TOCTOU race)
         target_face_id = uuid4()
@@ -78,24 +100,11 @@ async def sync_faces_for_asset(
             face["boundingBoxY1"],
             face["boundingBoxX2"],
             face["boundingBoxY2"],
-            face["sourceType"],
+            "manual",
             face["isVisible"],
         )
         if result == "INSERT 0 0":
             continue
-
-        # Copy face embedding
-        await conn.execute(
-            """
-            INSERT INTO face_search ("faceId", embedding)
-            SELECT $1, embedding
-            FROM face_search
-            WHERE "faceId" = $2
-            ON CONFLICT ("faceId") DO NOTHING
-            """,
-            target_face_id,
-            source_face_id,
-        )
 
         # Point the target person's feature photo at a face the target owns.
         # faceAssetId is still an FK to asset_face.id, so it must never

@@ -14,7 +14,7 @@ from src.sync_engine import _configured_user_ids, run_full_sync
 logger = logging.getLogger(__name__)
 
 
-SCHEMA_VERSION = 3  # Bump when tracking table schema changes
+SCHEMA_VERSION = 4  # Bump when tracking table schema changes
 
 
 async def ensure_tracking_tables() -> None:
@@ -76,6 +76,9 @@ async def _run_migrations() -> None:
 
     if current < 3:
         await _migrate_v3()
+
+    if current < 4:
+        await _migrate_v4()
 
     await execute(
         """
@@ -153,6 +156,58 @@ async def _migrate_v3() -> None:
     """v3.2.0 cluster-group port: drop the retired person mapping table."""
     async with acquire() as conn:
         await _drop_person_map_table(conn)
+
+
+async def _strip_copied_face_embeddings(conn) -> tuple[int, int]:
+    """Take the sidecar's copied faces out of Immich's recognition candidate pool.
+
+    Copies made before v4 carry a byte-identical clone of the source embedding
+    and the source's 'machine-learning' sourceType. Both are wrong, and only
+    together: searchFaces() inner-joins face_search, so the clone sits at
+    distance 0 from its source and votes a second time when recognition counts
+    matches against minFaces — a person in two synced photos reaches a
+    threshold of 3 on two real sightings. Deleting the embedding stops that;
+    flipping sourceType stops getAllFaces() queueing the copy at all, so it is
+    skipped rather than failing on the embedding we just removed.
+
+    Scoped to target assets in _face_sync_asset_map: these are the rows the
+    sidecar created, and nothing else in the database should be touched.
+
+    Returns (embeddings deleted, faces reclassified). Idempotent — a second run
+    finds nothing left to do.
+    """
+    embeddings = await conn.execute(
+        """
+        DELETE FROM face_search fs
+        USING asset_face af, _face_sync_asset_map m
+        WHERE fs."faceId" = af.id
+          AND af."assetId" = m.target_asset_id
+        """
+    )
+    faces = await conn.execute(
+        """
+        UPDATE asset_face af
+        SET "sourceType" = 'manual'
+        FROM _face_sync_asset_map m
+        WHERE af."assetId" = m.target_asset_id
+          AND af."sourceType" <> 'manual'
+        """
+    )
+    return (
+        int(embeddings.rsplit(" ", 1)[-1]),
+        int(faces.rsplit(" ", 1)[-1]),
+    )
+
+
+async def _migrate_v4() -> None:
+    """Stop the sidecar's face copies distorting Immich facial recognition."""
+    async with acquire() as conn:
+        deleted, reclassified = await _strip_copied_face_embeddings(conn)
+    logger.info(
+        "Removed %d copied face embeddings and reclassified %d copied faces as "
+        "'manual' so Immich's facial recognition ignores them",
+        deleted, reclassified,
+    )
 
 
 async def validate_user_and_library_ids() -> None:

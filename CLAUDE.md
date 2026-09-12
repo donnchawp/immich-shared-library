@@ -55,7 +55,7 @@ The repo has an automated test suite (pytest) run against a scratch `immich_test
 
 ### Sync Engine (5 phases, each in its own transaction)
 
-1. **New asset sync** (`asset_sync.py`): Finds source assets with completed ML processing not yet in `_face_sync_asset_map`. For each, creates a target asset record with remapped paths, copies EXIF, hardlinks thumbnails, copies CLIP embeddings, copies faces + face embeddings (`ml_sync.py`, which copies `asset_face."personGroupId"` verbatim and ensures the target has a `person` row for that group). Uses SAVEPOINTs so one asset failure doesn't abort the batch.
+1. **New asset sync** (`asset_sync.py`): Finds source assets with completed ML processing not yet in `_face_sync_asset_map`. For each, creates a target asset record with remapped paths, copies EXIF, hardlinks thumbnails, copies CLIP embeddings, copies faces (`ml_sync.py`, which copies `asset_face."personGroupId"` verbatim, ensures the target has a `person` row for that group, and deliberately does *not* copy the face embedding). Uses SAVEPOINTs so one asset failure doesn't abort the batch.
 
 1b. **Album assignment** (`album_sync.py`): Adds newly synced assets to the target album, backfills previously synced assets missing from it.
 
@@ -69,7 +69,7 @@ The repo has an automated test suite (pytest) run against a scratch `immich_test
 
 - `sync_engine.py` — Orchestrates the 5 phases, returns stats dict
 - `asset_sync.py` — Asset record creation with savepoint rollback, idempotency check, path remapping
-- `ml_sync.py` — Face record copying with bounding-box dedup, face_search embedding copy, `personGroupId` copied verbatim
+- `ml_sync.py` — Face record copying with bounding-box dedup, `personGroupId` copied verbatim. Copies carry **no `face_search` row** and `sourceType = 'manual'`, which together keep them out of Immich's facial recognition (see "Why copied faces are invisible to recognition")
 - `person_sync.py` — Target person row creation (`ensure_target_person`), thumbnail hardlinking, name sync, orphan cleanup (~300 lines; shrank from 422 when person mirroring was removed)
 - `cleanup.py` — Deletion detection (LEFT JOIN on source), hardlink removal before DB deletion, source-authoritative face reassignment
 - `file_ops.py` — Hardlink creation/removal, path remapping by exact UUID component matching
@@ -87,7 +87,7 @@ Per-job config can come from either `config.yaml` (preferred for multi-job setup
 ### Tracking tables (created automatically)
 
 - `_face_sync_asset_map` — Maps `source_asset_id` <-> `target_asset_id` with `synced_at` watermark. Indexed on `(target_user_id, source_user_id)` (`_face_sync_asset_map_user_pair_idx`) to support the person queries in `person_sync.py`.
-- `_face_sync_meta` — Sidecar's own schema version (`SCHEMA_VERSION = 3`). `_migrate_v3()` drops the retired `_face_sync_person_map` table on upgrade — person identity moved to Immich's `person_group`, so there's nothing left to map.
+- `_face_sync_meta` — Sidecar's own schema version (`SCHEMA_VERSION = 4`). `_migrate_v3()` drops the retired `_face_sync_person_map` table on upgrade — person identity moved to Immich's `person_group`, so there's nothing left to map. `_migrate_v4()` deletes the `face_search` rows of already-copied faces and flips their `sourceType` to `'manual'`, retiring the distance-0 twins earlier versions created.
 - `_face_sync_skipped` — Source assets deliberately skipped (e.g. detected duplicates), keyed by `(source_asset_id, target_user_id)`.
 
 ## Immich Schema Constraints
@@ -109,6 +109,17 @@ Key relationships:
 - Person thumbnail (since Immich v3.2.0, keyed on the person **group**, not the person): `/data/thumbs/{ownerId}/{personGroupId[0:2]}/{personGroupId[2:4]}/{personGroupId}.jpeg`
 - Immich's `deleteEmptyGroups` drops any `person_group` with no `person` row and nulls its faces — always create the target's `person` row (`ensure_target_person`) rather than leaving a bare `personGroupId` reference.
 - `user.clusterGroupId` is a single `NOT NULL uuid`: a user is in exactly one cluster group. `validate_cluster_group()` checks this for every configured user and refuses to start on a mismatch.
+
+### Why copied faces are invisible to recognition
+
+A copied face gets **no `face_search` row** and `sourceType = 'manual'`. Both are required, and for different reasons:
+
+- **No embedding.** `searchFaces()` inner-joins `face_search`, so a face without one is never a recognition candidate. A copied embedding is byte-identical to its source — a distance-0 twin — and `handleRecognizeFaces` counts matches against `minFaces` to decide whether a cluster is "core". Copying it made every shared face vote twice, so a person appearing in two synced photos cleared a threshold of 3 and became a person who should not exist.
+- **Non-ML `sourceType`.** `getAllFaces()` only queues `machine-learning` faces, and `handleRecognizeFaces` rejects anything else *before* it checks for an embedding. Without this, a cluster-wide reset would queue every copy and fail each one with "does not have an embedding".
+
+`'manual'` and not `'exif'`: metadata extraction deletes every exif-sourced face on an asset and rebuilds it from XMP regions (`metadata.service.ts`), and the sidecar syncs XMP sidecars. Nothing in Immich deletes or rewrites manual faces — `deleteFaces` and `unassignFaces` are both scoped to `machine-learning`.
+
+The cost: the target's faces can no longer be recognized independently, which is the design (the source is authoritative for identity) but means leaving the cluster group requires a face-detection re-run. A consequence to know: a force face-detection run deletes the source's ML faces but leaves the manual copies, where previously both went. Phase 2's bounding-box `NOT EXISTS` keeps the existing copy and `cleanup_reassigned_faces` refreshes its group, so it self-heals — unless re-detection shifts a bounding box, which strands the old copy alongside the new one.
 
 ### Why pre-populating works (Immich skip logic)
 

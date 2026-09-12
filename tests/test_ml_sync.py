@@ -225,3 +225,65 @@ async def test_one_failing_pair_does_not_poison_the_incremental_phase(conn):
         )
     )
     assert watermarks[good_src] > watermarks[doomed_src]
+
+
+async def test_copied_face_gets_no_embedding(conn):
+    """A copy must not be a facial-recognition candidate.
+
+    searchFaces() inner-joins face_search, and a copied embedding would be
+    byte-identical to its source — a distance-0 twin that votes a second time
+    when recognition counts matches against minFaces.
+    """
+    cg = await make_cluster_group(conn)
+    src = await make_user(conn, cluster_group_id=cg)
+    tgt = await make_user(conn, cluster_group_id=cg)
+    pg = await make_person_group(conn, cg)
+    await make_person(conn, src, pg, name="Dad")
+
+    src_asset = await make_asset(conn, src)
+    tgt_asset = await make_asset(conn, tgt)
+    src_face = await make_face(conn, src_asset, person_group_id=pg)
+    await conn.execute(
+        'INSERT INTO face_search ("faceId", embedding) VALUES ($1, $2)',
+        src_face, "[" + ",".join(["0.1"] * 512) + "]",
+    )
+
+    await sync_faces_for_asset(conn, src_asset, tgt_asset, src, tgt)
+
+    # The source keeps its embedding; the copy never gets one.
+    assert await conn.fetchval(
+        'SELECT count(*) FROM face_search WHERE "faceId" = $1', src_face
+    ) == 1
+    copied_embeddings = await conn.fetchval(
+        """
+        SELECT count(*) FROM face_search fs
+        JOIN asset_face af ON af.id = fs."faceId"
+        WHERE af."assetId" = $1
+        """,
+        tgt_asset,
+    )
+    assert copied_embeddings == 0
+
+
+async def test_copied_face_is_not_machine_learning(conn):
+    """Recognition skips a non-machine-learning face before it looks for an
+    embedding, so this is what keeps the copies out of the queue rather than
+    failing in it. 'manual' and not 'exif': metadata extraction deletes every
+    exif-sourced face on an asset and rebuilds it from XMP regions.
+    """
+    cg = await make_cluster_group(conn)
+    src = await make_user(conn, cluster_group_id=cg)
+    tgt = await make_user(conn, cluster_group_id=cg)
+
+    src_asset = await make_asset(conn, src)
+    tgt_asset = await make_asset(conn, tgt)
+    await make_face(conn, src_asset, person_group_id=None)
+    assert await conn.fetchval(
+        'SELECT "sourceType"::text FROM asset_face WHERE "assetId" = $1', src_asset
+    ) == "machine-learning"
+
+    await sync_faces_for_asset(conn, src_asset, tgt_asset, src, tgt)
+
+    assert await conn.fetchval(
+        'SELECT "sourceType"::text FROM asset_face WHERE "assetId" = $1', tgt_asset
+    ) == "manual"

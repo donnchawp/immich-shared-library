@@ -266,3 +266,90 @@ async def test_the_face_guard_is_transparent_on_success(conn):
     assert await conn.fetchval(
         'SELECT "personGroupId" FROM asset_face WHERE "assetId" = $1', tgt_asset
     ) == pg
+
+
+async def test_v4_migration_strips_copied_embeddings_and_reclassifies(
+    conn, route_main_db_calls_through_conn
+):
+    """An upgrade must retire the twins already in the database.
+
+    Copies made before v4 carry a byte-identical clone of the source
+    embedding, which votes a second time when recognition counts matches
+    against minFaces. Fixing only new copies would leave every existing one
+    distorting the next cluster-wide reset.
+    """
+    cg = await make_cluster_group(conn)
+    src = await make_user(conn, cluster_group_id=cg)
+    tgt = await make_user(conn, cluster_group_id=cg)
+    src_asset, tgt_asset = await make_synced_pair(conn, src, tgt)
+
+    embedding = "[" + ",".join(["0.1"] * 512) + "]"
+    src_face = await make_face(conn, src_asset, bbox=(1, 2, 3, 4))
+    tgt_face = await make_face(conn, tgt_asset, bbox=(1, 2, 3, 4))
+    for fid in (src_face, tgt_face):
+        await conn.execute(
+            'INSERT INTO face_search ("faceId", embedding) VALUES ($1, $2)', fid, embedding
+        )
+
+    # An unrelated user's face must survive untouched -- the migration is
+    # scoped to rows the sidecar created, via _face_sync_asset_map.
+    other = await make_user(conn, cluster_group_id=cg)
+    other_asset = await make_asset(conn, other)
+    other_face = await make_face(conn, other_asset)
+    await conn.execute(
+        'INSERT INTO face_search ("faceId", embedding) VALUES ($1, $2)', other_face, embedding
+    )
+
+    await conn.execute(
+        """
+        INSERT INTO _face_sync_meta (key, value) VALUES ('schema_version', '3')
+        ON CONFLICT (key) DO UPDATE SET value = '3'
+        """
+    )
+
+    await main_module._run_migrations()
+
+    # The copy loses its embedding and stops being a machine-learning face.
+    assert await conn.fetchval(
+        'SELECT count(*) FROM face_search WHERE "faceId" = $1', tgt_face
+    ) == 0
+    assert await conn.fetchval(
+        'SELECT "sourceType"::text FROM asset_face WHERE id = $1', tgt_face
+    ) == "manual"
+
+    # The source and the unrelated user are left alone.
+    assert await conn.fetchval(
+        'SELECT count(*) FROM face_search WHERE "faceId" = $1', src_face
+    ) == 1
+    assert await conn.fetchval(
+        'SELECT "sourceType"::text FROM asset_face WHERE id = $1', src_face
+    ) == "machine-learning"
+    assert await conn.fetchval(
+        'SELECT count(*) FROM face_search WHERE "faceId" = $1', other_face
+    ) == 1
+    assert await conn.fetchval(
+        'SELECT "sourceType"::text FROM asset_face WHERE id = $1', other_face
+    ) == "machine-learning"
+
+    assert await conn.fetchval(
+        "SELECT value FROM _face_sync_meta WHERE key = 'schema_version'"
+    ) == str(main_module.SCHEMA_VERSION)
+
+
+async def test_v4_migration_is_idempotent(conn):
+    """Re-running finds nothing left to strip."""
+    cg = await make_cluster_group(conn)
+    src = await make_user(conn, cluster_group_id=cg)
+    tgt = await make_user(conn, cluster_group_id=cg)
+    src_asset, tgt_asset = await make_synced_pair(conn, src, tgt)
+    tgt_face = await make_face(conn, tgt_asset)
+    await conn.execute(
+        'INSERT INTO face_search ("faceId", embedding) VALUES ($1, $2)',
+        tgt_face, "[" + ",".join(["0.1"] * 512) + "]",
+    )
+
+    first = await main_module._strip_copied_face_embeddings(conn)
+    second = await main_module._strip_copied_face_embeddings(conn)
+
+    assert first == (1, 1)
+    assert second == (0, 0)
