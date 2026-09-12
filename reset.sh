@@ -23,9 +23,13 @@ DB_DATABASE_NAME=$(get_env DB_DATABASE_NAME immich)
 EXTERNAL_LIBRARY_DIR=$(get_env EXTERNAL_LIBRARY_DIR)
 POSTGRES_CONTAINER="immich_postgres"
 
+# ON_ERROR_STOP is load-bearing, not hygiene. Without it psql exits 0 after a
+# failed statement, so `set -e` never fires and the script marches on to drop
+# the tracking tables — leaving orphaned assets in Immich and destroying the
+# only record of which ones they were.
 psql_cmd() {
     docker exec -e PGPASSWORD="$DB_PASSWORD" "$POSTGRES_CONTAINER" \
-        psql -U "$DB_USERNAME" -d "$DB_DATABASE_NAME" -t -A -c "$1"
+        psql -v ON_ERROR_STOP=1 -U "$DB_USERNAME" -d "$DB_DATABASE_NAME" -t -A -c "$1"
 }
 
 echo "=== Immich Shared Library Reset ==="
@@ -89,8 +93,12 @@ echo "  3. Delete up to $person_count mirrored person(s) from Immich"
 echo "  4. Drop all sidecar tracking tables"
 [[ ${#symlinks[@]} -gt 0 ]] && echo "  5. Remove ${#symlinks[@]} symlink(s)"
 echo ""
+# Not ${confirm,,}: that is bash 4+, and on a stock macOS host the shebang
+# resolves to bash 3.2, where it is a bad-substitution error that kills the
+# script here — after the preview, before anything destructive, so safe but
+# unusable.
 read -p "Proceed? [y/N] " confirm
-if [[ "${confirm,,}" != "y" ]]; then
+if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
     echo "Aborted."
     exit 0
 fi
@@ -101,6 +109,11 @@ echo "Stopping sidecar..."
 docker compose -f "$SCRIPT_DIR/docker-compose.yml" down 2>/dev/null || true
 
 # Delete synced assets (album entries first, then assets cascade to child tables)
+#
+# Note: this leaves the hardlinked thumbnail and preview files behind. They are
+# hardlinks, so they cost no extra disk space, but nothing after this point
+# knows their paths. delete_synced.py removes the files first and is the
+# better tool if you want a clean filesystem; this is the blunt instrument.
 if [[ "$asset_count" -gt 0 ]]; then
     echo "Deleting $asset_count synced asset(s)..."
     psql_cmd "
@@ -143,12 +156,21 @@ if [[ "$person_count" -gt 0 ]]; then
     "
 fi
 
-# Drop tracking tables
+# Drop tracking tables. Only after both deletes above have succeeded —
+# _face_sync_asset_map is the only record of which assets and persons this
+# reset was supposed to remove, so dropping it on top of a failed delete
+# leaves orphans that nothing can find again. set -e plus ON_ERROR_STOP
+# already stops the script before here; this comment is why that matters.
+#
+# _face_sync_meta goes too: it holds the sidecar's own schema version, and a
+# stale version pointing at tables that no longer exist would mislead the next
+# migration run.
 echo "Dropping tracking tables..."
 psql_cmd "
     DROP TABLE IF EXISTS _face_sync_asset_map;
     DROP TABLE IF EXISTS _face_sync_person_map;
     DROP TABLE IF EXISTS _face_sync_skipped;
+    DROP TABLE IF EXISTS _face_sync_meta;
 "
 
 # Remove symlinks
