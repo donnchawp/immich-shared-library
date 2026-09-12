@@ -80,6 +80,13 @@ async def sync_faces_for_asset(
     #
     # One statement for the whole asset. The NOT EXISTS keeps the per-face
     # check-and-insert atomicity that made this a loop in the first place.
+    #
+    # It ignores soft-deleted faces, matching cleanup_reassigned_faces, which
+    # requires deletedAt IS NULL on both sides. The two have to agree on what
+    # "a face already exists at this box" means: while this one counted trashed
+    # faces and that one did not, a soft-deleted target face blocked the copy
+    # here forever and was invisible to reconciliation there, so the target
+    # simply lost the face with nothing reporting it.
     inserted = await conn.fetch(
         """
         INSERT INTO asset_face (
@@ -97,6 +104,7 @@ async def sync_faces_for_asset(
         WHERE NOT EXISTS (
             SELECT 1 FROM asset_face ex
             WHERE ex."assetId" = $1
+              AND ex."deletedAt" IS NULL
               AND ex."boundingBoxX1" = t.x1
               AND ex."boundingBoxY1" = t.y1
               AND ex."boundingBoxX2" = t.x2
@@ -107,18 +115,47 @@ async def sync_faces_for_asset(
         target_asset_id, *(list(col) for col in zip(*rows)),
     )
 
-    if not inserted:
-        return 0
-
     # Point each target person's feature photo at a face the target owns.
     # faceAssetId is still an FK to asset_face.id, so it must never reference
     # the source user's face row. One face per group: the first inserted, which
     # is what the per-face loop settled on too, since the second face in a group
     # found faceAssetId already set and non-dangling.
+    #
+    # No early return when nothing was inserted. person."faceAssetId" is
+    # ON DELETE SET NULL, so deleting a target face nulls the pointer rather
+    # than leaving it dangling — which means the UPDATE's IS NULL half is the
+    # one that does the work here, and the NOT EXISTS half is belt and braces
+    # against a schema change. Either way a person can sit with no feature face
+    # while the face it should point at is already on the asset: the row was
+    # created by ensure_target_person, which does not set faceAssetId, or the
+    # face it had was deleted and re-copied on a pass this one did not run.
+    # Building `feature` from `inserted` alone meant the repair could only run
+    # on a pass that had just created a face, which is the pass least likely to
+    # need it.
+    #
+    # The fallback query runs only when nothing was inserted, so the hot path
+    # is unchanged, and only for groups this asset's source faces resolved to.
     feature: dict[UUID, UUID] = {}
     for row in inserted:
         if row["personGroupId"] is not None:
             feature.setdefault(row["personGroupId"], row["id"])
+
+    if not inserted:
+        groups = [g for g in resolved.values() if g is not None]
+        if groups:
+            existing = await conn.fetch(
+                """
+                SELECT DISTINCT ON ("personGroupId") "personGroupId", id
+                FROM asset_face
+                WHERE "assetId" = $1
+                  AND "deletedAt" IS NULL
+                  AND "personGroupId" = ANY($2::uuid[])
+                ORDER BY "personGroupId", id
+                """,
+                target_asset_id, groups,
+            )
+            for row in existing:
+                feature.setdefault(row["personGroupId"], row["id"])
 
     if feature:
         await conn.execute(
@@ -207,7 +244,7 @@ async def sync_faces_incremental(conn: asyncpg.Connection) -> int:
 
     total = 0
     done_sources: list[UUID] = []
-    done_targets: list[UUID] = []
+    done_target_users: list[UUID] = []
     for pair in pairs:
         count = await sync_faces_for_asset_guarded(
             conn, pair["source_asset_id"], pair["target_asset_id"],
@@ -226,7 +263,7 @@ async def sync_faces_incremental(conn: asyncpg.Connection) -> int:
         # reassignment itself is applied by cleanup_reassigned_faces in Phase
         # 4, which does not use this watermark.
         done_sources.append(pair["source_asset_id"])
-        done_targets.append(pair["target_user_id"])
+        done_target_users.append(pair["target_user_id"])
         total += count
 
     # One statement, not one per pair. A reassignment-only pass copies nothing
@@ -241,7 +278,7 @@ async def sync_faces_incremental(conn: asyncpg.Connection) -> int:
             WHERE m.source_asset_id = w.source_asset_id
               AND m.target_user_id = w.target_user_id
             """,
-            done_sources, done_targets,
+            done_sources, done_target_users,
         )
 
     return total

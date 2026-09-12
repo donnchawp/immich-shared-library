@@ -308,3 +308,91 @@ async def test_a_reassignment_only_pass_still_advances_the_watermark(conn, pair)
 
     # And the window is genuinely closed: a second pass finds nothing to do.
     assert await sync_faces_incremental(conn) == 0
+
+
+async def test_two_source_faces_sharing_a_box_land_once(conn, pair):
+    """The NOT EXISTS cannot see rows inserted by its own statement.
+
+    This became a real risk when the per-face loop was replaced by one
+    statement: the loop inserted the first face and then the NOT EXISTS saw it
+    and skipped the second. A single INSERT ... SELECT does not, so the dedup
+    has to happen in Python before the statement runs.
+    """
+    cg, src, tgt = pair
+    src_asset = await make_asset(conn, src)
+    tgt_asset = await make_asset(conn, tgt)
+    await make_face(conn, src_asset, bbox=(5, 5, 15, 15))
+    await make_face(conn, src_asset, bbox=(5, 5, 15, 15))
+
+    count = await sync_faces_for_asset(conn, src_asset, tgt_asset, src, tgt)
+
+    assert count == 1
+    landed = await conn.fetchval(
+        'SELECT count(*) FROM asset_face WHERE "assetId" = $1', tgt_asset
+    )
+    assert landed == 1
+
+
+async def test_a_trashed_target_face_does_not_block_the_copy(conn, pair):
+    """The dedup must agree with cleanup_reassigned_faces about what exists.
+
+    cleanup_reassigned_faces requires deletedAt IS NULL on both sides, so a
+    soft-deleted target face is invisible to it. While this dedup counted
+    trashed faces, such a face blocked the copy here permanently and could
+    never be reconciled there: the target simply lost the face, with nothing
+    reporting it.
+    """
+    cg, src, tgt = pair
+    src_asset = await make_asset(conn, src)
+    tgt_asset = await make_asset(conn, tgt)
+    await make_face(conn, src_asset, bbox=(7, 7, 17, 17))
+    trashed = await make_face(conn, tgt_asset, bbox=(7, 7, 17, 17))
+    await conn.execute(
+        'UPDATE asset_face SET "deletedAt" = NOW() WHERE id = $1', trashed
+    )
+
+    count = await sync_faces_for_asset(conn, src_asset, tgt_asset, src, tgt)
+
+    assert count == 1
+    live = await conn.fetchval(
+        'SELECT count(*) FROM asset_face WHERE "assetId" = $1 AND "deletedAt" IS NULL',
+        tgt_asset,
+    )
+    assert live == 1
+
+
+async def test_a_missing_feature_face_is_filled_on_a_pass_that_copies_nothing(
+    conn, pair
+):
+    """The faceAssetId repair used to be unreachable in the case that needs it.
+
+    person."faceAssetId" is ON DELETE SET NULL, so a deleted face leaves the
+    pointer NULL rather than dangling. ensure_target_person does not set it
+    either, so a target person can sit with no feature face while the face it
+    should point at is already on the asset. The UPDATE that fixes this only
+    ever ran on a pass that had just inserted a face -- which is the pass least
+    likely to need it.
+    """
+    cg, src, tgt = pair
+    pg = await make_person_group(conn, cg)
+    await make_person(conn, src, pg, name="Dad")
+    src_asset = await make_asset(conn, src)
+    tgt_asset = await make_asset(conn, tgt)
+    await make_face(conn, src_asset, person_group_id=pg, bbox=(2, 2, 8, 8))
+
+    # The state a previous cycle can leave: the target has the person row and
+    # the copied face, but no feature face recorded.
+    await make_person(conn, tgt, pg, name="Dad")
+    tgt_face = await make_face(conn, tgt_asset, person_group_id=pg, bbox=(2, 2, 8, 8))
+    assert await conn.fetchval(
+        'SELECT "faceAssetId" FROM person WHERE "ownerId" = $1 AND "personGroupId" = $2',
+        tgt, pg,
+    ) is None
+
+    # This pass copies nothing: the box is already there.
+    assert await sync_faces_for_asset(conn, src_asset, tgt_asset, src, tgt) == 0
+
+    assert await conn.fetchval(
+        'SELECT "faceAssetId" FROM person WHERE "ownerId" = $1 AND "personGroupId" = $2',
+        tgt, pg,
+    ) == tgt_face, "the feature face was not filled in"
