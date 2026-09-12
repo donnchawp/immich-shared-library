@@ -1,4 +1,4 @@
-from src.ml_sync import sync_faces_for_asset
+from src.ml_sync import sync_faces_for_asset, sync_faces_incremental
 from tests.conftest import (
     make_cluster_group, make_asset, make_face, make_person, make_person_group,
     make_synced_pair, make_user,
@@ -287,3 +287,48 @@ async def test_copied_face_is_not_machine_learning(conn):
     assert await conn.fetchval(
         'SELECT "sourceType"::text FROM asset_face WHERE "assetId" = $1', tgt_asset
     ) == "manual"
+
+
+async def test_a_reassignment_only_pass_still_advances_the_watermark(conn):
+    """A pair that copies nothing must still leave the Phase 2 window.
+
+    Reassigning a source face to a different person group bumps
+    asset_face."updatedAt", so Phase 2 selects the pair — but the bounding box
+    is already on the target, so nothing is inserted and the count is 0.
+    Gating the watermark update on count > 0 left the pair inside the window
+    permanently, re-fetched and re-scanned on every cycle for the life of the
+    install. The reassignment itself is Phase 4's job, not this one's.
+    """
+    cg = await make_cluster_group(conn)
+    src = await make_user(conn, cluster_group_id=cg)
+    tgt = await make_user(conn, cluster_group_id=cg)
+    first = await make_person_group(conn, cg)
+    second = await make_person_group(conn, cg)
+    await make_person(conn, src, first)
+    await make_person(conn, src, second)
+
+    src_asset, tgt_asset = await make_synced_pair(
+        conn, src, tgt, synced_at="NOW() - INTERVAL '1 day'",
+    )
+    await make_face(conn, src_asset, person_group_id=first, bbox=(1, 1, 9, 9))
+    await make_face(conn, tgt_asset, person_group_id=first, bbox=(1, 1, 9, 9))
+
+    # The source user moves the face to a different person. Only "updatedAt"
+    # changes as far as Phase 2 is concerned; the box is untouched.
+    await conn.execute(
+        'UPDATE asset_face SET "personGroupId" = $1 WHERE "assetId" = $2',
+        second, src_asset,
+    )
+
+    before = await conn.fetchval(
+        "SELECT synced_at FROM _face_sync_asset_map WHERE source_asset_id = $1", src_asset
+    )
+    assert await sync_faces_incremental(conn) == 0
+
+    after = await conn.fetchval(
+        "SELECT synced_at FROM _face_sync_asset_map WHERE source_asset_id = $1", src_asset
+    )
+    assert after > before, "the pair would be re-scanned every cycle forever"
+
+    # And the window is genuinely closed: a second pass finds nothing to do.
+    assert await sync_faces_incremental(conn) == 0

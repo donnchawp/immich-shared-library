@@ -210,13 +210,19 @@ async def sync_faces_incremental(conn: asyncpg.Connection) -> int:
             # Leave the watermark alone: the pair is still inside the window,
             # so the next cycle picks it up again without any extra state.
             continue
-        if count > 0:
-            # Update the watermark so we don't re-check this asset next cycle
-            await conn.execute(
-                "UPDATE _face_sync_asset_map SET synced_at = NOW() WHERE source_asset_id = $1 AND target_user_id = $2",
-                pair["source_asset_id"],
-                pair["target_user_id"],
-            )
+        # Advance the watermark on every pair that was processed without
+        # error, not only on pairs that inserted a face. A source face
+        # reassigned to a different person group bumps asset_face."updatedAt"
+        # but copies nothing — the bounding box is already on the target — so
+        # gating this on count > 0 left the pair permanently inside the
+        # window, re-fetched and re-scanned on every cycle forever. The
+        # reassignment itself is applied by cleanup_reassigned_faces in Phase
+        # 4, which does not use this watermark.
+        await conn.execute(
+            "UPDATE _face_sync_asset_map SET synced_at = NOW() WHERE source_asset_id = $1 AND target_user_id = $2",
+            pair["source_asset_id"],
+            pair["target_user_id"],
+        )
         total += count
 
     return total
