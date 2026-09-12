@@ -158,7 +158,7 @@ async def _migrate_v3() -> None:
         await _drop_person_map_table(conn)
 
 
-async def _strip_copied_face_embeddings(conn) -> tuple[int, int]:
+async def _strip_copied_face_embeddings(conn: asyncpg.Connection) -> tuple[int, int]:
     """Take the sidecar's copied faces out of Immich's recognition candidate pool.
 
     Copies made before v4 carry a byte-identical clone of the source embedding

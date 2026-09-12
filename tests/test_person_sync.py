@@ -631,3 +631,37 @@ def test_a_missing_source_file_is_not_recorded_as_linked(tmp_path, monkeypatch):
     )
 
     assert result == ""
+
+
+async def test_two_sources_holding_one_group_link_the_thumbnail_once(
+    conn, tmp_path, monkeypatch
+):
+    """Two jobs into one target: the same (target, group) appears once per source.
+
+    Plain DISTINCT kept both rows, so the file was linked once, the UPDATE ran
+    twice and the returned count claimed two thumbnails where there is one.
+    """
+    cg = await make_cluster_group(conn)
+    src_a = await make_user(conn, cluster_group_id=cg)
+    src_b = await make_user(conn, cluster_group_id=cg)
+    tgt = await make_user(conn, cluster_group_id=cg)
+    pg = await make_person_group(conn, cg)
+
+    await make_person(conn, src_a, pg, name="Granny")
+    await make_person(conn, src_b, pg, name="Granny")
+    await make_person(conn, tgt, pg, name="Granny")
+    await _map_synced_pair(conn, src_a, tgt, person_group_id=pg)
+    await _map_synced_pair(conn, src_b, tgt, person_group_id=pg)
+
+    # Both sources hold a thumbnail, at different paths.
+    monkeypatch.setattr(person_sync.settings, "upload_location_mount", str(tmp_path))
+    for owner in (src_a, src_b):
+        f = _thumb_for(tmp_path, owner, pg)
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_bytes(b"jpeg-bytes")
+        await conn.execute(
+            'UPDATE person SET "thumbnailPath" = $1 WHERE "ownerId" = $2 AND "personGroupId" = $3',
+            str(f), owner, pg,
+        )
+
+    assert await sync_person_thumbnails(conn) == 1

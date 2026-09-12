@@ -30,7 +30,11 @@ async def delete_target_asset(conn: asyncpg.Connection, target_asset_id) -> bool
             file_paths = await owned_file_paths(conn, target_asset_id)
             remove_hardlinks(file_paths)
 
-            # Remove from albums before deleting the asset
+            # Belt and braces: album_asset."assetId" is already ON DELETE
+            # CASCADE, and the album_asset_delete_audit trigger fires either
+            # way (it is guarded on pg_trigger_depth() <= 1). Kept as a
+            # statement of intent and against the FK changing, at the cost of
+            # one round trip per deleted asset.
             await conn.execute(
                 'DELETE FROM album_asset WHERE "assetId" = $1',
                 target_asset_id,
@@ -144,6 +148,18 @@ async def cleanup_reassigned_faces(conn: asyncpg.Connection) -> int:
     runs in its own transaction (src/sync_engine.py) and may have failed, so
     the guard is stated here rather than assumed. An unassignment
     (``sf."personGroupId" IS NULL``) needs no person row and still propagates.
+
+    Cost, understood and accepted: this is a full scan of
+    ``_face_sync_asset_map`` joined twice to ``asset_face``, every cycle,
+    forever, and it does nothing almost every time. Unlike Phase 2 it has no
+    watermark, and it must not grow one — a watermark records that work was
+    done, and this function's whole job is to converge state that *something
+    else* failed to apply, including a Phase 2 pass that advanced its own
+    watermark before dying. A drift it skips once it would skip permanently.
+    The cost is bounded by index lookups and grows linearly with the library;
+    if that stops being acceptable the answer is a cheap pre-check (does any
+    mapped source face have ``updatedAt`` past the last full pass?) gating the
+    expensive statement, not a watermark on the statement itself.
     """
     updated = await conn.fetch(
         """

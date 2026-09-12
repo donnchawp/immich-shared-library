@@ -98,14 +98,21 @@ async def _sync_faces_guarded(
     if count is not None:
         return count
 
-    await conn.execute(
-        """
-        UPDATE _face_sync_asset_map SET synced_at = 'epoch'
-        WHERE source_asset_id = $1 AND target_user_id = $2
-        """,
-        source_asset_id,
-        target_user_id,
-    )
+    # Savepointed like everything else in Phase 1. It is a constraint-free
+    # single-table UPDATE, so the realistic failure is the connection going
+    # away rather than the statement itself -- but it is the one write left in
+    # this phase that could abort all 500 assets' mappings while their
+    # hardlinks stay on disk, which is the harm the surrounding docstring is
+    # about.
+    async with conn.transaction():
+        await conn.execute(
+            """
+            UPDATE _face_sync_asset_map SET synced_at = 'epoch'
+            WHERE source_asset_id = $1 AND target_user_id = $2
+            """,
+            source_asset_id,
+            target_user_id,
+        )
     logger.warning(
         "Asset %s synced without faces; watermark rewound for Phase 2 to retry",
         source_asset_id,

@@ -41,6 +41,7 @@ import logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", stream=sys.stdout)
 
 from src.db import close_pool, init_pool, transaction
+from src.main import ensure_tracking_tables
 
 # How many groups the dry run names individually. Enough to spot a pattern
 # without burying the summary; the counts above it are always the full picture.
@@ -216,6 +217,12 @@ async def main(min_faces: int, apply: bool) -> None:
     from src.config import settings
     print(f"Connecting to {settings.db_hostname}:{settings.db_port}/{settings.db_database_name}")
     await init_pool()
+    # Every query here reads _face_sync_asset_map to tell a copy from an
+    # original. Without this, running the script before the sidecar has ever
+    # started gives an UndefinedTableError traceback rather than "nothing to
+    # prune", which is the true answer -- nothing has been copied yet.
+    # delete_synced.py and dedup_synced.py both do this already.
+    await ensure_tracking_tables()
 
     try:
         async with transaction() as conn:

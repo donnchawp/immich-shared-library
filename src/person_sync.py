@@ -139,12 +139,13 @@ async def ensure_target_person(
     # The composite PK makes this race-safe without an advisory lock: a
     # concurrent transaction inserting the same (ownerId, personGroupId) loses
     # the conflict and we keep whichever row landed first.
-    await conn.execute(
+    created = await conn.fetch(
         """
         INSERT INTO person ("ownerId", "personGroupId", name, "thumbnailPath",
                             "isHidden", "birthDate", "isFavorite", color)
         VALUES ($1, $2, $3, $4, $5, $6, FALSE, $7)
         ON CONFLICT ("ownerId", "personGroupId") DO NOTHING
+        RETURNING "personGroupId"
         """,
         target_user_id,
         person_group_id,
@@ -155,10 +156,23 @@ async def ensure_target_person(
         source["color"],
     )
 
-    logger.info(
-        "Created person for user %s in group %s (name=%r)",
-        target_user_id, person_group_id, source["name"],
-    )
+    # RETURNING yields nothing when the ON CONFLICT swallowed the insert, so
+    # this says "created" only when a row was. Logging it unconditionally
+    # reported a creation that did not happen on a lost race -- the kind of
+    # line someone reads during an incident and believes.
+    if created:
+        logger.info(
+            "Created person for user %s in group %s (name=%r)",
+            target_user_id, person_group_id, source["name"],
+        )
+    elif target_thumbnail:
+        # We hardlinked a thumbnail for a row we did not end up writing. The
+        # file is harmless (the source holds the inode) but nothing references
+        # it, so say so rather than leaving it silently on disk.
+        logger.debug(
+            "Lost the insert race for group %s; unreferenced thumbnail at %s",
+            person_group_id, target_thumbnail,
+        )
     return person_group_id
 
 
@@ -205,9 +219,16 @@ async def sync_person_thumbnails(conn: asyncpg.Connection) -> int:
     fill-only on ``thumbnailPath = ''``, but it creates files on disk, so the
     reach is worth bounding.
     """
+    # DISTINCT ON, not DISTINCT: with two jobs into one target, the same
+    # (target, group) appears once per source, and those sources can hold
+    # different thumbnailPath values. Plain DISTINCT keeps both rows, so the
+    # file gets linked once, the UPDATE runs twice and the count over-reports.
+    # Picking the lowest source ownerId is arbitrary but stated, which beats
+    # arbitrary and incidental.
     rows = await conn.fetch(
         """
-        SELECT DISTINCT t."ownerId" AS target_user_id,
+        SELECT DISTINCT ON (t."ownerId", t."personGroupId")
+               t."ownerId" AS target_user_id,
                t."personGroupId" AS person_group_id,
                s."thumbnailPath" AS source_thumb
         FROM person t
@@ -215,7 +236,10 @@ async def sync_person_thumbnails(conn: asyncpg.Connection) -> int:
         WHERE s."thumbnailPath" <> ''
           AND t."thumbnailPath" = ''
         """
-        + _SYNCED_GROUP_SCOPE,
+        + _SYNCED_GROUP_SCOPE
+        + """
+        ORDER BY t."ownerId", t."personGroupId", s."ownerId"
+        """,
     )
 
     count = 0
