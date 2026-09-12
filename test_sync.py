@@ -190,8 +190,20 @@ async def main():
         print(f"  group={g['personGroupId']} shared by {g['owners']} users")
 
     await close_pool()
-    print("\n=== Done ===")
+
+    if regressed:
+        # Repeated, because the banner above is now thousands of lines up the
+        # scrollback, and returned so the exit status carries it too. The
+        # verification dump is left in deliberately: if this has fired, it is
+        # the evidence you want.
+        print(
+            "\n=== FAILED: a source user's own faces lost their person assignment ==="
+            "\n    Scroll up to the face-health section. Do not run another cycle."
+        )
+    else:
+        print("\n=== Done ===")
+    return regressed
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    sys.exit(1 if asyncio.run(main()) else 0)

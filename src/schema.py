@@ -157,9 +157,10 @@ INSERTED_COLUMNS: dict[str, set[str]] = {
         "boundingBoxX1", "boundingBoxY1", "boundingBoxX2", "boundingBoxY2",
         "sourceType", "isVisible",
     },
-    "face_search": {
-        "faceId", "embedding",
-    },
+    # face_search is deliberately absent. Since schema v4 the sidecar never
+    # inserts into it -- copies get no embedding at all -- so a new NOT NULL
+    # column there is Immich's business, not ours. Declaring it here would
+    # refuse to start the sidecar over a table it only ever deletes from.
     "person": {
         "ownerId", "personGroupId", "name", "thumbnailPath", "isHidden",
         "birthDate", "isFavorite", "color",
@@ -181,7 +182,7 @@ EXPECTED_CASCADE_CHILDREN: set[str] = {
 # Each entry is table -> frozenset of column names that must be covered by
 # a single unique or primary key constraint.
 EXPECTED_UNIQUE_CONSTRAINTS: dict[str, list[frozenset[str]]] = {
-    "face_search": [frozenset({"faceId"})],
+    # Likewise no face_search: its ON CONFLICT went with the embedding copy.
     "album_asset": [frozenset({"albumId", "assetId"})],
     # person's composite PK, which ensure_target_person's ON CONFLICT targets.
     # New in v3.2.0 and the least settled of the three, so the one most worth
