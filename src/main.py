@@ -173,17 +173,19 @@ async def _strip_copied_face_embeddings(conn) -> tuple[int, int]:
     Scoped to target assets in _face_sync_asset_map: these are the rows the
     sidecar created, and nothing else in the database should be touched.
 
+    Order matters, and so does the transaction. The reclassification goes
+    first: between the two statements the copies are whatever the one already
+    run has left them, and 'machine-learning' with no embedding is the single
+    state this function exists to prevent — getAllFaces() queues those and
+    handleRecognizeFaces fails each one on the embedding that is no longer
+    there. 'manual' with an embedding, the other order's intermediate state, is
+    inert, because sourceType is checked first. The caller wraps both in one
+    transaction so no other connection sees either state, but the order stands
+    on its own for the crash case.
+
     Returns (embeddings deleted, faces reclassified). Idempotent — a second run
     finds nothing left to do.
     """
-    embeddings = await conn.execute(
-        """
-        DELETE FROM face_search fs
-        USING asset_face af, _face_sync_asset_map m
-        WHERE fs."faceId" = af.id
-          AND af."assetId" = m.target_asset_id
-        """
-    )
     faces = await conn.execute(
         """
         UPDATE asset_face af
@@ -193,6 +195,14 @@ async def _strip_copied_face_embeddings(conn) -> tuple[int, int]:
           AND af."sourceType" <> 'manual'
         """
     )
+    embeddings = await conn.execute(
+        """
+        DELETE FROM face_search fs
+        USING asset_face af, _face_sync_asset_map m
+        WHERE fs."faceId" = af.id
+          AND af."assetId" = m.target_asset_id
+        """
+    )
     return (
         int(embeddings.rsplit(" ", 1)[-1]),
         int(faces.rsplit(" ", 1)[-1]),
@@ -200,9 +210,15 @@ async def _strip_copied_face_embeddings(conn) -> tuple[int, int]:
 
 
 async def _migrate_v4() -> None:
-    """Stop the sidecar's face copies distorting Immich facial recognition."""
+    """Stop the sidecar's face copies distorting Immich facial recognition.
+
+    One transaction, not two autocommitted statements: a recognition job that
+    runs between them would see the half-migrated state, and asyncpg
+    autocommits each statement on a bare acquire().
+    """
     async with acquire() as conn:
-        deleted, reclassified = await _strip_copied_face_embeddings(conn)
+        async with conn.transaction():
+            deleted, reclassified = await _strip_copied_face_embeddings(conn)
     logger.info(
         "Removed %d copied face embeddings and reclassified %d copied faces as "
         "'manual' so Immich's facial recognition ignores them",
@@ -352,8 +368,15 @@ async def main() -> None:
     await wait_for_immich(api)
 
     await init_pool()
-    await ensure_tracking_tables()
+    # Schema first, migrations second. _migrate_v4 issues a DELETE against
+    # Immich's own face_search table, and running that before anything has
+    # checked Immich's schema means a version that moved or renamed it gives
+    # the operator a raw UndefinedTableError from inside a destructive
+    # statement, rather than the curated "Immich was upgraded" message that
+    # validate_schema exists to produce. Nothing in validate_schema reads the
+    # tracking tables, so the order costs nothing.
     await validate_schema()
+    await ensure_tracking_tables()
     # Users and libraries first: both this and validate_cluster_group reject a
     # missing user, but only this one can say which job and which side it came
     # from. validate_cluster_group keeps its own check for the per-cycle call

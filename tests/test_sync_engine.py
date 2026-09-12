@@ -276,7 +276,80 @@ async def test_the_face_guard_is_transparent_on_success(conn, pair):
     ) == pg
 
 
-async def test_v4_migration_strips_copied_embeddings_and_reclassifies(pair, 
+class _RecordingConn:
+    """A conn that records the SQL issued and whether it was in a transaction."""
+
+    def __init__(self):
+        self.queries = []
+        self.in_transaction = False
+        self.transaction_opened = False
+
+    async def execute(self, query, *args):
+        self.queries.append((query.strip().split()[0].upper(), self.in_transaction))
+        return f"{query.strip().split()[0].upper()} 0"
+
+    def transaction(self):
+        recorder = self
+
+        class _Tx:
+            async def __aenter__(self_):
+                recorder.transaction_opened = True
+                recorder.in_transaction = True
+
+            async def __aexit__(self_, *exc):
+                recorder.in_transaction = False
+                return False
+
+        return _Tx()
+
+
+async def test_v4_reclassifies_before_it_deletes_the_embeddings():
+    """The order is the whole safety property, and it is invisible end-to-end.
+
+    Between the two statements the copies are in whatever state the first one
+    left them. 'machine-learning' with no embedding is the one combination
+    this migration exists to prevent: getAllFaces() queues those and
+    handleRecognizeFaces fails every one on the embedding that is no longer
+    there. 'manual' with an embedding -- the other order's middle state -- is
+    inert, because sourceType is checked first.
+
+    Only the finished state is observable from outside, so both orders pass
+    the end-to-end test below. This one reads the statements.
+    """
+    recorder = _RecordingConn()
+
+    await main_module._strip_copied_face_embeddings(recorder)
+
+    verbs = [verb for verb, _ in recorder.queries]
+    assert verbs == ["UPDATE", "DELETE"], (
+        f"got {verbs}; the sourceType flip must precede the embedding delete"
+    )
+
+
+async def test_v4_runs_both_statements_in_one_transaction():
+    """asyncpg autocommits each statement on a bare acquire().
+
+    Without an explicit transaction a recognition job running between the two
+    sees the half-migrated state that the ordering above only narrows, rather
+    than closes.
+    """
+    recorder = _RecordingConn()
+
+    @asynccontextmanager
+    async def patched_acquire():
+        yield recorder
+
+    import unittest.mock
+    with unittest.mock.patch.object(main_module, "acquire", patched_acquire):
+        await main_module._migrate_v4()
+
+    assert recorder.transaction_opened, "the migration never opened a transaction"
+    assert all(in_tx for _, in_tx in recorder.queries), (
+        f"a statement ran outside the transaction: {recorder.queries}"
+    )
+
+
+async def test_v4_migration_strips_copied_embeddings_and_reclassifies(pair,
     conn, route_main_db_calls_through_conn
 ):
     """An upgrade must retire the twins already in the database.
