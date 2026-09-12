@@ -444,3 +444,35 @@ async def test_teardown_face_guard_is_owner_scoped_not_group_scoped(conn):
     assert await conn.fetchval(
         'SELECT "personGroupId" FROM asset_face WHERE "assetId" = $1', src_asset
     ) == pg
+
+
+async def test_orphan_cleanup_spares_a_named_person(conn):
+    """A name is the only provenance left, so it is treated as one.
+
+    _face_sync_person_map used to record which target rows the sidecar
+    created; v3.2.0 retired it, and the remaining guards — managed target, no
+    source person on the group, no faces anywhere — are all satisfied by a
+    person the target user found on their own photos and then deleted the
+    photos of. Deleting that is something Immich itself would never do, so an
+    unnamed row is fair game and a named one is not.
+    """
+    cg = await make_cluster_group(conn)
+    src = await make_user(conn, cluster_group_id=cg)
+    tgt = await make_user(conn, cluster_group_id=cg)
+    await make_synced_pair(conn, src, tgt)
+
+    named_group = await make_person_group(conn, cg)
+    await make_person(conn, tgt, named_group, name="Someone the target named")
+
+    unnamed_group = await make_person_group(conn, cg)
+    await make_person(conn, tgt, unnamed_group, name="")
+
+    assert await cleanup_orphaned_persons(conn) == 1
+
+    survivors = {
+        r["personGroupId"] for r in await conn.fetch(
+            'SELECT "personGroupId" FROM person WHERE "ownerId" = $1', tgt
+        )
+    }
+    assert named_group in survivors
+    assert unnamed_group not in survivors

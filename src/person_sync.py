@@ -239,7 +239,11 @@ async def sync_person_thumbnails(conn: asyncpg.Connection) -> int:
 
 
 async def cleanup_orphaned_persons(conn: asyncpg.Connection) -> int:
-    """Remove sidecar-created person rows that no longer have any faces.
+    """Remove unnamed target person rows that no longer have any faces.
+
+    This is what lets an emptied person group be collected at all: Immich's
+    ``deleteEmptyGroups`` drops groups with no *person* rows, so while the
+    sidecar's row sits there the group survives as a person with no photos.
 
     Safety: only delete a person row when its group has NO remaining faces at
     all, owned by anyone. Immich sets ``asset_face."personGroupId"`` to NULL
@@ -266,11 +270,24 @@ async def cleanup_orphaned_persons(conn: asyncpg.Connection) -> int:
     asset sync that produces the first mapped asset). That row is simply
     skipped by this sweep until the map catches up — harmless and
     self-correcting, unlike widening the DELETE's scope to compensate.
+
+    Names are the one piece of provenance left. Nothing here proves the
+    sidecar *created* the row it is about to delete — ``_face_sync_person_map``
+    carried that and v3.2.0 retired it — and the three guards above are all
+    satisfied by a person the target user found on their own photos and then
+    deleted the photos of. So a named row is never touched, on the same
+    principle prune_inflated_people.py uses: a name means a human decided this
+    person was real. ``ensure_target_person`` creates rows with an empty name,
+    and sync_person_names only fills one when the group still carries a synced
+    face, which this sweep requires to be gone. The cost is that a named
+    person can outlive its last face as an empty entry in the target's people
+    list, which the target user can delete themselves.
     """
     deleted = await conn.fetch(
         """
         DELETE FROM person t
-        WHERE EXISTS (
+        WHERE t.name = ''
+          AND EXISTS (
               SELECT 1 FROM _face_sync_asset_map m
               WHERE m.target_user_id = t."ownerId"
           )
