@@ -182,5 +182,17 @@ class Settings(BaseSettings):
             ))
         return jobs
 
+    @property
+    def configured_user_ids(self) -> list[UUID]:
+        """Every distinct user the sidecar touches, across all jobs.
+
+        Order-preserving so the startup error names users in config order.
+        """
+        return list(dict.fromkeys(
+            uid
+            for job in self.sync_jobs
+            for uid in (job.source_user_id, job.target_user_id)
+        ))
+
 
 settings = Settings()

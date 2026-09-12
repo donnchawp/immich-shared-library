@@ -15,8 +15,10 @@ Two things follow, and both have bitten:
 """
 from uuid import uuid4
 
+import src.cleanup as cleanup_mod
+from src.asset_sync import _sync_asset_files
 from src.config import SyncJob
-from tests.conftest import make_asset, make_cluster_group, make_synced_pair, make_user
+from tests.conftest import make_asset, make_synced_pair
 
 SRC_PREFIX = "/external_library/donncha/shared/"
 TGT_PREFIX = "/external_library/tester/donncha/"
@@ -40,12 +42,9 @@ async def _add_file(conn, asset_id, file_type, path):
     )
 
 
-async def test_sidecar_row_is_created_with_a_remapped_path(conn):
-    from src.asset_sync import _sync_asset_files
+async def test_sidecar_row_is_created_with_a_remapped_path(conn, pair):
 
-    cg = await make_cluster_group(conn)
-    src = await make_user(conn, cluster_group_id=cg)
-    tgt = await make_user(conn, cluster_group_id=cg)
+    cg, src, tgt = pair
     src_asset = await make_asset(conn, src, original_path=f"{SRC_PREFIX}p.jpg")
     tgt_asset = await make_asset(conn, tgt, original_path=f"{TGT_PREFIX}p.jpg")
     await _add_file(conn, src_asset, "sidecar", f"{SRC_PREFIX}p.jpg.xmp")
@@ -59,13 +58,10 @@ async def test_sidecar_row_is_created_with_a_remapped_path(conn):
     assert path == f"{TGT_PREFIX}p.jpg.xmp"
 
 
-async def test_sidecar_path_is_not_returned_for_rollback_cleanup(conn):
+async def test_sidecar_path_is_not_returned_for_rollback_cleanup(conn, pair):
     """The returned paths get unlinked on rollback. The XMP is not ours to delete."""
-    from src.asset_sync import _sync_asset_files
 
-    cg = await make_cluster_group(conn)
-    src = await make_user(conn, cluster_group_id=cg)
-    tgt = await make_user(conn, cluster_group_id=cg)
+    cg, src, tgt = pair
     src_asset = await make_asset(conn, src, original_path=f"{SRC_PREFIX}p.jpg")
     tgt_asset = await make_asset(conn, tgt, original_path=f"{TGT_PREFIX}p.jpg")
     await _add_file(conn, src_asset, "sidecar", f"{SRC_PREFIX}p.jpg.xmp")
@@ -75,13 +71,10 @@ async def test_sidecar_path_is_not_returned_for_rollback_cleanup(conn):
     assert all(".xmp" not in p for p in created), created
 
 
-async def test_sidecar_outside_the_job_prefix_is_skipped(conn):
+async def test_sidecar_outside_the_job_prefix_is_skipped(conn, pair):
     """A path the job prefixes cannot remap must not be guessed at."""
-    from src.asset_sync import _sync_asset_files
 
-    cg = await make_cluster_group(conn)
-    src = await make_user(conn, cluster_group_id=cg)
-    tgt = await make_user(conn, cluster_group_id=cg)
+    cg, src, tgt = pair
     src_asset = await make_asset(conn, src, original_path=f"{SRC_PREFIX}p.jpg")
     tgt_asset = await make_asset(conn, tgt, original_path=f"{TGT_PREFIX}p.jpg")
     await _add_file(conn, src_asset, "sidecar", "/somewhere/else/p.jpg.xmp")
@@ -95,17 +88,13 @@ async def test_sidecar_outside_the_job_prefix_is_skipped(conn):
     assert rows == 0
 
 
-async def test_cleanup_never_unlinks_a_sidecar_path(conn, monkeypatch):
+async def test_cleanup_never_unlinks_a_sidecar_path(conn, pair, monkeypatch):
     """cleanup_deleted_assets must not hand the XMP to remove_hardlinks.
 
     The target XMP path resolves through the external-library symlink to the
     source user's own file, so unlinking it destroys source data.
     """
-    import src.cleanup as cleanup_mod
-
-    cg = await make_cluster_group(conn)
-    src = await make_user(conn, cluster_group_id=cg)
-    tgt = await make_user(conn, cluster_group_id=cg)
+    cg, src, tgt = pair
     src_asset = await make_asset(conn, src)
     tgt_asset = await make_asset(conn, tgt)
 
@@ -128,37 +117,15 @@ async def test_cleanup_never_unlinks_a_sidecar_path(conn, monkeypatch):
     assert all(".xmp" not in p for p in handed_over), handed_over
 
 
-async def test_delete_synced_never_unlinks_a_sidecar_path(conn, monkeypatch):
-    """The same guarantee as above, for the interactive bulk-delete tool.
+async def test_delete_synced_deletes_assets_through_the_shared_helper():
+    """delete_synced.py must not grow its own copy of the asset deletion.
 
-    delete_synced.py is the higher-consequence path -- it removes every synced
-    asset for a user in one go -- and it kept handing XMP paths to
-    remove_hardlinks long after cleanup.py stopped. remove_hardlinks rejects
-    them today via validate_path_within_upload, so this test pins the
-    behaviour at the SQL, where the reason lives, rather than at the backstop.
+    It is the higher-consequence path -- it removes every synced asset for a
+    user in one go -- and it once kept handing XMP paths to remove_hardlinks
+    long after cleanup.py stopped, because it carried a hand-maintained
+    duplicate of cleanup_deleted_assets' body. The sidecar guarantee above is
+    tested once, at the helper; this pins the only way it can drift again.
     """
     import delete_synced as delete_synced_mod
 
-    cg = await make_cluster_group(conn)
-    src = await make_user(conn, cluster_group_id=cg)
-    tgt = await make_user(conn, cluster_group_id=cg)
-    tgt_asset = await make_asset(conn, tgt)
-
-    await _add_file(conn, tgt_asset, "thumbnail", "/data/thumbs/t/aa/bb/x_thumbnail.webp")
-    await _add_file(conn, tgt_asset, "sidecar", f"{TGT_PREFIX}p.jpg.xmp")
-    await conn.execute(
-        """
-        INSERT INTO _face_sync_asset_map
-            (source_asset_id, target_asset_id, source_user_id, target_user_id, synced_at)
-        VALUES ($1, $2, $3, $4, NOW())
-        """,
-        await make_asset(conn, src), tgt_asset, src, tgt,
-    )
-
-    handed_over: list[str] = []
-    monkeypatch.setattr(delete_synced_mod, "remove_hardlinks", handed_over.extend)
-
-    assert await delete_synced_mod.delete_synced_asset(conn, tgt_asset) is True
-
-    assert handed_over, "delete_synced_asset handed over no paths at all"
-    assert all(".xmp" not in p for p in handed_over), handed_over
+    assert delete_synced_mod.delete_target_asset is cleanup_mod.delete_target_asset

@@ -5,7 +5,7 @@ import pytest
 
 from src.cleanup import cleanup_deleted_assets, cleanup_reassigned_faces, cleanup_stale_mappings
 from tests.conftest import (
-    make_cluster_group, make_asset, make_face, make_person, make_person_group,
+    make_asset, make_face, make_person, make_person_group,
     make_synced_pair, make_user,
 )
 
@@ -18,10 +18,8 @@ async def _link(conn, src_asset, tgt_asset, src_user, tgt_user):
     )
 
 
-async def test_propagates_a_source_reassignment(conn):
-    cg = await make_cluster_group(conn)
-    src = await make_user(conn, cluster_group_id=cg)
-    tgt = await make_user(conn, cluster_group_id=cg)
+async def test_propagates_a_source_reassignment(conn, pair):
+    cg, src, tgt = pair
     old_pg = await make_person_group(conn, cg)
     new_pg = await make_person_group(conn, cg)
 
@@ -50,14 +48,12 @@ async def test_propagates_a_source_reassignment(conn):
     assert await cleanup_reassigned_faces(conn) == 0
 
 
-async def test_is_a_no_op_when_already_in_sync(conn):
+async def test_is_a_no_op_when_already_in_sync(conn, pair):
     """A no-op stays a no-op. Weaker than the convergence guard in
     test_propagates_a_source_reassignment (which proves a real write does not
     get re-flagged on the next cycle — the actual shape of bug 851005b); this
     only covers the case where there was never anything to reconcile."""
-    cg = await make_cluster_group(conn)
-    src = await make_user(conn, cluster_group_id=cg)
-    tgt = await make_user(conn, cluster_group_id=cg)
+    cg, src, tgt = pair
     pg = await make_person_group(conn, cg)
 
     src_asset = await make_asset(conn, src)
@@ -70,10 +66,8 @@ async def test_is_a_no_op_when_already_in_sync(conn):
     assert await cleanup_reassigned_faces(conn) == 0
 
 
-async def test_propagates_an_unassignment(conn):
-    cg = await make_cluster_group(conn)
-    src = await make_user(conn, cluster_group_id=cg)
-    tgt = await make_user(conn, cluster_group_id=cg)
+async def test_propagates_an_unassignment(conn, pair):
+    cg, src, tgt = pair
     pg = await make_person_group(conn, cg)
 
     src_asset = await make_asset(conn, src)
@@ -89,15 +83,13 @@ async def test_propagates_an_unassignment(conn):
     assert now is None
 
 
-async def test_does_not_assign_a_group_the_target_has_no_person_row_on(conn):
+async def test_does_not_assign_a_group_the_target_has_no_person_row_on(conn, pair):
     """Phase 4 must not point a target face at a group the target user has no
     ``person`` row on: with no row, Immich's deleteEmptyGroups can drop the
     group and null the face. Phase 2 creates that row, but it runs in its own
     transaction and may have failed, so Phase 4 states the precondition itself.
     """
-    cg = await make_cluster_group(conn)
-    src = await make_user(conn, cluster_group_id=cg)
-    tgt = await make_user(conn, cluster_group_id=cg)
+    cg, src, tgt = pair
     old_pg = await make_person_group(conn, cg)
     new_pg = await make_person_group(conn, cg)
 
@@ -166,7 +158,7 @@ async def test_one_undeletable_asset_does_not_poison_the_cleanup_transaction(con
     ) == 1
 
 
-async def test_stale_mapping_is_pruned_only_when_the_target_is_hard_deleted(conn):
+async def test_stale_mapping_is_pruned_only_when_the_target_is_hard_deleted(conn, pair):
     """The Phase 0 contract, in one test: hard-deleted goes, trashed stays.
 
     The trashed half is the subtle one and was only ever asserted in a
@@ -174,9 +166,7 @@ async def test_stale_mapping_is_pruned_only_when_the_target_is_hard_deleted(conn
     trash has to find its original mapping intact — pruning there would make
     the source re-sync and create a second copy alongside the restored one.
     """
-    cg = await make_cluster_group(conn)
-    src = await make_user(conn, cluster_group_id=cg)
-    tgt = await make_user(conn, cluster_group_id=cg)
+    cg, src, tgt = pair
 
     # Hard-deleted: the id was never inserted into `asset`, which is what a
     # mapping looks like once Immich has emptied the trash.
@@ -201,7 +191,7 @@ async def test_stale_mapping_is_pruned_only_when_the_target_is_hard_deleted(conn
     assert live_tgt in remaining
 
 
-async def test_phase_2_would_have_wedged_on_the_mapping_phase_0_prunes(conn):
+async def test_phase_2_would_have_wedged_on_the_mapping_phase_0_prunes(conn, pair):
     """Why Phase 0 exists, demonstrated rather than asserted about.
 
     The stale mapping's target asset does not exist, so inserting a face for
@@ -212,9 +202,7 @@ async def test_phase_2_would_have_wedged_on_the_mapping_phase_0_prunes(conn):
     a live foreign-key hazard and not a theoretical one, and then the prune is
     shown to remove it.
     """
-    cg = await make_cluster_group(conn)
-    src = await make_user(conn, cluster_group_id=cg)
-    tgt = await make_user(conn, cluster_group_id=cg)
+    cg, src, tgt = pair
     _, dead_target = await make_synced_pair(conn, src, tgt, target_asset_id=uuid4())
 
     await conn.execute("SAVEPOINT probe")

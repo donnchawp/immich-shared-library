@@ -9,7 +9,7 @@ from src.db import acquire, close_pool, execute, fetch_one, init_pool, reset_poo
 from src.health import start_health_server, stop_health_server
 from src.immich_api import ImmichAPI
 from src.schema import validate_cluster_group, validate_schema
-from src.sync_engine import _configured_user_ids, run_full_sync
+from src.sync_engine import run_full_sync
 
 logger = logging.getLogger(__name__)
 
@@ -279,12 +279,6 @@ async def validate_user_and_library_ids() -> None:
                     f"{album['owner_id']}, not target_user_id {job.target_user_id}"
                 )
 
-    # Reciprocal pairs (A -> B and B -> A) used to warn here, because person
-    # visibility was source-authoritative in both directions and an isHidden
-    # disagreement would flip once per cycle. Visibility is now per-user and
-    # nothing in a cycle overwrites it, so the warning no longer applies.
-    # Everything Phase 3 still does is fill-only.
-
     logger.info("Configuration validated: users, libraries, and albums exist and are correctly associated")
 
 
@@ -369,9 +363,13 @@ async def main() -> None:
     await init_pool()
     await ensure_tracking_tables()
     await validate_schema()
-    async with acquire() as conn:
-        await validate_cluster_group(conn, _configured_user_ids())
+    # Users and libraries first: both this and validate_cluster_group reject a
+    # missing user, but only this one can say which job and which side it came
+    # from. validate_cluster_group keeps its own check for the per-cycle call
+    # in sync_engine, where this function never runs.
     await validate_user_and_library_ids()
+    async with acquire() as conn:
+        await validate_cluster_group(conn, settings.configured_user_ids)
 
     await start_health_server()
 

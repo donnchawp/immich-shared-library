@@ -215,9 +215,7 @@ async def sync_person_thumbnails(conn: asyncpg.Connection) -> int:
         WHERE s."thumbnailPath" <> ''
           AND t."thumbnailPath" = ''
         """
-        + _SYNCED_GROUP_SCOPE
-        + """
-        """,
+        + _SYNCED_GROUP_SCOPE,
     )
 
     count = 0

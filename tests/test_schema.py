@@ -1,3 +1,5 @@
+from uuid import uuid4
+
 import pytest
 
 from src.schema import SchemaValidationError, validate_cluster_group, validate_schema
@@ -25,7 +27,6 @@ async def test_different_cluster_groups_raise(conn):
 
 
 async def test_missing_user_raises(conn):
-    from uuid import uuid4
     alice = await make_user(conn)
 
     with pytest.raises(SchemaValidationError, match="not found"):

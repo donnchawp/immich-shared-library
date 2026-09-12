@@ -17,16 +17,14 @@ from src.person_sync import cleanup_orphaned_persons, sync_person_names
 from src import sync_engine
 from src.sync_engine import _sync_faces_guarded
 from tests.conftest import (
-    make_asset, make_cluster_group, make_face, make_person, make_person_group,
+    make_asset, make_face, make_person, make_person_group,
     make_synced_pair, make_user,
 )
 
 
-async def test_full_face_flow_converges(conn):
+async def test_full_face_flow_converges(conn, pair):
     """Sync a face, rename at source, reassign at source -- all must converge."""
-    cg = await make_cluster_group(conn)
-    src = await make_user(conn, cluster_group_id=cg)
-    tgt = await make_user(conn, cluster_group_id=cg)
+    cg, src, tgt = pair
     pg = await make_person_group(conn, cg)
     await make_person(conn, src, pg, name="")
 
@@ -212,7 +210,7 @@ async def test_real_migration_path_is_a_no_op_once_already_current(
     assert table is not None
 
 
-async def test_a_face_failure_keeps_the_batch_alive_and_defers_to_phase_2(conn):
+async def test_a_face_failure_keeps_the_batch_alive_and_defers_to_phase_2(conn, pair):
     """Phase 1's face copy must run under its own savepoint.
 
     sync_asset releases its savepoint before returning, so the face copy used
@@ -222,9 +220,7 @@ async def test_a_face_failure_keeps_the_batch_alive_and_defers_to_phase_2(conn):
     only looks at pairs where a source face is newer than synced_at, so
     without the rewind the asset would stay faceless forever.
     """
-    cg = await make_cluster_group(conn)
-    src = await make_user(conn, cluster_group_id=cg)
-    tgt = await make_user(conn, cluster_group_id=cg)
+    cg, src, tgt = pair
     pg = await make_person_group(conn, cg)
     await make_person(conn, src, pg)
 
@@ -260,11 +256,9 @@ async def test_a_face_failure_keeps_the_batch_alive_and_defers_to_phase_2(conn):
     ) == pg
 
 
-async def test_the_face_guard_is_transparent_on_success(conn):
+async def test_the_face_guard_is_transparent_on_success(conn, pair):
     """The savepoint must not swallow the happy path."""
-    cg = await make_cluster_group(conn)
-    src = await make_user(conn, cluster_group_id=cg)
-    tgt = await make_user(conn, cluster_group_id=cg)
+    cg, src, tgt = pair
     pg = await make_person_group(conn, cg)
     await make_person(conn, src, pg)
 
@@ -278,7 +272,7 @@ async def test_the_face_guard_is_transparent_on_success(conn):
     ) == pg
 
 
-async def test_v4_migration_strips_copied_embeddings_and_reclassifies(
+async def test_v4_migration_strips_copied_embeddings_and_reclassifies(pair, 
     conn, route_main_db_calls_through_conn
 ):
     """An upgrade must retire the twins already in the database.
@@ -288,9 +282,7 @@ async def test_v4_migration_strips_copied_embeddings_and_reclassifies(
     against minFaces. Fixing only new copies would leave every existing one
     distorting the next cluster-wide reset.
     """
-    cg = await make_cluster_group(conn)
-    src = await make_user(conn, cluster_group_id=cg)
-    tgt = await make_user(conn, cluster_group_id=cg)
+    cg, src, tgt = pair
     src_asset, tgt_asset = await make_synced_pair(conn, src, tgt)
 
     embedding = "[" + ",".join(["0.1"] * 512) + "]"
@@ -346,11 +338,9 @@ async def test_v4_migration_strips_copied_embeddings_and_reclassifies(
     ) == str(main_module.SCHEMA_VERSION)
 
 
-async def test_v4_migration_is_idempotent(conn):
+async def test_v4_migration_is_idempotent(conn, pair):
     """Re-running finds nothing left to strip."""
-    cg = await make_cluster_group(conn)
-    src = await make_user(conn, cluster_group_id=cg)
-    tgt = await make_user(conn, cluster_group_id=cg)
+    cg, src, tgt = pair
     src_asset, tgt_asset = await make_synced_pair(conn, src, tgt)
     tgt_face = await make_face(conn, tgt_asset)
     await conn.execute(
@@ -407,7 +397,7 @@ async def test_phase_0_prunes_the_stale_mapping_before_phase_2_reads_it(conn, mo
     assert calls.index("phase0") < calls.index("phase4_assets")
 
 
-async def test_a_failed_phase_4_step_does_not_undo_the_deletions_before_it(conn, monkeypatch):
+async def test_a_failed_phase_4_step_does_not_undo_the_deletions_before_it(conn, pair, monkeypatch):
     """Phase 4's steps share a transaction but must not share a fate.
 
     cleanup_deleted_assets unlinks thumbnails before deleting the rows that
@@ -417,9 +407,7 @@ async def test_a_failed_phase_4_step_does_not_undo_the_deletions_before_it(conn,
     the failure is deterministic. The marker row here stands in for that
     committed-in-spirit work: it must survive the later failure.
     """
-    cg = await make_cluster_group(conn)
-    src = await make_user(conn, cluster_group_id=cg)
-    tgt = await make_user(conn, cluster_group_id=cg)
+    cg, src, tgt = pair
     orphan = await make_asset(conn, tgt)
     await make_synced_pair(conn, src, tgt, target_asset_id=orphan)
 

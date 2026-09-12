@@ -38,105 +38,107 @@ async def sync_faces_for_asset(
     if not source_faces:
         return 0
 
-    count = 0
+    # Identity is shared: the group id copies verbatim. We only need to make
+    # sure the target user has their own person row on each group, so Immich's
+    # deleteEmptyGroups doesn't drop it and null these faces.
+    #
+    # Once per *distinct* group, not once per face: the same few people recur
+    # across an asset's faces, and ensure_target_person costs two queries every
+    # time it is asked.
+    resolved: dict[UUID, UUID | None] = {}
+    for group_id in {f["personGroupId"] for f in source_faces if f["personGroupId"] is not None}:
+        # None means the source has no person row for the group; those faces
+        # copy unassigned rather than pointing at a group that may vanish.
+        resolved[group_id] = await ensure_target_person(
+            conn, group_id, source_user_id, target_user_id,
+        )
+
+    # Deduplicate by bounding box before inserting. The NOT EXISTS below cannot
+    # see rows inserted by its own statement, so two source faces sharing a box
+    # would both land — where the per-face loop this replaces inserted the first
+    # and then skipped the second.
+    rows, seen = [], set()
     for face in source_faces:
-        person_group_id = face["personGroupId"]
+        box = (
+            face["boundingBoxX1"], face["boundingBoxY1"],
+            face["boundingBoxX2"], face["boundingBoxY2"],
+        )
+        if box in seen:
+            continue
+        seen.add(box)
+        rows.append((
+            uuid4(), resolved.get(face["personGroupId"]),
+            face["imageWidth"], face["imageHeight"], *box, face["isVisible"],
+        ))
 
-        # Identity is shared: the group id copies verbatim. We only need to make
-        # sure the target user has their own person row on that group, so
-        # Immich's deleteEmptyGroups doesn't drop it and null these faces.
-        if person_group_id is not None:
-            if await ensure_target_person(
-                conn, person_group_id, source_user_id, target_user_id,
-            ) is None:
-                # Source has no person row for this group; copy the face
-                # unassigned rather than pointing at a group that may vanish.
-                person_group_id = None
+    # Two deliberate departures from copying the source row verbatim, both to
+    # keep this copy out of Immich's facial recognition: no face_search row, and
+    # sourceType 'manual' rather than the source's 'machine-learning'. Each is
+    # necessary and neither is sufficient — see the docstring above, and "Why
+    # copied faces are invisible to recognition" in CLAUDE.md for the full
+    # reasoning.
+    #
+    # One statement for the whole asset. The NOT EXISTS keeps the per-face
+    # check-and-insert atomicity that made this a loop in the first place.
+    inserted = await conn.fetch(
+        """
+        INSERT INTO asset_face (
+            id, "assetId", "personGroupId",
+            "imageWidth", "imageHeight",
+            "boundingBoxX1", "boundingBoxY1", "boundingBoxX2", "boundingBoxY2",
+            "sourceType", "isVisible"
+        )
+        SELECT t.id, $1, t.person_group_id, t.image_width, t.image_height,
+               t.x1, t.y1, t.x2, t.y2, 'manual', t.is_visible
+        FROM unnest(
+            $2::uuid[], $3::uuid[], $4::int[], $5::int[],
+            $6::int[], $7::int[], $8::int[], $9::int[], $10::bool[]
+        ) AS t(id, person_group_id, image_width, image_height, x1, y1, x2, y2, is_visible)
+        WHERE NOT EXISTS (
+            SELECT 1 FROM asset_face ex
+            WHERE ex."assetId" = $1
+              AND ex."boundingBoxX1" = t.x1
+              AND ex."boundingBoxY1" = t.y1
+              AND ex."boundingBoxX2" = t.x2
+              AND ex."boundingBoxY2" = t.y2
+        )
+        RETURNING id, "personGroupId"
+        """,
+        target_asset_id, *(list(col) for col in zip(*rows)),
+    )
 
-        # Two deliberate departures from copying the source row verbatim, both
-        # to keep this copy out of Immich's facial recognition:
-        #
-        # No face_search row. searchFaces() inner-joins face_search, so a face
-        # without an embedding is never a candidate. That matters because a copied
-        # embedding is byte-identical to its source — a distance-0 twin — and
-        # recognition counts matches to decide whether a cluster reaches minFaces.
-        # Copying it made every shared face vote twice, so a person in two synced
-        # photos cleared a threshold of 3 and became a person who should not exist.
-        #
-        # sourceType 'manual', not the source's 'machine-learning'. getAllFaces()
-        # only queues machine-learning faces and handleRecognizeFaces() skips
-        # anything else *before* it checks for an embedding, so this is what stops
-        # the copies being queued and failing. It pairs with the missing embedding:
-        # drop one without the other and a cluster-wide reset queues every copy,
-        # each failing with "does not have an embedding".
-        #
-        # Not 'exif' — metadata extraction deletes every exif-sourced face on an
-        # asset and rebuilds it from XMP regions, and the sidecar syncs XMP.
-        #
-        # The cost: the target's faces can no longer be recognized independently.
-        # That is the design (the source is authoritative for identity), but it
-        # means leaving the cluster group needs a face-detection re-run.
-        # Insert face record only if no matching bounding box exists on the target
-        # asset (atomic check-and-insert to avoid TOCTOU race)
-        target_face_id = uuid4()
-        result = await conn.execute(
+    if not inserted:
+        return 0
+
+    # Point each target person's feature photo at a face the target owns.
+    # faceAssetId is still an FK to asset_face.id, so it must never reference
+    # the source user's face row. One face per group: the first inserted, which
+    # is what the per-face loop settled on too, since the second face in a group
+    # found faceAssetId already set and non-dangling.
+    feature: dict[UUID, UUID] = {}
+    for row in inserted:
+        if row["personGroupId"] is not None:
+            feature.setdefault(row["personGroupId"], row["id"])
+
+    if feature:
+        await conn.execute(
             """
-            INSERT INTO asset_face (
-                id, "assetId", "personGroupId",
-                "imageWidth", "imageHeight",
-                "boundingBoxX1", "boundingBoxY1", "boundingBoxX2", "boundingBoxY2",
-                "sourceType", "isVisible"
-            )
-            SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11
-            WHERE NOT EXISTS (
-                SELECT 1 FROM asset_face
-                WHERE "assetId" = $2
-                  AND "boundingBoxX1" = $6
-                  AND "boundingBoxY1" = $7
-                  AND "boundingBoxX2" = $8
-                  AND "boundingBoxY2" = $9
+            UPDATE person p SET "faceAssetId" = t.face_id
+            FROM unnest($1::uuid[], $2::uuid[]) AS t(person_group_id, face_id)
+            WHERE p."ownerId" = $3 AND p."personGroupId" = t.person_group_id AND (
+                p."faceAssetId" IS NULL
+                OR NOT EXISTS (
+                    SELECT 1 FROM asset_face WHERE id = p."faceAssetId"
+                )
             )
             """,
-            target_face_id,
-            target_asset_id,
-            person_group_id,
-            face["imageWidth"],
-            face["imageHeight"],
-            face["boundingBoxX1"],
-            face["boundingBoxY1"],
-            face["boundingBoxX2"],
-            face["boundingBoxY2"],
-            "manual",
-            face["isVisible"],
+            list(feature.keys()), list(feature.values()), target_user_id,
         )
-        if result == "INSERT 0 0":
-            continue
 
-        # Point the target person's feature photo at a face the target owns.
-        # faceAssetId is still an FK to asset_face.id, so it must never
-        # reference the source user's face row.
-        if person_group_id is not None:
-            await conn.execute(
-                """
-                UPDATE person SET "faceAssetId" = $1
-                WHERE "ownerId" = $2 AND "personGroupId" = $3 AND (
-                    "faceAssetId" IS NULL
-                    OR NOT EXISTS (
-                        SELECT 1 FROM asset_face WHERE id = person."faceAssetId"
-                    )
-                )
-                """,
-                target_face_id,
-                target_user_id,
-                person_group_id,
-            )
-
-        count += 1
-
-    if count > 0:
-        logger.debug("Synced %d faces for asset %s -> %s", count, source_asset_id, target_asset_id)
-
-    return count
+    logger.debug(
+        "Synced %d faces for asset %s -> %s", len(inserted), source_asset_id, target_asset_id
+    )
+    return len(inserted)
 
 
 async def sync_faces_for_asset_guarded(
@@ -160,15 +162,12 @@ async def sync_faces_for_asset_guarded(
     rest of the pass — then does so again every cycle, since a pair that
     failed keeps its old watermark and stays in the window.
     """
-    await conn.execute("SAVEPOINT sync_faces")
     try:
-        count = await sync_faces_for_asset(
-            conn, source_asset_id, target_asset_id, source_user_id, target_user_id,
-        )
-        await conn.execute("RELEASE SAVEPOINT sync_faces")
-        return count
+        async with conn.transaction():
+            return await sync_faces_for_asset(
+                conn, source_asset_id, target_asset_id, source_user_id, target_user_id,
+            )
     except Exception:
-        await conn.execute("ROLLBACK TO SAVEPOINT sync_faces")
         logger.exception("Failed to sync faces for asset %s", source_asset_id)
         return None
 
@@ -207,6 +206,8 @@ async def sync_faces_incremental(conn: asyncpg.Connection) -> int:
     )
 
     total = 0
+    done_sources: list[UUID] = []
+    done_targets: list[UUID] = []
     for pair in pairs:
         count = await sync_faces_for_asset_guarded(
             conn, pair["source_asset_id"], pair["target_asset_id"],
@@ -224,11 +225,23 @@ async def sync_faces_incremental(conn: asyncpg.Connection) -> int:
         # window, re-fetched and re-scanned on every cycle forever. The
         # reassignment itself is applied by cleanup_reassigned_faces in Phase
         # 4, which does not use this watermark.
-        await conn.execute(
-            "UPDATE _face_sync_asset_map SET synced_at = NOW() WHERE source_asset_id = $1 AND target_user_id = $2",
-            pair["source_asset_id"],
-            pair["target_user_id"],
-        )
+        done_sources.append(pair["source_asset_id"])
+        done_targets.append(pair["target_user_id"])
         total += count
+
+    # One statement, not one per pair. A reassignment-only pass copies nothing
+    # but still advances every pair it touched, so this is the common case and
+    # it used to cost a round trip each — a source-side recognition reset puts
+    # every synced pair in the window at once.
+    if done_sources:
+        await conn.execute(
+            """
+            UPDATE _face_sync_asset_map m SET synced_at = NOW()
+            FROM unnest($1::uuid[], $2::uuid[]) AS w(source_asset_id, target_user_id)
+            WHERE m.source_asset_id = w.source_asset_id
+              AND m.target_user_id = w.target_user_id
+            """,
+            done_sources, done_targets,
+        )
 
     return total

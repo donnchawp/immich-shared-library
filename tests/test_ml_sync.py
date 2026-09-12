@@ -1,14 +1,14 @@
+from uuid import uuid4
+
 from src.ml_sync import sync_faces_for_asset, sync_faces_incremental
 from tests.conftest import (
-    make_cluster_group, make_asset, make_face, make_person, make_person_group,
-    make_synced_pair, make_user,
+    make_asset, make_face, make_person, make_person_group,
+    make_synced_pair,
 )
 
 
-async def test_copies_person_group_id_verbatim(conn):
-    cg = await make_cluster_group(conn)
-    src = await make_user(conn, cluster_group_id=cg)
-    tgt = await make_user(conn, cluster_group_id=cg)
+async def test_copies_person_group_id_verbatim(conn, pair):
+    cg, src, tgt = pair
     pg = await make_person_group(conn, cg)
     await make_person(conn, src, pg, name="Dad")
 
@@ -25,10 +25,8 @@ async def test_copies_person_group_id_verbatim(conn):
     assert copied == pg
 
 
-async def test_creates_the_target_person_row(conn):
-    cg = await make_cluster_group(conn)
-    src = await make_user(conn, cluster_group_id=cg)
-    tgt = await make_user(conn, cluster_group_id=cg)
+async def test_creates_the_target_person_row(conn, pair):
+    cg, src, tgt = pair
     pg = await make_person_group(conn, cg)
     await make_person(conn, src, pg, name="Dad")
 
@@ -44,10 +42,8 @@ async def test_creates_the_target_person_row(conn):
     assert name == "Dad"
 
 
-async def test_unassigned_face_copies_with_null_group(conn):
-    cg = await make_cluster_group(conn)
-    src = await make_user(conn, cluster_group_id=cg)
-    tgt = await make_user(conn, cluster_group_id=cg)
+async def test_unassigned_face_copies_with_null_group(conn, pair):
+    cg, src, tgt = pair
 
     src_asset = await make_asset(conn, src)
     tgt_asset = await make_asset(conn, tgt)
@@ -62,10 +58,8 @@ async def test_unassigned_face_copies_with_null_group(conn):
     assert copied is None
 
 
-async def test_does_not_duplicate_an_existing_bounding_box(conn):
-    cg = await make_cluster_group(conn)
-    src = await make_user(conn, cluster_group_id=cg)
-    tgt = await make_user(conn, cluster_group_id=cg)
+async def test_does_not_duplicate_an_existing_bounding_box(conn, pair):
+    cg, src, tgt = pair
 
     src_asset = await make_asset(conn, src)
     tgt_asset = await make_asset(conn, tgt)
@@ -81,10 +75,8 @@ async def test_does_not_duplicate_an_existing_bounding_box(conn):
     assert total == 1
 
 
-async def test_sets_face_asset_id_on_the_target_person(conn):
-    cg = await make_cluster_group(conn)
-    src = await make_user(conn, cluster_group_id=cg)
-    tgt = await make_user(conn, cluster_group_id=cg)
+async def test_sets_face_asset_id_on_the_target_person(conn, pair):
+    cg, src, tgt = pair
     pg = await make_person_group(conn, cg)
     await make_person(conn, src, pg, name="Dad")
 
@@ -107,7 +99,7 @@ async def test_sets_face_asset_id_on_the_target_person(conn):
     assert face_asset_id == target_face_id
 
 
-async def test_incremental_sync_skips_mappings_whose_target_asset_is_gone(conn):
+async def test_incremental_sync_skips_mappings_whose_target_asset_is_gone(conn, pair):
     """A hard-deleted target asset must not crash the whole cycle.
 
     Phase 2 reads pairs straight out of _face_sync_asset_map. When the target
@@ -117,12 +109,8 @@ async def test_incremental_sync_skips_mappings_whose_target_asset_is_gone(conn):
     cleanup that would have fixed it never executes. That deadlocks the sidecar
     on every subsequent cycle.
     """
-    from src.ml_sync import sync_faces_incremental
-    from uuid import uuid4
 
-    cg = await make_cluster_group(conn)
-    src = await make_user(conn, cluster_group_id=cg)
-    tgt = await make_user(conn, cluster_group_id=cg)
+    cg, src, tgt = pair
 
     src_asset = await make_asset(conn, src)
     missing_target = uuid4()  # never inserted into asset
@@ -139,13 +127,10 @@ async def test_incremental_sync_skips_mappings_whose_target_asset_is_gone(conn):
     assert await sync_faces_incremental(conn) == 0
 
 
-async def test_incremental_sync_still_syncs_live_pairs(conn):
+async def test_incremental_sync_still_syncs_live_pairs(conn, pair):
     """The guard must not stop real work — pairs with a live target still sync."""
-    from src.ml_sync import sync_faces_incremental
 
-    cg = await make_cluster_group(conn)
-    src = await make_user(conn, cluster_group_id=cg)
-    tgt = await make_user(conn, cluster_group_id=cg)
+    cg, src, tgt = pair
 
     src_asset = await make_asset(conn, src)
     tgt_asset = await make_asset(conn, tgt)
@@ -163,7 +148,7 @@ async def test_incremental_sync_still_syncs_live_pairs(conn):
     assert copied == 1
 
 
-async def test_one_failing_pair_does_not_poison_the_incremental_phase(conn):
+async def test_one_failing_pair_does_not_poison_the_incremental_phase(conn, pair):
     """Phase 2's loop needs the same per-item savepoint as Phase 1's.
 
     A failed statement leaves Postgres in an aborted transaction, so one bad
@@ -172,11 +157,8 @@ async def test_one_failing_pair_does_not_poison_the_incremental_phase(conn):
     every later cycle. The failure must be contained and the good pair must
     still sync.
     """
-    from src.ml_sync import sync_faces_incremental
 
-    cg = await make_cluster_group(conn)
-    src = await make_user(conn, cluster_group_id=cg)
-    tgt = await make_user(conn, cluster_group_id=cg)
+    cg, src, tgt = pair
 
     doomed_src = await make_asset(conn, src)
     doomed_tgt = await make_asset(conn, tgt)
@@ -227,16 +209,14 @@ async def test_one_failing_pair_does_not_poison_the_incremental_phase(conn):
     assert watermarks[good_src] > watermarks[doomed_src]
 
 
-async def test_copied_face_gets_no_embedding(conn):
+async def test_copied_face_gets_no_embedding(conn, pair):
     """A copy must not be a facial-recognition candidate.
 
     searchFaces() inner-joins face_search, and a copied embedding would be
     byte-identical to its source — a distance-0 twin that votes a second time
     when recognition counts matches against minFaces.
     """
-    cg = await make_cluster_group(conn)
-    src = await make_user(conn, cluster_group_id=cg)
-    tgt = await make_user(conn, cluster_group_id=cg)
+    cg, src, tgt = pair
     pg = await make_person_group(conn, cg)
     await make_person(conn, src, pg, name="Dad")
 
@@ -265,15 +245,13 @@ async def test_copied_face_gets_no_embedding(conn):
     assert copied_embeddings == 0
 
 
-async def test_copied_face_is_not_machine_learning(conn):
+async def test_copied_face_is_not_machine_learning(conn, pair):
     """Recognition skips a non-machine-learning face before it looks for an
     embedding, so this is what keeps the copies out of the queue rather than
     failing in it. 'manual' and not 'exif': metadata extraction deletes every
     exif-sourced face on an asset and rebuilds it from XMP regions.
     """
-    cg = await make_cluster_group(conn)
-    src = await make_user(conn, cluster_group_id=cg)
-    tgt = await make_user(conn, cluster_group_id=cg)
+    cg, src, tgt = pair
 
     src_asset = await make_asset(conn, src)
     tgt_asset = await make_asset(conn, tgt)
@@ -289,7 +267,7 @@ async def test_copied_face_is_not_machine_learning(conn):
     ) == "manual"
 
 
-async def test_a_reassignment_only_pass_still_advances_the_watermark(conn):
+async def test_a_reassignment_only_pass_still_advances_the_watermark(conn, pair):
     """A pair that copies nothing must still leave the Phase 2 window.
 
     Reassigning a source face to a different person group bumps
@@ -299,9 +277,7 @@ async def test_a_reassignment_only_pass_still_advances_the_watermark(conn):
     permanently, re-fetched and re-scanned on every cycle for the life of the
     install. The reassignment itself is Phase 4's job, not this one's.
     """
-    cg = await make_cluster_group(conn)
-    src = await make_user(conn, cluster_group_id=cg)
-    tgt = await make_user(conn, cluster_group_id=cg)
+    cg, src, tgt = pair
     first = await make_person_group(conn, cg)
     second = await make_person_group(conn, cg)
     await make_person(conn, src, first)

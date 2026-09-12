@@ -3,7 +3,7 @@
 Delete all synced assets for a target user.
 
 Removes every asset the sync engine created for a given target user,
-along with mirrored persons and their thumbnail hardlinks. Does NOT
+along with synced persons and their thumbnail hardlinks. Does NOT
 mark sources as skipped — running the sync engine again will recreate
 the assets, which is the expected behavior for a "reset" operation.
 
@@ -13,36 +13,20 @@ Usage:
 import asyncio
 import os
 import sys
-from pathlib import Path
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(__file__))
 
-# Load .env before importing anything from src: src.config builds its settings
-# singleton at import time, so the environment has to be populated first.
-#
-# A missing .env is not fatal here, only in main(). Importing this module must
-# stay side-effect-free enough for the test suite to reach the functions below
-# — .env is gitignored, so an import-time sys.exit would make every test of
-# this file pass only on a machine that happens to have one.
-ENV_FILE = Path(__file__).parent / ".env"
+from src.env_bootstrap import ENV_FILE, bootstrap
 
-if ENV_FILE.exists():
-    for line in ENV_FILE.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        key, _, value = line.partition("=")
-        if key and value:
-            os.environ.setdefault(key.strip(), value.strip())
-
-os.environ.setdefault("SYNC_INTERVAL_SECONDS", "9999")
+bootstrap()
 
 import logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", stream=sys.stdout)
 
+from src.cleanup import delete_target_asset
 from src.db import init_pool, close_pool, fetch_all, fetch_one, transaction
-from src.file_ops import owned_file_paths, remove_hardlinks
+from src.file_ops import remove_hardlinks
 from src.main import ensure_tracking_tables
 from src.person_sync import delete_target_person_in_shared_group
 
@@ -68,14 +52,14 @@ async def get_synced_assets(target_user_id) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-async def get_mirrored_persons(target_user_id) -> list[dict]:
+async def get_synced_persons(target_user_id) -> list[dict]:
     """Get sidecar-created target persons for a target user.
 
     v3.2.0 cluster groups: person identity is Immich's shared person_group,
-    so there is no more person-mapping table. A "mirrored person" is
-    identified structurally: a person row owned by this target user, on a
-    personGroupId that a paired source user (per _face_sync_asset_map) also
-    has a person row for.
+    so there is no more person-mapping table. Such a person is identified
+    structurally: a person row owned by this target user, on a personGroupId
+    that a paired source user (per _face_sync_asset_map) also has a person
+    row for.
 
     Note this is the inverse of cleanup_orphaned_persons' selection, which
     wants groups no mapped source holds any more. This listing is advisory
@@ -96,64 +80,17 @@ async def get_mirrored_persons(target_user_id) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-async def delete_synced_asset(conn, target_asset_id) -> bool:
-    """Delete a synced target asset.
-
-    Follows the same pattern as cleanup_deleted_assets:
-    remove hardlinks -> delete album_asset -> delete asset (cascades) -> delete mapping.
-    Does NOT insert into _face_sync_skipped.
-
-    Caller batches these inside one transaction(), so the failure path needs a
-    SAVEPOINT: without one, Postgres aborts the whole transaction on the first
-    error and every later statement raises InFailedSQLTransactionError. Same
-    pattern as sync_asset (src/asset_sync.py).
-    """
-    await conn.execute("SAVEPOINT delete_synced_asset")
-    try:
-        # Paths we created and may delete — excludes the XMP sidecar, which
-        # is not ours. See file_ops.owned_file_paths.
-        file_paths = await owned_file_paths(conn, target_asset_id)
-
-        # Remove hardlinked files first
-        remove_hardlinks(file_paths)
-
-        # Remove from albums
-        await conn.execute(
-            'DELETE FROM album_asset WHERE "assetId" = $1',
-            target_asset_id,
-        )
-
-        # Delete the target asset (cascades to exif, files, faces, smart_search, job_status)
-        await conn.execute("DELETE FROM asset WHERE id = $1", target_asset_id)
-
-        # Remove the mapping
-        await conn.execute(
-            "DELETE FROM _face_sync_asset_map WHERE target_asset_id = $1",
-            target_asset_id,
-        )
-
-        await conn.execute("RELEASE SAVEPOINT delete_synced_asset")
-        return True
-    except Exception:
-        await conn.execute("ROLLBACK TO SAVEPOINT delete_synced_asset")
-        logging.getLogger(__name__).exception(
-            "Failed to delete synced asset %s", target_asset_id
-        )
-        return False
-
-
-async def delete_mirrored_person(conn, target_user_id, person_group_id) -> str:
-    """Delete a mirrored person's row and its thumbnail hardlink.
+async def delete_synced_person(conn, target_user_id, person_group_id) -> str:
+    """Delete a synced person's row and its thumbnail hardlink.
 
     person's PK is now ("ownerId", "personGroupId") - there is no person.id.
 
     The guard lives in delete_target_person_in_shared_group
     (src/person_sync.py), which is where its two conditions are explained and
-    tested. It is NOT the same shape as cleanup_orphaned_persons' guard, and
-    an earlier version of this docstring claimed it was: this one requires a
-    mapped source to still hold a person row on the group (which is what
-    stops deleteEmptyGroups nulling the group's faces) and only then refuses
-    on the target's own remaining faces.
+    tested. It is NOT the same shape as cleanup_orphaned_persons' guard: this
+    one requires a mapped source to still hold a person row on the group
+    (which is what stops deleteEmptyGroups nulling the group's faces) and only
+    then refuses on the target's own remaining faces.
 
     Returns "deleted", "skipped" (guard refused, or row already gone), or
     "failed".
@@ -164,35 +101,30 @@ async def delete_mirrored_person(conn, target_user_id, person_group_id) -> str:
     than the alternative failure here, which is an orphaned hardlink costing
     nothing.
 
-    SAVEPOINT for the same reason as delete_synced_asset: the caller runs a
+    Savepointed for the same reason as delete_target_asset: the caller runs a
     whole batch inside one transaction(), and a bare except would leave the
     transaction aborted for every later item.
     """
-    await conn.execute("SAVEPOINT delete_mirrored_person")
     try:
-        person = await conn.fetchrow(
-            'SELECT "thumbnailPath" FROM person WHERE "ownerId" = $1 AND "personGroupId" = $2',
-            target_user_id, person_group_id,
-        )
-        if person is None:
-            await conn.execute("RELEASE SAVEPOINT delete_mirrored_person")
-            return "skipped"
+        async with conn.transaction():
+            person = await conn.fetchrow(
+                'SELECT "thumbnailPath" FROM person WHERE "ownerId" = $1 AND "personGroupId" = $2',
+                target_user_id, person_group_id,
+            )
+            if person is None:
+                return "skipped"
 
-        if not await delete_target_person_in_shared_group(
-            conn, target_user_id, person_group_id,
-        ):
-            await conn.execute("RELEASE SAVEPOINT delete_mirrored_person")
-            return "skipped"
+            if not await delete_target_person_in_shared_group(
+                conn, target_user_id, person_group_id,
+            ):
+                return "skipped"
 
-        if person["thumbnailPath"]:
-            remove_hardlinks([person["thumbnailPath"]])
-
-        await conn.execute("RELEASE SAVEPOINT delete_mirrored_person")
+            if person["thumbnailPath"]:
+                remove_hardlinks([person["thumbnailPath"]])
         return "deleted"
     except Exception:
-        await conn.execute("ROLLBACK TO SAVEPOINT delete_mirrored_person")
         logging.getLogger(__name__).exception(
-            "Failed to delete mirrored person %s for user %s", person_group_id, target_user_id
+            "Failed to delete synced person %s for user %s", person_group_id, target_user_id
         )
         return "failed"
 
@@ -238,10 +170,10 @@ async def main():
 
     # Step 2: Show summary
     assets = await get_synced_assets(target_user_id)
-    persons = await get_mirrored_persons(target_user_id)
+    persons = await get_synced_persons(target_user_id)
 
     print(f"\n  Synced assets:    {len(assets)}")
-    print(f"  Mirrored persons: {len(persons)}")
+    print(f"  Synced persons:   {len(persons)}")
 
     if not assets and not persons:
         print("\nNothing to delete.")
@@ -267,7 +199,7 @@ async def main():
             print(f"    DELETE target={a['target_asset_id']}")
         if len(assets) > 20:
             print(f"    ... and {len(assets) - 20} more")
-        print(f"  {len(persons)} mirrored person(s)")
+        print(f"  {len(persons)} synced person(s)")
         for p in persons[:20]:
             print(f"    DELETE person_group={p['person_group_id']}")
         if len(persons) > 20:
@@ -287,7 +219,7 @@ async def main():
         batch = assets[batch_start:batch_start + batch_size]
         async with transaction() as conn:
             for a in batch:
-                ok = await delete_synced_asset(conn, a["target_asset_id"])
+                ok = await delete_target_asset(conn, a["target_asset_id"])
                 if ok:
                     deleted_assets += 1
                 else:
@@ -296,15 +228,15 @@ async def main():
 
     print(f"\nAssets: {deleted_assets} deleted, {failed_assets} failed.")
 
-    # Phase 2: Delete all mirrored persons
+    # Phase 2: Delete all synced persons
     if persons:
-        print(f"\nDeleting {len(persons)} mirrored person(s)...")
+        print(f"\nDeleting {len(persons)} synced person(s)...")
         deleted_persons = 0
         skipped_persons = 0
         failed_persons = 0
         async with transaction() as conn:
             for p in persons:
-                result = await delete_mirrored_person(conn, target_user_id, p["person_group_id"])
+                result = await delete_synced_person(conn, target_user_id, p["person_group_id"])
                 if result == "deleted":
                     deleted_persons += 1
                 elif result == "skipped":

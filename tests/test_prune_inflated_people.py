@@ -11,11 +11,9 @@ from tests.conftest import (
 )
 
 
-async def _synced_group(conn, *, originals: int, name: str = ""):
+async def _synced_group(conn, pair, *, originals: int, name: str = ""):
     """A person group with `originals` real faces, each mirrored onto a copy."""
-    cg = await make_cluster_group(conn)
-    src = await make_user(conn, cluster_group_id=cg)
-    tgt = await make_user(conn, cluster_group_id=cg)
+    cg, src, tgt = pair
     pg = await make_person_group(conn, cg)
     await make_person(conn, src, pg, name=name)
     await make_person(conn, tgt, pg)
@@ -31,11 +29,11 @@ async def _synced_group(conn, *, originals: int, name: str = ""):
     return pg
 
 
-async def test_group_below_min_faces_on_originals_is_pruned(conn):
+async def test_group_below_min_faces_on_originals_is_pruned(conn, pair):
     """Two real sightings plus their two copies looks like 4 faces to Immich,
     which is what let it clear a threshold of 3. Judged on originals it is 2.
     """
-    pg = await _synced_group(conn, originals=2)
+    pg = await _synced_group(conn, pair, originals=2)
 
     stats = await preview(conn, 3)
     assert stats["groups"] == 1
@@ -48,8 +46,8 @@ async def test_group_below_min_faces_on_originals_is_pruned(conn):
     ) == 0
 
 
-async def test_group_with_enough_originals_is_kept(conn):
-    pg = await _synced_group(conn, originals=3)
+async def test_group_with_enough_originals_is_kept(conn, pair):
+    pg = await _synced_group(conn, pair, originals=3)
 
     assert (await preview(conn, 3))["groups"] == 0
     assert await prune(conn, 3) == 0
@@ -58,9 +56,9 @@ async def test_group_with_enough_originals_is_kept(conn):
     ) == 1
 
 
-async def test_named_group_is_never_pruned(conn):
+async def test_named_group_is_never_pruned(conn, pair):
     """A name means a human judged the person real, however it was clustered."""
-    pg = await _synced_group(conn, originals=1, name="Granny")
+    pg = await _synced_group(conn, pair, originals=1, name="Granny")
 
     assert (await preview(conn, 3))["groups"] == 0
     assert await prune(conn, 3) == 0
@@ -69,9 +67,9 @@ async def test_named_group_is_never_pruned(conn):
     ) == 1
 
 
-async def test_pruning_unassigns_the_faces_rather_than_deleting_them(conn):
+async def test_pruning_unassigns_the_faces_rather_than_deleting_them(conn, pair):
     """The photos and their face boxes must survive -- only the attribution goes."""
-    pg = await _synced_group(conn, originals=2)
+    pg = await _synced_group(conn, pair, originals=2)
     before = await conn.fetchval(
         'SELECT count(*) FROM asset_face WHERE "personGroupId" = $1', pg
     )
@@ -88,9 +86,9 @@ async def test_pruning_unassigns_the_faces_rather_than_deleting_them(conn):
     ) >= 4
 
 
-async def test_preview_changes_nothing(conn):
+async def test_preview_changes_nothing(conn, pair):
     """The dry-run path must be side-effect free."""
-    pg = await _synced_group(conn, originals=1)
+    pg = await _synced_group(conn, pair, originals=1)
 
     await preview(conn, 3)
     await preview(conn, 3)
@@ -103,11 +101,9 @@ async def test_preview_changes_nothing(conn):
     ) == 2
 
 
-async def test_a_group_of_only_copies_is_pruned(conn):
+async def test_a_group_of_only_copies_is_pruned(conn, pair):
     """Zero originals -- the group exists purely because copies were counted."""
-    cg = await make_cluster_group(conn)
-    src = await make_user(conn, cluster_group_id=cg)
-    tgt = await make_user(conn, cluster_group_id=cg)
+    cg, src, tgt = pair
     pg = await make_person_group(conn, cg)
     await make_person(conn, tgt, pg)
 
@@ -122,7 +118,7 @@ async def test_a_group_of_only_copies_is_pruned(conn):
     assert await prune(conn, 3) == 1
 
 
-async def test_a_small_group_holding_no_copy_is_left_alone(conn):
+async def test_a_small_group_holding_no_copy_is_left_alone(conn, pair):
     """Two original faces, below minFaces, and not a copy among them.
 
     The count is deliberately 2, not 3: at 3 the group is kept for the

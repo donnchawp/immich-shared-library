@@ -44,7 +44,7 @@ fi
 # Gather counts
 asset_count=$(psql_cmd "SELECT COUNT(*) FROM _face_sync_asset_map" 2>/dev/null || echo "0")
 # v3.2.0 cluster groups: there is no more person-mapping table. A
-# "mirrored person" is identified structurally, the same way
+# sidecar-created person is identified structurally, the same way
 # cleanup_orphaned_persons (src/person_sync.py) does it: a person row
 # owned by a sidecar-managed target user, on a personGroupId that the
 # paired source user (per _face_sync_asset_map) also has a person row
@@ -64,7 +64,7 @@ skipped_count=$(psql_cmd "SELECT COUNT(*) FROM _face_sync_skipped" 2>/dev/null |
 
 echo "Database:"
 echo "  Synced assets:    $asset_count"
-echo "  Mirrored persons: $person_count"
+echo "  Synced persons:   $person_count"
 echo "  Skipped records:  $skipped_count"
 
 # Find symlinks in external library
@@ -89,7 +89,7 @@ echo ""
 echo "This will:"
 echo "  1. Stop the sidecar container"
 echo "  2. Delete $asset_count synced asset(s) from Immich"
-echo "  3. Delete up to $person_count mirrored person(s) from Immich"
+echo "  3. Delete up to $person_count synced person(s) from Immich"
 echo "  4. Drop all sidecar tracking tables"
 [[ ${#symlinks[@]} -gt 0 ]] && echo "  5. Remove ${#symlinks[@]} symlink(s)"
 echo ""
@@ -122,7 +122,7 @@ if [[ "$asset_count" -gt 0 ]]; then
     "
 fi
 
-# Delete mirrored persons (runs after asset deletion above, so any faces that
+# Delete synced persons (runs after asset deletion above, so any faces that
 # lived only on synced assets are already gone).
 #
 # Two guards, and it is the EXISTS that matters most. Requiring a mapped
@@ -137,7 +137,7 @@ fi
 # Same predicate as delete_target_person_in_shared_group, which is where it
 # is documented and tested; keep the two in step.
 if [[ "$person_count" -gt 0 ]]; then
-    echo "Deleting up to $person_count mirrored person(s)..."
+    echo "Deleting up to $person_count synced person(s)..."
     psql_cmd "
         DELETE FROM person t
         WHERE EXISTS (
@@ -183,4 +183,4 @@ if [[ ${#symlinks[@]} -gt 0 ]]; then
 fi
 
 echo ""
-echo "Reset complete. Run setup.py to reconfigure."
+echo "Reset complete. Run configure.py to reconfigure."

@@ -7,6 +7,48 @@ from src.file_ops import owned_file_paths, remove_hardlinks
 logger = logging.getLogger(__name__)
 
 
+async def delete_target_asset(conn: asyncpg.Connection, target_asset_id) -> bool:
+    """Delete one target asset: its hardlinks, its album rows, the asset, the mapping.
+
+    Files go before records. If the unlink fails the DB records stay and the
+    next cycle retries; if the DB delete fails afterwards, the hardlinks are
+    merely orphan files, which is safe — the source still holds a link to the
+    inode.
+
+    Runs inside its own savepoint. Callers batch these in one transaction, and
+    catching the exception is not enough on its own: a failed statement leaves
+    Postgres in an aborted transaction, so without the rollback every later
+    item dies with InFailedSQLTransactionError and the whole batch unwinds
+    because of one bad asset.
+
+    Returns True if the asset was deleted, False if it failed.
+    """
+    try:
+        async with conn.transaction():
+            # Paths we created and may delete — excludes the XMP sidecar,
+            # which is not ours. See file_ops.owned_file_paths.
+            file_paths = await owned_file_paths(conn, target_asset_id)
+            remove_hardlinks(file_paths)
+
+            # Remove from albums before deleting the asset
+            await conn.execute(
+                'DELETE FROM album_asset WHERE "assetId" = $1',
+                target_asset_id,
+            )
+
+            # Cascades to exif, files, faces, smart_search, job_status
+            await conn.execute("DELETE FROM asset WHERE id = $1", target_asset_id)
+
+            await conn.execute(
+                "DELETE FROM _face_sync_asset_map WHERE target_asset_id = $1",
+                target_asset_id,
+            )
+        return True
+    except Exception:
+        logger.exception("Failed to delete target asset %s", target_asset_id)
+        return False
+
+
 async def cleanup_deleted_assets(conn: asyncpg.Connection) -> int:
     """Remove target assets whose source has been deleted.
 
@@ -28,47 +70,12 @@ async def cleanup_deleted_assets(conn: asyncpg.Connection) -> int:
     count = 0
     for row in orphaned:
         target_id = row["target_asset_id"]
-        source_id = row["source_asset_id"]
-
-        # Per-asset savepoint, same pattern as sync_asset. Catching the
-        # exception is not enough on its own: a failed statement leaves
-        # Postgres in an aborted transaction, so without the rollback every
-        # later iteration dies with InFailedSQLTransactionError and the whole
-        # cleanup unwinds because of one bad asset.
-        await conn.execute("SAVEPOINT cleanup_asset")
-        try:
-            # Paths we created and may delete — excludes the XMP sidecar,
-            # which is not ours. See file_ops.owned_file_paths.
-            file_paths = await owned_file_paths(conn, target_id)
-
-            # Remove hardlinked files first — if this fails, DB records stay
-            # and we can retry next cycle. If DB delete fails after file removal,
-            # the hardlinks are just orphan files (safe, since they're hardlinks
-            # and the source still has a link to the inode).
-            remove_hardlinks(file_paths)
-
-            # Remove from albums before deleting asset
-            await conn.execute(
-                'DELETE FROM album_asset WHERE "assetId" = $1',
-                target_id,
+        if await delete_target_asset(conn, target_id):
+            logger.info(
+                "Cleaned up deleted asset: source=%s target=%s",
+                row["source_asset_id"], target_id,
             )
-
-            # Delete the target asset (cascades to exif, files, faces, smart_search, job_status)
-            await conn.execute("DELETE FROM asset WHERE id = $1", target_id)
-
-            # Remove the mapping
-            await conn.execute(
-                "DELETE FROM _face_sync_asset_map WHERE target_asset_id = $1",
-                target_id,
-            )
-
-            await conn.execute("RELEASE SAVEPOINT cleanup_asset")
-            logger.info("Cleaned up deleted asset: source=%s target=%s", source_id, target_id)
             count += 1
-
-        except Exception:
-            await conn.execute("ROLLBACK TO SAVEPOINT cleanup_asset")
-            logger.exception("Failed to clean up target asset %s", target_id)
 
     return count
 
@@ -116,14 +123,12 @@ async def cleanup_reassigned_faces(conn: asyncpg.Connection) -> int:
     because the bounding box still matches and the group ids now differ
     again. That is intentional, not a bug.
 
-    It is also the last source-authoritative write left. Names are fill-only
-    and visibility is not synced at all, both per-user by design in v3.2.0, so
-    the old justification here -- "the same principle as name/visibility sync"
-    -- no longer holds and has been removed rather than quietly left to rot.
-    The case for keeping this one is narrower and worth stating plainly: the
-    copies carry no embedding and sourceType 'manual', so they cannot
-    re-cluster themselves out of a bad assignment, and the source is the only
-    account whose recognition still runs on these faces.
+    It is also the last source-authoritative write left -- names are fill-only
+    and visibility is not synced at all, both per-user by design in v3.2.0 --
+    so the case for it stands on its own: the copies carry no embedding and
+    sourceType 'manual', so they cannot re-cluster themselves out of a bad
+    assignment, and the source is the only account whose recognition still runs
+    on these faces.
 
     Known limitations, left unhandled because they are edge cases rather than
     correctness defects:

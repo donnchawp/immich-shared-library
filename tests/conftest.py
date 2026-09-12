@@ -48,6 +48,19 @@ async def make_user(conn, *, cluster_group_id: UUID | None = None) -> UUID:
     return uid
 
 
+@pytest_asyncio.fixture
+async def pair(conn) -> tuple[UUID, UUID, UUID]:
+    """A cluster group and a source/target user pair inside it. (cg, src, tgt).
+
+    Almost every test needs exactly this and nothing about it is ever the
+    subject of the test — validate_cluster_group refuses to start on users in
+    different cluster groups, so a shared group is the only interesting shape.
+    Tests wanting a third user still call make_user(conn, cluster_group_id=cg).
+    """
+    cg = await make_cluster_group(conn)
+    return cg, await make_user(conn, cluster_group_id=cg), await make_user(conn, cluster_group_id=cg)
+
+
 async def make_person_group(conn, cluster_group_id: UUID) -> UUID:
     return await conn.fetchval(
         'INSERT INTO person_group (id, "clusterGroupId") VALUES ($1, $2) RETURNING id',

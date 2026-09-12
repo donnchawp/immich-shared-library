@@ -14,26 +14,17 @@ from pathlib import Path
 # Add project root to path
 sys.path.insert(0, os.path.dirname(__file__))
 
-# Load .env file
-env_file = Path(__file__).parent / ".env"
-if not env_file.exists():
+from src.env_bootstrap import bootstrap
+
+if not bootstrap():
     print("Error: .env not found. Copy env.example to .env and fill in your values.")
     sys.exit(1)
-
-for line in env_file.read_text().splitlines():
-    line = line.strip()
-    if not line or line.startswith("#"):
-        continue
-    key, _, value = line.partition("=")
-    if key and value:
-        os.environ.setdefault(key.strip(), value.strip())
 
 # Point CONFIG_FILE at local config.yaml if it exists
 config_yaml = Path(__file__).parent / "config.yaml"
 if config_yaml.is_file():
     os.environ.setdefault("CONFIG_FILE", str(config_yaml))
 
-os.environ.setdefault("SYNC_INTERVAL_SECONDS", "9999")
 os.environ.setdefault("LOG_LEVEL", "DEBUG")
 
 import logging

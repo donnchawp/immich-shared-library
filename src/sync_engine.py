@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 BATCH_SIZE = 500
 
 
-async def _cleanup_step(conn, savepoint: str, fn) -> int:
+async def _cleanup_step(conn, fn) -> int:
     """Run one Phase 4 cleanup inside its own savepoint. Returns its count, or 0.
 
     The steps share a transaction but must not share a fate.
@@ -27,28 +27,13 @@ async def _cleanup_step(conn, savepoint: str, fn) -> int:
     leave Immich showing broken assets, indefinitely if the failure is
     deterministic. This is the same reasoning _sync_faces_guarded applies to
     Phase 1; it just hadn't been carried down here.
-
-    `savepoint` is a literal supplied by the caller below, never user input.
     """
-    await conn.execute(f"SAVEPOINT {savepoint}")
     try:
-        count = await fn(conn)
+        async with conn.transaction():
+            return await fn(conn)
     except Exception:
-        await conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
-        logger.exception("Phase 4 step '%s' failed; the rest of the cycle stands", savepoint)
+        logger.exception("Phase 4 step '%s' failed; the rest of the cycle stands", fn.__name__)
         return 0
-    await conn.execute(f"RELEASE SAVEPOINT {savepoint}")
-    return count
-
-
-def _configured_user_ids() -> list[UUID]:
-    """Every distinct user the sidecar touches, across all jobs."""
-    ids: list[UUID] = []
-    for job in settings.sync_jobs:
-        for uid in (job.source_user_id, job.target_user_id):
-            if uid not in ids:
-                ids.append(uid)
-    return ids
 
 
 async def _sync_faces_guarded(
@@ -147,7 +132,7 @@ async def run_full_sync() -> dict:
                 source_assets = await get_unsynced_source_assets(conn, job)
                 if source_assets and not schema_validated:
                     await validate_schema(conn)
-                    await validate_cluster_group(conn, _configured_user_ids())
+                    await validate_cluster_group(conn, settings.configured_user_ids)
                     schema_validated = True
 
                 # Duplicate detection: skip source assets already in target by filename + capture time
@@ -211,12 +196,9 @@ async def run_full_sync() -> dict:
     # pruned in Phase 0, before any phase read the map. Each step is
     # savepointed — see _cleanup_step for why they must not share a fate.
     async with transaction() as conn:
-        stats["assets_cleaned"] = await _cleanup_step(
-            conn, "cleanup_assets", cleanup_deleted_assets)
-        stats["faces_reassigned"] = await _cleanup_step(
-            conn, "cleanup_faces", cleanup_reassigned_faces)
-        stats["persons_cleaned"] = await _cleanup_step(
-            conn, "cleanup_persons", cleanup_orphaned_persons)
+        stats["assets_cleaned"] = await _cleanup_step(conn, cleanup_deleted_assets)
+        stats["faces_reassigned"] = await _cleanup_step(conn, cleanup_reassigned_faces)
+        stats["persons_cleaned"] = await _cleanup_step(conn, cleanup_orphaned_persons)
 
     if any(v > 0 for v in stats.values()):
         logger.info("Sync complete: %s", stats)

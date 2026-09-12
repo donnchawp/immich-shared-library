@@ -22,6 +22,11 @@ A Python sidecar service that syncs a subset of Immich photos from a source user
 pip install -e .
 ```
 
+The setup wizard is `configure.py`, **not** `setup.py`. Named `setup.py` it was
+executed by pip's build frontend, so `pip install -e .` — and therefore the
+`make test` container — died with `EOFError` on its first `input()` prompt. Do
+not rename it back.
+
 **Run the service (Docker, production mode):**
 ```bash
 docker compose up --build
@@ -65,18 +70,19 @@ The repo has an automated test suite (pytest) run against a scratch `immich_test
 
 3. **Person metadata sync** (`person_sync.py`): `sync_person_names` only fills an *empty* target name — it never overwrites a name the target user set (names are per-user by design in v3.2.0). `sync_person_thumbnails` hardlinks thumbnails that are still empty. **Visibility is deliberately not synced**: `isHidden` is a plain boolean with no "unset" sentinel, so there is no fill-only option, and each user owns their own. The target inherits the source's `isHidden` once, at person creation. `tests/test_person_sync.py::test_no_cycle_function_overwrites_the_target_visibility` discovers and runs every public `async def f(conn)` in `person_sync` to guard this.
 
-4. **Cleanup** (`cleanup.py`, `person_sync.py`): Removes target assets whose source was deleted/trashed, reassigns target faces back to the source's `personGroupId` when they've drifted (`cleanup_reassigned_faces` — the source is authoritative, so a target-side reassignment is reverted next cycle), removes unnamed target persons left with no faces. The three steps share a transaction but each gets its own SAVEPOINT (`_cleanup_step`): `cleanup_deleted_assets` unlinks thumbnails before deleting the rows that name them, and the filesystem does not roll back, so a later step's failure must not restore assets whose files are gone.
+4. **Cleanup** (`cleanup.py`, `person_sync.py`): Removes target assets whose source was deleted/trashed, reassigns target faces back to the source's `personGroupId` when they've drifted (`cleanup_reassigned_faces` — the source is authoritative, so a target-side reassignment is reverted next cycle), removes unnamed target persons left with no faces. The three steps share a transaction but each gets its own savepoint (`_cleanup_step`, via a nested `conn.transaction()` — asyncpg issues a SAVEPOINT when one transaction is nested inside another): `cleanup_deleted_assets` unlinks thumbnails before deleting the rows that name them, and the filesystem does not roll back, so a later step's failure must not restore assets whose files are gone.
 
 ### Key modules
 
-- `sync_engine.py` — Orchestrates the 6 phases, returns stats dict. `_cleanup_step` savepoints each Phase 4 step; the Phase 1 batch loop breaks when a full batch makes no progress, so a batch of persistently failing assets can't spin forever
+- `sync_engine.py` — Orchestrates the 6 phases, returns stats dict. `_cleanup_step` savepoints each Phase 4 step (naming it off `fn.__name__` rather than an interpolated literal); the Phase 1 batch loop breaks when a full batch makes no progress, so a batch of persistently failing assets can't spin forever
 - `asset_sync.py` — Asset record creation with savepoint rollback, idempotency check, path remapping
 - `ml_sync.py` — Face record copying with bounding-box dedup, `personGroupId` copied verbatim. Copies carry **no `face_search` row** and `sourceType = 'manual'`, which together keep them out of Immich's facial recognition (see "Why copied faces are invisible to recognition")
 - `person_sync.py` — Target person row creation (`ensure_target_person`), thumbnail hardlinking, name sync, orphan cleanup (~300 lines; shrank from 422 when person mirroring was removed). `cleanup_orphaned_persons` will not delete a *named* person: `_face_sync_person_map` carried the "did the sidecar create this row" provenance and v3.2.0 retired it, so a name is the only signal left that a human judged the person real — and its other guards are all satisfied by a person the target found on their own photos and then deleted the photos of.
-- `cleanup.py` — Deletion detection (LEFT JOIN on source), hardlink removal before DB deletion, source-authoritative face reassignment
+- `cleanup.py` — Deletion detection (LEFT JOIN on source), hardlink removal before DB deletion, source-authoritative face reassignment. `delete_target_asset` is the single per-asset delete (hardlinks, album rows, asset, mapping) shared with `delete_synced.py`, which used to carry a hand-maintained copy of it
 - `file_ops.py` — Hardlink creation/removal, path remapping by exact UUID component matching
 - `db.py` — asyncpg pool (min=2, max=10), `transaction()` context manager, query helpers
-- `config.py` — SyncJob dataclass, YAML config loader, Pydantic Settings (env var fallback)
+- `config.py` — SyncJob dataclass, YAML config loader, Pydantic Settings (env var fallback), `settings.configured_user_ids`
+- `env_bootstrap.py` — Loads `.env` into the environment for the repo-root scripts, which must populate it *before* importing `src.config` (that builds its `settings` singleton at import). Imports nothing from `src`, deliberately
 - `main.py` — Entry point: config validation, tracking-table migrations, health wait, DB init, concurrent sync + scan loops
 - `schema.py` — Schema validation plus `validate_cluster_group()`, which refuses to start unless every configured source and target user shares one `clusterGroupId` (soft-deleted users count as missing)
 - `immich_api.py` — httpx AsyncClient (single instance) for Immich REST API (health check)

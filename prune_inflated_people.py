@@ -30,25 +30,12 @@ import argparse
 import asyncio
 import os
 import sys
-from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-# Load .env before importing from src: src.config builds its settings singleton
-# at import time. Import must stay side-effect-free enough to be testable, so a
-# missing .env is only fatal in main().
-ENV_FILE = Path(__file__).parent / ".env"
+from src.env_bootstrap import ENV_FILE, bootstrap
 
-if ENV_FILE.exists():
-    for line in ENV_FILE.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        key, _, value = line.partition("=")
-        if key and value:
-            os.environ.setdefault(key.strip(), value.strip())
-
-os.environ.setdefault("SYNC_INTERVAL_SECONDS", "9999")
+bootstrap()
 
 import logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", stream=sys.stdout)

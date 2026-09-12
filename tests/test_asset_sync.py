@@ -10,7 +10,7 @@ from uuid import uuid4
 
 from src.asset_sync import sync_asset
 from src.config import SyncJob
-from tests.conftest import make_asset, make_cluster_group, make_user
+from tests.conftest import make_asset
 
 
 async def _library(conn, owner_id):
@@ -43,11 +43,9 @@ async def _existing_target(conn, job, path):
     return aid
 
 
-async def test_recovers_a_lost_mapping_without_creating_a_second_asset(conn):
+async def test_recovers_a_lost_mapping_without_creating_a_second_asset(conn, pair):
     """The crash-recovery branch: asset survived, mapping did not."""
-    cg = await make_cluster_group(conn)
-    src = await make_user(conn, cluster_group_id=cg)
-    tgt = await make_user(conn, cluster_group_id=cg)
+    cg, src, tgt = pair
     job = await _job(conn, src, tgt)
 
     source = await conn.fetchrow(
@@ -62,7 +60,7 @@ async def test_recovers_a_lost_mapping_without_creating_a_second_asset(conn):
     ) == 1
 
 
-async def test_a_target_already_mapped_to_another_source_does_not_abort_the_batch(conn):
+async def test_a_target_already_mapped_to_another_source_does_not_abort_the_batch(conn, pair):
     """The wedge that outlived the Phase 0 fix, one function away from it.
 
     _face_sync_asset_map has two unique constraints, and the recovery INSERT
@@ -77,9 +75,7 @@ async def test_a_target_already_mapped_to_another_source_does_not_abort_the_batc
     rescanned: Immich gives it a new id at the same path, so the remap finds
     the target that the *old* source id still claims.
     """
-    cg = await make_cluster_group(conn)
-    src = await make_user(conn, cluster_group_id=cg)
-    tgt = await make_user(conn, cluster_group_id=cg)
+    cg, src, tgt = pair
     job = await _job(conn, src, tgt)
 
     existing = await _existing_target(conn, job, "/external_library/target/a.jpg")
@@ -109,7 +105,7 @@ async def test_a_target_already_mapped_to_another_source_does_not_abort_the_batc
     ) == old_source
 
 
-async def test_a_path_that_escapes_the_target_prefix_is_contained_to_its_own_asset(conn):
+async def test_a_path_that_escapes_the_target_prefix_is_contained_to_its_own_asset(conn, pair):
     """The one input _remap_asset_path rejects must not take the batch with it.
 
     A path outside the job's prefix is *not* an error — it is returned
@@ -118,9 +114,7 @@ async def test_a_path_that_escapes_the_target_prefix_is_contained_to_its_own_ass
     before the savepoint opened, so it propagated straight out of sync_asset
     into the Phase 1 loop and aborted every other asset in the batch.
     """
-    cg = await make_cluster_group(conn)
-    src = await make_user(conn, cluster_group_id=cg)
-    tgt = await make_user(conn, cluster_group_id=cg)
+    cg, src, tgt = pair
     job = await _job(conn, src, tgt)
 
     source = await conn.fetchrow(
