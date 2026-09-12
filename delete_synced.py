@@ -24,6 +24,7 @@ bootstrap()
 import logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", stream=sys.stdout)
 
+from src import confirm
 from src.cleanup import delete_target_asset
 from src.db import init_pool, close_pool, fetch_all, fetch_one, transaction
 from src.file_ops import remove_hardlinks
@@ -181,18 +182,14 @@ async def main():
         return
 
     # Step 3: Dry run or delete
-    while True:
-        action = input("\nDelete all synced data for this user? [dry-run / delete / cancel]: ").strip().lower()
-        if action in ("dry-run", "delete", "cancel", "d", "c"):
-            break
-        print("Please enter 'dry-run', 'delete', or 'cancel'.")
+    action = confirm.ask("\nDelete all synced data for this user?")
 
-    if action in ("cancel", "c"):
+    if action == confirm.CANCEL:
         print("Cancelled.")
         await close_pool()
         return
 
-    if action == "dry-run":
+    if action == confirm.DRY_RUN:
         print(f"\n[DRY RUN] Would delete:")
         print(f"  {len(assets)} synced asset(s)")
         for a in assets[:20]:
@@ -208,7 +205,7 @@ async def main():
         await close_pool()
         return
 
-    # action == "delete"
+    # action == confirm.DELETE
     # Phase 1: Delete all synced assets in batches
     total_assets = len(assets)
     batch_size = 200

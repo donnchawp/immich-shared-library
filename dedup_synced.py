@@ -26,6 +26,7 @@ bootstrap()
 import logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", stream=sys.stdout)
 
+from src import confirm
 from src.asset_sync import record_skipped_duplicates
 from src.cleanup import delete_target_asset
 from src.db import init_pool, close_pool, fetch_all, fetch_one
@@ -180,18 +181,14 @@ async def main(match_time: bool = False):
         print()
 
     # Step 3: Dry run or delete
-    while True:
-        action = input("Delete these synced copies? [dry-run / delete / cancel]: ").strip().lower()
-        if action in ("dry-run", "delete", "cancel", "d", "c"):
-            break
-        print("Please enter 'dry-run', 'delete', or 'cancel'.")
+    action = confirm.ask("Delete these synced copies?")
 
-    if action in ("cancel", "c"):
+    if action == confirm.CANCEL:
         print("Cancelled.")
         await close_pool()
         return
 
-    if action == "dry-run":
+    if action == confirm.DRY_RUN:
         print(f"\n[DRY RUN] Would delete {len(duplicates)} synced asset(s):")
         for d in duplicates:
             print(f"  DELETE target={d['target_asset_id']}  ({d['synced_filename']})")
@@ -200,7 +197,7 @@ async def main(match_time: bool = False):
         await close_pool()
         return
 
-    # action == "delete"
+    # action == confirm.DELETE
     total = len(duplicates)
     batch_size = 200
     print(f"\nDeleting {total} synced asset(s) in batches of {batch_size}...")
