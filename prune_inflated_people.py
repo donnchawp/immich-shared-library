@@ -16,9 +16,11 @@ number fewer than minFaces and deletes them, leaving their faces unassigned —
 where minFaces would have left them had the twins never existed.
 
 A group is judged on original faces only. A face is a copy when its asset is a
-target in _face_sync_asset_map; everything else is original. Named people are
-never touched, on the assumption that a name means a human decided the person
-was real regardless of how it was clustered.
+target in _face_sync_asset_map; everything else is original. Three things are
+never touched: named people (a name means a human decided the person was real
+regardless of how it was clustered), groups holding no copied face at all (they
+were never double-counted, so a small one is small for an ordinary reason), and
+therefore anything belonging to a user the sidecar has never synced for.
 
 Usage:
   python3 prune_inflated_people.py --min-faces 3          # dry run
@@ -53,6 +55,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 
 from src.db import close_pool, init_pool, transaction
 
+# How many groups the dry run names individually. Enough to spot a pattern
+# without burying the summary; the counts above it are always the full picture.
+LISTING_LIMIT = 40
+
 
 # One definition of "inflated", used by both the preview and the delete, so the
 # two can never disagree about which groups are in scope.
@@ -73,6 +79,15 @@ WITH face_class AS (
     SELECT g.grp, g.total_faces, g.original_faces
     FROM per_group g
     WHERE g.original_faces < $1
+      -- The group must actually hold a copy. Without this the predicate reads
+      -- "small and unnamed", not "inflated", and it deletes two kinds of group
+      -- this script has no business touching: a person belonging to a user the
+      -- sidecar has never synced anything for, and a legitimate person that has
+      -- since shrunk below the threshold. Immich's minFaces gates cluster
+      -- *creation*, not persistence, so shrunken groups are normal — unassign
+      -- two faces from a four-face person in the UI and you have made one. A
+      -- group containing no copy was never double-counted, by construction.
+      AND g.total_faces > g.original_faces
       -- A name means a human judged this person real; leave it alone.
       AND NOT EXISTS (
           SELECT 1 FROM person p
@@ -80,6 +95,24 @@ WITH face_class AS (
       )
 )
 """
+
+
+async def configured_min_faces(conn) -> int | None:
+    """Immich's own minFaces, or None if the admin never overrode the default.
+
+    system-config stores only what differs from Immich's built-in defaults, so
+    an absent key means the instance is running the default (3). Worth reading
+    because --min-faces is the one argument that silently widens the deletion:
+    pass a value above the instance's setting and the script removes groups
+    recognition would have kept.
+    """
+    value = await conn.fetchval(
+        """
+        SELECT value #>> '{machineLearning,facialRecognition,minFaces}'
+        FROM system_metadata WHERE key = 'system-config'
+        """,
+    )
+    return int(value) if value is not None else None
 
 
 async def preview(conn, min_faces: int) -> dict:
@@ -95,6 +128,32 @@ async def preview(conn, min_faces: int) -> dict:
         min_faces,
     )
     return dict(row)
+
+
+async def listing(conn, min_faces: int, limit: int) -> list:
+    """The groups the delete would remove, one row each, for the operator to read.
+
+    Four aggregate numbers cannot be checked against anything, and --apply is
+    irreversible, so the dry run has to name what it is about to destroy.
+    Ordered by the largest first: those are the ones most likely to be a real
+    person the threshold merely clipped, and so the ones worth looking at in
+    the UI before committing.
+    """
+    return await conn.fetch(
+        INFLATED_GROUPS_CTE + """
+        SELECT i.grp,
+               i.total_faces,
+               i.original_faces,
+               (SELECT string_agg(u.email, ', ' ORDER BY u.email)
+                  FROM person p JOIN "user" u ON u.id = p."ownerId"
+                 WHERE p."personGroupId" = i.grp) AS owners
+        FROM inflated i
+        ORDER BY i.original_faces DESC, i.total_faces DESC
+        LIMIT $2
+        """,
+        min_faces,
+        limit,
+    )
 
 
 async def prune(conn, min_faces: int) -> int:
@@ -134,21 +193,41 @@ async def main(min_faces: int, apply: bool) -> None:
 
     try:
         async with transaction() as conn:
+            configured = await configured_min_faces(conn)
+            if configured is None:
+                print("\nImmich's minFaces is not overridden, so it is the default of 3.")
+            else:
+                print(f"\nImmich's configured minFaces is {configured}.")
+            if configured is not None and configured != min_faces:
+                print(
+                    f"WARNING: you passed --min-faces {min_faces}. Above your instance's "
+                    f"setting this deletes groups recognition would have kept."
+                )
+
             stats = await preview(conn, min_faces)
 
-            print(f"\nPerson groups with fewer than {min_faces} original faces:")
+            print(f"\nPerson groups holding a copy and fewer than {min_faces} original faces:")
             print(f"  groups:                 {stats['groups']}")
             print(f"  person rows:            {stats['person_rows']}")
             print(f"  faces they hold:        {stats['faces_unassigned']}")
             print(f"  of which original:      {stats['original_faces']}")
-            print("\nNamed people are excluded.")
+            print("\nNamed people are excluded, as are groups with no copied face.")
 
             if stats["groups"] == 0:
                 print("\nNothing to prune.")
                 return
 
+            rows = await listing(conn, min_faces, LISTING_LIMIT)
+            print(f"\nGroups to delete (largest first, showing {len(rows)} of {stats['groups']}):")
+            print(f"  {'person group':38}  {'orig':>4}  {'total':>5}  owners")
+            for row in rows:
+                print(
+                    f"  {str(row['grp']):38}  {row['original_faces']:>4}  "
+                    f"{row['total_faces']:>5}  {row['owners'] or '(no person rows)'}"
+                )
+
             if not apply:
-                print("\n[DRY RUN] Nothing was changed. Re-run with --apply to delete.")
+                print("\n[DRY RUN] Nothing was changed. Check the list above, then re-run with --apply.")
                 return
 
             deleted = await prune(conn, min_faces)

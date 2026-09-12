@@ -122,15 +122,21 @@ async def test_a_group_of_only_copies_is_pruned(conn):
     assert await prune(conn, 3) == 1
 
 
-async def test_unsynced_users_are_judged_on_all_their_faces(conn):
-    """A user the sidecar never touched has no copies, so nothing is discounted
-    and a legitimate small group of theirs is left alone.
+async def test_a_small_group_holding_no_copy_is_left_alone(conn):
+    """Two original faces, below minFaces, and not a copy among them.
+
+    The count is deliberately 2, not 3: at 3 the group is kept for the
+    ordinary reason and the test proves nothing. Below the threshold it is
+    only spared by the "must hold a copy" guard, which is the point. This
+    covers both a user the sidecar never touched and a legitimate person that
+    has since shrunk — Immich's minFaces gates cluster creation, not
+    persistence, so unassigning faces in the UI makes one of these.
     """
     cg = await make_cluster_group(conn)
     owner = await make_user(conn, cluster_group_id=cg)
     pg = await make_person_group(conn, cg)
     await make_person(conn, owner, pg)
-    for i in range(3):
+    for i in range(2):
         asset = await make_asset(conn, owner)
         await make_face(conn, asset, person_group_id=pg, bbox=(i, i, i + 5, i + 5))
 
