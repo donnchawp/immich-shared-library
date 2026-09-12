@@ -4,6 +4,7 @@ The judgement is on *original* faces -- a face whose asset is a target in
 _face_sync_asset_map is a copy and does not count -- so these tests always set
 up both halves of a synced pair and check the copy is discounted.
 """
+import prune_inflated_people as prune_mod
 from prune_inflated_people import preview, prune
 from tests.conftest import (
     make_asset, make_cluster_group, make_face, make_person, make_person_group,
@@ -138,3 +139,43 @@ async def test_a_small_group_holding_no_copy_is_left_alone(conn, pair):
 
     assert (await preview(conn, 3))["groups"] == 0
     assert await prune(conn, 3) == 0
+
+
+def test_the_warning_fires_on_a_stock_instance():
+    """configured_min_faces returns None when the admin never overrode minFaces.
+
+    Gating the warning on "configured is not None" meant it never fired in the
+    common case, which is the case where --min-faces 10 --apply silently
+    deletes every copy-holding group under ten.
+    """
+    lines = prune_mod.min_faces_warning(10, None)
+
+    assert lines, "no warning on a stock instance"
+    assert "ABOVE" in lines[0]
+    assert "10" in lines[0] and "3" in lines[0]
+
+
+def test_the_warning_reads_the_direction():
+    """Below the effective setting is incomplete; above it is dangerous.
+
+    The message said "Above your instance's setting" for both, which is wrong
+    half the time in the one sentence meant to tell you which way you erred.
+    """
+    above = prune_mod.min_faces_warning(6, 3)
+    below = prune_mod.min_faces_warning(2, 3)
+
+    assert "ABOVE" in above[0] and "WARNING" in above[0]
+    assert "below" in below[0] and "NOTE" in below[0]
+    assert "ABOVE" not in below[0]
+
+
+def test_no_warning_when_the_value_matches():
+    assert prune_mod.min_faces_warning(3, None) == []
+    assert prune_mod.min_faces_warning(7, 7) == []
+
+
+def test_the_cli_default_is_immich_s_default():
+    """A default of 3 hardcoded in two places is one rename from disagreeing."""
+    assert prune_mod.IMMICH_DEFAULT_MIN_FACES == 3
+    parser = prune_mod.build_parser()
+    assert parser.parse_args([]).min_faces == prune_mod.IMMICH_DEFAULT_MIN_FACES

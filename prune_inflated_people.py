@@ -47,6 +47,11 @@ from src.db import close_pool, init_pool, transaction
 LISTING_LIMIT = 40
 
 
+# Immich's built-in minFaces. system-config stores only what differs from the
+# defaults, so an absent key means this value is the one in force.
+IMMICH_DEFAULT_MIN_FACES = 3
+
+
 # One definition of "inflated", used by both the preview and the delete, so the
 # two can never disagree about which groups are in scope.
 INFLATED_GROUPS_CTE = """
@@ -100,6 +105,40 @@ async def configured_min_faces(conn) -> int | None:
         """,
     )
     return int(value) if value is not None else None
+
+
+def min_faces_warning(min_faces: int, configured: int | None) -> list[str]:
+    """Warn when --min-faces disagrees with what recognition actually used.
+
+    Two things this gets wrong if written the obvious way, and both did.
+
+    It must compare against the *effective* setting, not against `configured`.
+    configured_min_faces returns None for the common case -- an admin who never
+    touched the default -- so gating the warning on `configured is not None`
+    means `--min-faces 10 --apply` on a stock instance says nothing at all and
+    deletes every copy-holding group under ten. That is precisely the silent
+    widening the docstring on configured_min_faces warns about.
+
+    And it has to read the direction. Below the effective setting the script is
+    narrower than recognition was, which is merely incomplete; above it, the
+    script deletes groups recognition would have kept, which is the dangerous
+    half. Saying "above your instance's setting" for both was wrong half the
+    time, in the sentence whose whole job is telling you which way you erred.
+    """
+    effective = IMMICH_DEFAULT_MIN_FACES if configured is None else configured
+    if min_faces == effective:
+        return []
+    if min_faces > effective:
+        return [
+            f"WARNING: --min-faces {min_faces} is ABOVE the effective setting of "
+            f"{effective}. This deletes groups recognition would have kept, which "
+            f"is more than the inflation you are undoing.",
+        ]
+    return [
+        f"NOTE: --min-faces {min_faces} is below the effective setting of "
+        f"{effective}, so this prunes fewer groups than were inflated. Some "
+        f"invented people will survive.",
+    ]
 
 
 async def preview(conn, min_faces: int) -> dict:
@@ -182,14 +221,14 @@ async def main(min_faces: int, apply: bool) -> None:
         async with transaction() as conn:
             configured = await configured_min_faces(conn)
             if configured is None:
-                print("\nImmich's minFaces is not overridden, so it is the default of 3.")
+                print(
+                    f"\nImmich's minFaces is not overridden, so it is the default "
+                    f"of {IMMICH_DEFAULT_MIN_FACES}."
+                )
             else:
                 print(f"\nImmich's configured minFaces is {configured}.")
-            if configured is not None and configured != min_faces:
-                print(
-                    f"WARNING: you passed --min-faces {min_faces}. Above your instance's "
-                    f"setting this deletes groups recognition would have kept."
-                )
+            for line in min_faces_warning(min_faces, configured):
+                print(line)
 
             stats = await preview(conn, min_faces)
 
@@ -224,17 +263,24 @@ async def main(min_faces: int, apply: bool) -> None:
         await close_pool()
 
 
-if __name__ == "__main__":
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Delete person groups that only exist because synced faces were double-counted.",
     )
     parser.add_argument(
-        "--min-faces", type=int, default=3,
-        help="Match your Immich facial recognition minFaces setting (default: 3)",
+        "--min-faces", type=int, default=IMMICH_DEFAULT_MIN_FACES,
+        help=(
+            f"Match your Immich facial recognition minFaces setting "
+            f"(default: {IMMICH_DEFAULT_MIN_FACES})"
+        ),
     )
     parser.add_argument(
         "--apply", action="store_true",
         help="Actually delete. Without this the script only reports.",
     )
-    args = parser.parse_args()
+    return parser
+
+
+if __name__ == "__main__":
+    args = build_parser().parse_args()
     asyncio.run(main(min_faces=args.min_faces, apply=args.apply))
