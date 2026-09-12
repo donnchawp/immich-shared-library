@@ -163,16 +163,43 @@ async def test_no_cycle_function_overwrites_the_target_visibility(conn):
     )
     await _map_synced_pair(conn, src, tgt, person_group_id=pg)
 
-    called = []
+    # Every public coroutine in person_sync that a sync cycle can call with
+    # just a connection. The filter is "first parameter is conn, the rest have
+    # defaults" rather than an exact ["conn"] match: Phase 1 is
+    # job-parameterised, so a future sync_person_visibility(conn, job) is the
+    # plausible shape, and an exact match would skip it in silence -- this
+    # guard would stop guarding and say nothing.
+    discovered = []
     for name, fn in inspect.getmembers(person_sync, inspect.iscoroutinefunction):
         if name.startswith("_"):
             continue
-        if list(inspect.signature(fn).parameters) != ["conn"]:
+        params = list(inspect.signature(fn).parameters.values())
+        if not params or params[0].name != "conn":
             continue
-        await fn(conn)
-        called.append(name)
+        if any(p.default is inspect.Parameter.empty for p in params[1:]):
+            # Needs arguments this test cannot supply. Not skipped quietly:
+            # the assertion below fails until someone decides what to do.
+            discovered.append((name, False))
+            continue
+        discovered.append((name, True))
 
-    assert "sync_person_names" in called, called  # the discovery actually found things
+    callable_here = [n for n, ok in discovered if ok]
+    for name in callable_here:
+        await getattr(person_sync, name)(conn)
+
+    # Pinned explicitly, so adding a function to person_sync forces a decision
+    # here instead of silently widening or narrowing what this guard covers.
+    assert sorted(n for n, _ in discovered) == [
+        "cleanup_orphaned_persons",
+        "delete_target_person_in_shared_group",
+        "ensure_target_person",
+        "sync_person_names",
+        "sync_person_thumbnails",
+    ], discovered
+    assert sorted(callable_here) == [
+        "cleanup_orphaned_persons", "sync_person_names", "sync_person_thumbnails",
+    ], discovered
+    called = callable_here
     is_hidden = await conn.fetchval(
         'SELECT "isHidden" FROM person WHERE "ownerId" = $1 AND "personGroupId" = $2', tgt, pg
     )

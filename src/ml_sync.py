@@ -17,7 +17,13 @@ async def sync_faces_for_asset(
 ) -> int:
     """Copy face data from source asset to target asset.
 
-    Creates mirrored persons as needed and copies face embeddings.
+    Copies asset_face."personGroupId" verbatim -- identity is shared under
+    cluster groups, so there is nothing to mirror -- and ensures the target
+    user has their own person row on that group. Deliberately does NOT copy
+    the embedding: a copied face gets no face_search row and sourceType
+    'manual', which together keep it out of Immich's recognition. See "Why
+    copied faces are invisible to recognition" in CLAUDE.md.
+
     Returns the number of faces synced.
     """
     # Get all faces on the source asset (including soft-deleted check)

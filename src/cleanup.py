@@ -114,8 +114,16 @@ async def cleanup_reassigned_faces(conn: asyncpg.Connection) -> int:
     The source is authoritative. If the target user reassigns a copied face
     to a different person themselves, this reverts it on the next cycle,
     because the bounding box still matches and the group ids now differ
-    again. That is intentional — the same principle as source-authoritative
-    name/visibility sync elsewhere in this sidecar — not a bug.
+    again. That is intentional, not a bug.
+
+    It is also the last source-authoritative write left. Names are fill-only
+    and visibility is not synced at all, both per-user by design in v3.2.0, so
+    the old justification here -- "the same principle as name/visibility sync"
+    -- no longer holds and has been removed rather than quietly left to rot.
+    The case for keeping this one is narrower and worth stating plainly: the
+    copies carry no embedding and sourceType 'manual', so they cannot
+    re-cluster themselves out of a bad assignment, and the source is the only
+    account whose recognition still runs on these faces.
 
     Known limitations, left unhandled because they are edge cases rather than
     correctness defects:

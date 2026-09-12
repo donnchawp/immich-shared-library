@@ -368,6 +368,8 @@ split; nothing else will.
    ```bash
    docker exec immich_postgres pg_dump -U postgres -d immich -t _face_sync_person_map > person_map.sql
    ```
+   This fails with "no matching tables were found" if you never ran a sidecar
+   old enough to have mirrored persons. That's fine — there is nothing to save.
 3. **Save your people.** The reset in step 5 deletes every person for every member of the group, names
    and birth dates included, and there is no undo. Export the names and copy each person's face
    thumbnail out first, so you can re-apply them afterwards:
@@ -538,7 +540,7 @@ make testdb   # (re)create the scratch database from the fixture
 make test     # run the tests
 ```
 
-`make help` lists all targets (`test`, `testdb`, `testdb-clean`, `schema-dump`, `lint`). Postgres isn't published to the host, so `make test` runs pytest inside a container on the `immich_default` network — running `pytest` directly on the host will fail to connect. Narrow to one file with `make test PYTEST_ARGS=tests/test_person_sync.py`. If your Immich network or Postgres container is named differently, override them: `NETWORK=immich_web PG=immich_postgres make test`.
+`make help` lists all targets (`test`, `testdb`, `testdb-clean`, `schema-dump`, `lint`). Postgres isn't published to the host, so `make test` runs pytest inside a container on the `immich_default` network — running `pytest` directly on the host will fail to connect. Narrow to one file with `make test PYTEST_ARGS=tests/test_person_sync.py`. If your Immich network or Postgres container is named differently, override them: `NETWORK=myproject_default PG=myproject-postgres-1 make test`. The defaults are `immich_default` and `immich_postgres`.
 
 ### Manual Integration Testing
 
