@@ -53,7 +53,9 @@ The repo has an automated test suite (pytest) run against a scratch `immich_test
 
 ## Architecture
 
-### Sync Engine (5 phases, each in its own transaction)
+### Sync Engine (6 phases, each in its own transaction)
+
+0. **Stale mapping prune** (`cleanup.py::cleanup_stale_mappings`): Drops mappings whose target asset was hard-deleted in Immich (so the source re-syncs next cycle; trashed targets keep their mapping). **Runs first, before any phase reads the map.** It used to run at the end of Phase 4, which wedged the sidecar permanently on a hard-deleted target: Phase 2 hit a foreign key violation inserting a face for the vanished asset, the cycle aborted, and the prune that would have fixed it never ran — identically, every cycle after. Consumers still guard themselves, but as belt and braces. Pinned by `tests/test_sync_engine.py::test_phase_0_prunes_the_stale_mapping_before_phase_2_reads_it`.
 
 1. **New asset sync** (`asset_sync.py`): Finds source assets with completed ML processing not yet in `_face_sync_asset_map`. For each, creates a target asset record with remapped paths, copies EXIF, hardlinks thumbnails, copies CLIP embeddings, copies faces (`ml_sync.py`, which copies `asset_face."personGroupId"` verbatim, ensures the target has a `person` row for that group, and deliberately does *not* copy the face embedding). Uses SAVEPOINTs so one asset failure doesn't abort the batch.
 
@@ -63,14 +65,14 @@ The repo has an automated test suite (pytest) run against a scratch `immich_test
 
 3. **Person metadata sync** (`person_sync.py`): `sync_person_names` only fills an *empty* target name — it never overwrites a name the target user set (names are per-user by design in v3.2.0). `sync_person_thumbnails` hardlinks thumbnails that are still empty. **Visibility is deliberately not synced**: `isHidden` is a plain boolean with no "unset" sentinel, so there is no fill-only option, and each user owns their own. The target inherits the source's `isHidden` once, at person creation. `tests/test_person_sync.py::test_no_cycle_function_overwrites_the_target_visibility` discovers and runs every public `async def f(conn)` in `person_sync` to guard this.
 
-4. **Cleanup** (`cleanup.py`, `person_sync.py`): Prunes mappings whose target asset was hard-deleted in Immich (so the source re-syncs next cycle; trashed targets keep their mapping), removes target assets whose source was deleted/trashed, reassigns target faces back to the source's `personGroupId` when they've drifted (`cleanup_reassigned_faces` — the source is authoritative, so a target-side reassignment is reverted next cycle), removes orphaned target persons.
+4. **Cleanup** (`cleanup.py`, `person_sync.py`): Removes target assets whose source was deleted/trashed, reassigns target faces back to the source's `personGroupId` when they've drifted (`cleanup_reassigned_faces` — the source is authoritative, so a target-side reassignment is reverted next cycle), removes unnamed target persons left with no faces. The three steps share a transaction but each gets its own SAVEPOINT (`_cleanup_step`): `cleanup_deleted_assets` unlinks thumbnails before deleting the rows that name them, and the filesystem does not roll back, so a later step's failure must not restore assets whose files are gone.
 
 ### Key modules
 
-- `sync_engine.py` — Orchestrates the 5 phases, returns stats dict
+- `sync_engine.py` — Orchestrates the 6 phases, returns stats dict. `_cleanup_step` savepoints each Phase 4 step; the Phase 1 batch loop breaks when a full batch makes no progress, so a batch of persistently failing assets can't spin forever
 - `asset_sync.py` — Asset record creation with savepoint rollback, idempotency check, path remapping
 - `ml_sync.py` — Face record copying with bounding-box dedup, `personGroupId` copied verbatim. Copies carry **no `face_search` row** and `sourceType = 'manual'`, which together keep them out of Immich's facial recognition (see "Why copied faces are invisible to recognition")
-- `person_sync.py` — Target person row creation (`ensure_target_person`), thumbnail hardlinking, name sync, orphan cleanup (~300 lines; shrank from 422 when person mirroring was removed)
+- `person_sync.py` — Target person row creation (`ensure_target_person`), thumbnail hardlinking, name sync, orphan cleanup (~300 lines; shrank from 422 when person mirroring was removed). `cleanup_orphaned_persons` will not delete a *named* person: `_face_sync_person_map` carried the "did the sidecar create this row" provenance and v3.2.0 retired it, so a name is the only signal left that a human judged the person real — and its other guards are all satisfied by a person the target found on their own photos and then deleted the photos of.
 - `cleanup.py` — Deletion detection (LEFT JOIN on source), hardlink removal before DB deletion, source-authoritative face reassignment
 - `file_ops.py` — Hardlink creation/removal, path remapping by exact UUID component matching
 - `db.py` — asyncpg pool (min=2, max=10), `transaction()` context manager, query helpers
@@ -79,6 +81,7 @@ The repo has an automated test suite (pytest) run against a scratch `immich_test
 - `schema.py` — Schema validation plus `validate_cluster_group()`, which refuses to start unless every configured source and target user shares one `clusterGroupId` (soft-deleted users count as missing)
 - `immich_api.py` — httpx AsyncClient (single instance) for Immich REST API (health check)
 - `health.py` — TCP health check server on port 8080
+- `prune_inflated_people.py` (repo root, not `src/`) — One-shot remediation for an instance that ran facial recognition before schema v4, when copied faces still carried twin embeddings and voted twice towards `minFaces`. Deletes person groups that fall below `minFaces` on their *original* faces alone. Three guards, all load-bearing: named people are spared, groups holding no copied face are spared (they were never double-counted — `minFaces` gates cluster *creation*, not persistence, so a legitimately shrunken group looks identical to an inflated one without this), and the dry run lists every group before `--apply` commits anything
 
 ### Configuration
 

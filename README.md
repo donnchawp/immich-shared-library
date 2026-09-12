@@ -383,15 +383,22 @@ split; nothing else will.
    Then `docker cp immich_server:<thumbnailPath> .` for each row — without the thumbnails you are
    re-naming thousands of unlabelled clusters from memory.
 4. **Upgrade Immich** to v3.2.0 and let its migrations finish.
-5. **Join the users into one cluster group** (Account Settings > Sharing > Cluster group), then run
+5. **Start the sidecar once, before joining the group** — only if you are coming from a sidecar older
+   than schema v4. It runs `_migrate_v4()`, which strips the copied face embeddings, and then exits with
+   a cluster-group error. That error is expected, and it is what makes this step safe: startup runs the
+   migration first and validates the cluster group second, so the migration commits and the process dies
+   before any sync can touch anything. Confirm you see both lines:
+   ```
+   Migrated tracking tables from v3 to v4
+   ERROR ... do not share one cluster group
+   ```
+   Skip this step and every synced face still votes twice in the reset below, which invents people that
+   should not exist. (If you had already reset before finding this out, see
+   [prune_inflated_people.py](#utility-scripts) — it undoes the damage after the fact.)
+6. **Join the users into one cluster group** (Account Settings > Sharing > Cluster group), then run
    **Reset facial recognition** for that group and wait for the re-recognition job to finish. Joining
    alone is not enough: it preserves each member's separate person groups, so identity is still not
    shared.
-   
-   If you are coming from a sidecar older than schema v4, start the sidecar *before* the reset so
-   `_migrate_v4()` can strip the copied embeddings first — otherwise every synced face votes twice and the
-   reset invents people that should not exist. (This is the one step where the sidecar runs early; it only
-   touches its own copied rows.)
 
    Watch for table bloat while it runs. Nulling every `personGroupId` leaves one dead tuple per face, and
    each reassignment adds another. Autovacuum reclaims them only if nothing pins the vacuum horizon — a
@@ -404,12 +411,13 @@ split; nothing else will.
    ```
    Then `pg_terminate_backend(<pid>)` — `pg_cancel_backend` does nothing to a backend parked in `ClientRead`,
    since there is no running query to cancel — followed by `VACUUM (ANALYZE) asset_face;`.
-6. **Rebuild and start the sidecar** (`docker compose up -d --build`). It validates the schema and the
+7. **Rebuild and start the sidecar** (`docker compose up -d --build`). It validates the schema and the
    cluster group on startup and drops the retired `_face_sync_person_map` table.
-7. **Re-apply the names** from your CSV.
+8. **Re-apply the names** from your CSV.
 
-Leave the sidecar stopped through steps 4 and 5. Re-recognition rewrites `asset_face."personGroupId"`
-across the whole cluster group, and the sidecar's face-reassignment pass has no reason to race it.
+Apart from the single migration-only start in step 5, leave the sidecar stopped until step 7.
+Re-recognition rewrites `asset_face."personGroupId"` across the whole cluster group, and the sidecar's
+face-reassignment pass has no reason to race it.
 
 ## Configuration Reference
 
@@ -460,13 +468,14 @@ At least one of `SHARED_PATH_PREFIX` or `UPLOAD_SOURCE_USER_ID` must be set. Bot
 
 ## How the Sync Works
 
-Each sync cycle runs five phases:
+Each sync cycle runs six phases:
 
+0. **Stale mapping prune** — Drops mappings whose target asset was hard-deleted in Immich, so the source syncs again next cycle. (Trashed targets keep their mapping.) This runs first, before anything else reads the map: at the end of Phase 4, where it used to be, a hard-deleted target wedged the sidecar permanently — Phase 2 hit a foreign key violation inserting a face for the vanished asset, the cycle aborted, and the prune that would have fixed it never ran.
 1. **New assets** — For each configured sync job (external library, uploads), finds fully-processed source assets not yet synced. Creates target asset records with copied EXIF, CLIP embeddings, faces, and hardlinked thumbnails.
 1b. **Album assignment** — Adds newly synced assets to the target album (if configured). Backfills any previously synced assets that are missing from the album.
 2. **Incremental faces** — Detects face updates on already-synced assets (using a watermark timestamp) and copies new faces.
 3. **Person metadata** — Fills in empty target person names from source and hardlinks missing thumbnails. Visibility is not synced; see below.
-4. **Cleanup** — Removes target assets (and their album entries) whose source was deleted or trashed. Reassigns target faces back to the source's `personGroupId` if they've drifted. Removes orphaned target persons.
+4. **Cleanup** — Removes target assets (and their album entries) whose source was deleted or trashed. Reassigns target faces back to the source's `personGroupId` if they've drifted. Removes unnamed target persons left with no faces. Each of the three is savepointed separately: Phase 4 unlinks thumbnails before deleting the rows that name them, and the filesystem doesn't roll back.
 
 ## How Faces Are Handled
 
@@ -515,7 +524,8 @@ The utility scripts read configuration from `.env` (the same file used by `docke
 - **`test_sync.py`** — Run a single sync cycle and print verification queries.
 - **`delete_synced.py`** — Delete all synced assets for a target user. Does not mark sources as skipped, so running the sync engine again will recreate everything. Useful for resetting a target account.
 - **`dedup_synced.py`** — Detect and remove synced assets that duplicate the target user's own uploads (matched by filename + capture date). Use `--match-time` to compare the full timestamp (with TZ normalisation) instead of just the date. Marks duplicates as skipped so the sync engine won't recreate them.
-- **`reset.sh`** — Full reset: stops the sidecar container, deletes all synced assets and mirrored persons from Immich, drops the tracking tables, and removes symlinks from the external library directory. Run directly on the host (not via `run-utility.sh`). Shows a summary and prompts for confirmation before making changes.
+- **`prune_inflated_people.py`** — Remediation for an instance that ran facial recognition *before* the sidecar reached schema v4. Copied faces used to carry a byte-identical `face_search` embedding, so every synced face was a distance-0 twin of its source and voted twice towards `minFaces` — clusters cleared the threshold that shouldn't have, and became people who should not exist. `_migrate_v4()` strips the twins, but it can't undo a recognition run that already happened; this can. It judges each person group on its *original* faces alone (a face on an asset that is a target in `_face_sync_asset_map` is a copy) and deletes groups that fall below `minFaces`, leaving their faces unassigned exactly where the threshold would have left them. Named people are never touched, nor is any group that holds no copied face — so a legitimate small person, or one that has since shrunk, is safe. **Dry run by default: read the list of groups it prints before re-running with `--apply`, because the delete is irreversible.** Pass `--min-faces` matching your instance's setting; the script reads Immich's configured value and warns if you disagree with it.
+- **`reset.sh`** — Full reset: stops the sidecar container, deletes all synced assets and mirrored persons from Immich, drops the tracking tables, and removes symlinks from the external library directory. Run directly on the host (not via `run-utility.sh`). Shows a summary and prompts for confirmation before making changes. Note it leaves the hardlinked thumbnail files behind — they cost no disk space, being hardlinks, but nothing afterwards knows their paths. `delete_synced.py` removes the files first and is the better tool if you want the filesystem clean.
 
 `delete_synced.py` and `dedup_synced.py` are interactive: they show a summary and prompt for confirmation before making changes, with a dry-run option.
 
