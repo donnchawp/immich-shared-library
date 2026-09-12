@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPTS=("test_sync.py" "dedup_synced.py" "delete_synced.py")
+SCRIPTS=("test_sync.py" "dedup_synced.py" "delete_synced.py" "prune_inflated_people.py")
 NETWORK="${NETWORK:-immich_default}"
 IMAGE="python:3.12-slim"
 
