@@ -209,38 +209,60 @@ async def sync_asset(conn: asyncpg.Connection, source: asyncpg.Record, job: Sync
     target_user_id = job.target_user_id
     target_library_id = job.target_library_id
 
-    target_path = _remap_asset_path(source["originalPath"], job)
-
-    # Idempotency: check if a target asset already exists for this path + owner + library
-    existing = await conn.fetchval(
-        """
-        SELECT id FROM asset
-        WHERE "ownerId" = $1 AND "libraryId" = $2 AND "originalPath" = $3 AND "deletedAt" IS NULL
-        """,
-        target_user_id,
-        target_library_id,
-        target_path,
-    )
-    if existing is not None:
-        # Already synced but mapping was lost (crash recovery) — re-create mapping
-        # Use conflict on the composite key (source_asset_id, target_user_id) since
-        # that's our unique constraint. Also catches target_asset_id conflicts.
-        result = await conn.execute(
-            """
-            INSERT INTO _face_sync_asset_map (source_asset_id, target_asset_id, source_user_id, target_user_id, synced_at)
-            VALUES ($1, $2, $3, $4, $5)
-            ON CONFLICT (source_asset_id, target_user_id) DO NOTHING
-            """,
-            source_id, existing, job.source_user_id, target_user_id, now,
-        )
-        if result == "INSERT 0 1":
-            logger.info("Recovered mapping for existing asset %s -> %s", source_id, existing)
-        return existing
-
-    # Use a savepoint so failure rolls back only this asset, not the whole transaction
+    # The savepoint opens before the path remap and the idempotency check, not
+    # after them. Both can raise — _remap_asset_path when a path normalizes
+    # out of the target prefix, the recovery INSERT below on a unique
+    # violation — and bare inside the batch transaction either one aborts all
+    # 500 assets, rolling their mappings back while their hardlinked thumbnails
+    # stay on disk with nothing left that knows the paths.
     await conn.execute("SAVEPOINT sync_asset")
     created_files: list[str] = []
     try:
+        target_path = _remap_asset_path(source["originalPath"], job)
+
+        # Idempotency: check if a target asset already exists for this path + owner + library
+        existing = await conn.fetchval(
+            """
+            SELECT id FROM asset
+            WHERE "ownerId" = $1 AND "libraryId" = $2 AND "originalPath" = $3 AND "deletedAt" IS NULL
+            """,
+            target_user_id,
+            target_library_id,
+            target_path,
+        )
+        if existing is not None:
+            # Already synced but the mapping was lost (crash recovery) — re-create it.
+            #
+            # Bare DO NOTHING, with no inference target: _face_sync_asset_map
+            # has two unique constraints, and naming one only swallows that
+            # one. The other, target_asset_id, is reachable — a source asset
+            # removed from the external library and rescanned comes back with
+            # a new id pointing at the same remapped target path, so this
+            # INSERT collides with the old source's mapping. Phase 0 doesn't
+            # prune that mapping (its target is alive), so an uncaught
+            # violation here wedged the cycle on every pass.
+            result = await conn.execute(
+                """
+                INSERT INTO _face_sync_asset_map (source_asset_id, target_asset_id, source_user_id, target_user_id, synced_at)
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT DO NOTHING
+                """,
+                source_id, existing, job.source_user_id, target_user_id, now,
+            )
+            await conn.execute("RELEASE SAVEPOINT sync_asset")
+            if result == "INSERT 0 1":
+                logger.info("Recovered mapping for existing asset %s -> %s", source_id, existing)
+                return existing
+            # Something else already claims this pair. Leave the asset for a
+            # later cycle: Phase 4 removes target assets whose source is gone,
+            # which drops the stale mapping and lets this source through next
+            # time.
+            logger.warning(
+                "Target asset %s is already mapped to another source; leaving source %s unsynced",
+                existing, source_id,
+            )
+            return None
+
         # 1. Insert asset record
         await conn.execute(
             """

@@ -1,0 +1,135 @@
+"""Phase 1's crash-recovery path, which runs before any file is touched.
+
+sync_asset's happy path creates hardlinks and is covered by the manual
+integration test against a live instance. What is worth pinning here is the
+branch that takes no filesystem action at all: the asset already exists, so
+only the mapping has to be rebuilt — and the ways that INSERT can fail are the
+ways the whole cycle used to wedge.
+"""
+from uuid import uuid4
+
+from src.asset_sync import sync_asset
+from src.config import SyncJob
+from tests.conftest import make_asset, make_cluster_group, make_user
+
+
+async def _library(conn, owner_id):
+    return await conn.fetchval(
+        """
+        INSERT INTO library (id, name, "ownerId", "importPaths", "exclusionPatterns")
+        VALUES ($1, 'test', $2, '{}', '{}') RETURNING id
+        """,
+        uuid4(), owner_id,
+    )
+
+
+async def _job(conn, src, tgt):
+    return SyncJob(
+        name="test",
+        source_user_id=src,
+        target_user_id=tgt,
+        target_library_id=await _library(conn, tgt),
+        source_path_prefix="/external_library/source/",
+        target_path_prefix="/external_library/target/",
+    )
+
+
+async def _existing_target(conn, job, path):
+    """A target asset at `path`, as a previous cycle would have left it."""
+    aid = await make_asset(conn, job.target_user_id, original_path=path)
+    await conn.execute(
+        'UPDATE asset SET "libraryId" = $1 WHERE id = $2', job.target_library_id, aid
+    )
+    return aid
+
+
+async def test_recovers_a_lost_mapping_without_creating_a_second_asset(conn):
+    """The crash-recovery branch: asset survived, mapping did not."""
+    cg = await make_cluster_group(conn)
+    src = await make_user(conn, cluster_group_id=cg)
+    tgt = await make_user(conn, cluster_group_id=cg)
+    job = await _job(conn, src, tgt)
+
+    source = await conn.fetchrow(
+        "SELECT * FROM asset WHERE id = $1",
+        await make_asset(conn, src, original_path="/external_library/source/a.jpg"),
+    )
+    existing = await _existing_target(conn, job, "/external_library/target/a.jpg")
+
+    assert await sync_asset(conn, source, job) == existing
+    assert await conn.fetchval(
+        "SELECT count(*) FROM _face_sync_asset_map WHERE target_asset_id = $1", existing
+    ) == 1
+
+
+async def test_a_target_already_mapped_to_another_source_does_not_abort_the_batch(conn):
+    """The wedge that outlived the Phase 0 fix, one function away from it.
+
+    _face_sync_asset_map has two unique constraints, and the recovery INSERT
+    used to name only one of them in its ON CONFLICT — so a violation of the
+    other, target_asset_id, escaped as an exception. Bare inside the batch
+    transaction it aborted all 500 assets of that batch (rolling their
+    mappings back while their hardlinks stayed on disk) and then escaped the
+    cycle entirely, before the Phase 4 cleanup that would have cleared the
+    stale mapping could run. Every cycle after failed identically.
+
+    Reached when a source asset is removed from the external library and
+    rescanned: Immich gives it a new id at the same path, so the remap finds
+    the target that the *old* source id still claims.
+    """
+    cg = await make_cluster_group(conn)
+    src = await make_user(conn, cluster_group_id=cg)
+    tgt = await make_user(conn, cluster_group_id=cg)
+    job = await _job(conn, src, tgt)
+
+    existing = await _existing_target(conn, job, "/external_library/target/a.jpg")
+    old_source = await make_asset(conn, src, original_path="/external_library/source/old.jpg")
+    await conn.execute(
+        """
+        INSERT INTO _face_sync_asset_map
+            (source_asset_id, target_asset_id, source_user_id, target_user_id)
+        VALUES ($1, $2, $3, $4)
+        """,
+        old_source, existing, src, tgt,
+    )
+
+    rescanned = await conn.fetchrow(
+        "SELECT * FROM asset WHERE id = $1",
+        await make_asset(conn, src, original_path="/external_library/source/a.jpg"),
+    )
+
+    # No exception, and the batch's transaction is still usable afterwards.
+    assert await sync_asset(conn, rescanned, job) is None
+    assert await conn.fetchval("SELECT 1") == 1
+
+    # The old mapping is untouched; Phase 4 is what clears it.
+    assert await conn.fetchval(
+        "SELECT source_asset_id FROM _face_sync_asset_map WHERE target_asset_id = $1",
+        existing,
+    ) == old_source
+
+
+async def test_a_path_that_escapes_the_target_prefix_is_contained_to_its_own_asset(conn):
+    """The one input _remap_asset_path rejects must not take the batch with it.
+
+    A path outside the job's prefix is *not* an error — it is returned
+    unchanged. What raises is a path that normalizes out of the target prefix,
+    which is the traversal guard doing its job. That raise used to happen
+    before the savepoint opened, so it propagated straight out of sync_asset
+    into the Phase 1 loop and aborted every other asset in the batch.
+    """
+    cg = await make_cluster_group(conn)
+    src = await make_user(conn, cluster_group_id=cg)
+    tgt = await make_user(conn, cluster_group_id=cg)
+    job = await _job(conn, src, tgt)
+
+    source = await conn.fetchrow(
+        "SELECT * FROM asset WHERE id = $1",
+        await make_asset(
+            conn, src, original_path="/external_library/source/../../etc/passwd.jpg"
+        ),
+    )
+
+    assert await sync_asset(conn, source, job) is None
+    assert await conn.fetchval("SELECT 1") == 1
+    assert await conn.fetchval("SELECT count(*) FROM _face_sync_asset_map") == 0
