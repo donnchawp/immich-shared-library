@@ -278,6 +278,37 @@ async def test_cleanup_keeps_person_while_the_source_still_has_faces_in_the_grou
     assert still_assigned == pg
 
 
+async def test_cleanup_keeps_person_while_a_trashed_source_face_holds_the_group(conn, pair):
+    """Same as above, but the source's remaining face is soft-deleted.
+
+    A trashed asset_face still carries its "personGroupId" and the FK is
+    ON DELETE SET NULL, so emptying the group nulls it exactly like a live
+    face — invisibly, and unrecoverably: restoring the asset from trash does
+    not bring the assignment back. A `deletedAt IS NULL` filter on the face
+    guard made this state deletion-eligible while every other guard passed.
+    """
+    cg, src, tgt = pair
+    pg = await make_person_group(conn, cg)
+
+    src_asset = await make_asset(conn, src)
+    src_face = await make_face(conn, src_asset, person_group_id=pg)
+    await conn.execute(
+        'UPDATE asset_face SET "deletedAt" = NOW() WHERE id = $1', src_face
+    )
+    await make_person(conn, tgt, pg)
+    await _map_synced_pair(conn, src, tgt)
+
+    assert await cleanup_orphaned_persons(conn) == 0
+    survived = await conn.fetchval(
+        'SELECT 1 FROM person WHERE "ownerId" = $1 AND "personGroupId" = $2', tgt, pg
+    )
+    assert survived == 1
+    still_assigned = await conn.fetchval(
+        'SELECT "personGroupId" FROM asset_face WHERE id = $1', src_face
+    )
+    assert still_assigned == pg
+
+
 async def test_cleanup_keeps_group_known_to_only_one_of_two_sources(conn):
     """Two jobs into one target: the "source has no person row" guard must hold
     for *every* mapped source, not merely for one of them. Nested inside the

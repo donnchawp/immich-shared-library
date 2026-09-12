@@ -247,10 +247,20 @@ async def cleanup_orphaned_persons(conn: asyncpg.Connection) -> int:
     all, owned by anyone. Immich sets ``asset_face."personGroupId"`` to NULL
     when the last person row in a group goes (``deleteEmptyGroups``), and it
     does so for *every* face in the group, not just the deleting user's. This
-    is the only statement in the sidecar that can empty a group, so it is the
-    only path that could write into the source user's own library — hence the
-    face guard is group-scoped, not owner-scoped. Anything narrower risks
+    is the only statement in the sync cycle that can empty a group, so it is
+    the only path that could write into the source user's own library — hence
+    the face guard is group-scoped, not owner-scoped. Anything narrower risks
     silently unassigning the source user's faces on their own photos.
+
+    That includes soft-deleted faces, which is why this guard alone does not
+    filter on ``deletedAt``. A trashed face still carries its
+    ``"personGroupId"``, and the FK is ON DELETE SET NULL, so emptying the
+    group nulls it exactly like a live one — except the source user cannot see
+    it happen and restoring from trash will not bring the assignment back. The
+    question this guard asks is "does any row still reference this group", and
+    a soft-deleted row does. The ``deletedAt IS NULL`` filters elsewhere in
+    this module are inclusion scopes ("which groups are worth syncing"), where
+    ignoring trashed faces is correct.
 
     Scope: restricted to target users the sidecar actually manages, via
     ``_face_sync_asset_map``, plus a ``NOT EXISTS`` guard that *no* mapped
@@ -298,7 +308,6 @@ async def cleanup_orphaned_persons(conn: asyncpg.Connection) -> int:
           AND NOT EXISTS (
               SELECT 1 FROM asset_face af
               WHERE af."personGroupId" = t."personGroupId"
-                AND af."deletedAt" IS NULL
           )
         RETURNING t."ownerId", t."personGroupId"
         """,
