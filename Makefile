@@ -11,16 +11,16 @@ help:  ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  %-14s %s\n", $$1, $$2}'
 
 schema-dump:  ## Re-dump the live Immich schema into the test fixture
-	# The \restrict/\unrestrict tokens pg_dump 17.6+ emits are random per run.
-	# Left in, every dump diffs against the last one and the fixture stops
-	# being useful as a 'did Immich's schema move?' check. They only guard
-	# psql restores against untrusted dumps; this one is ours.
-	#
-	# Via a temp file, never straight into the fixture. A '>' truncates before
-	# pg_dump has written a byte, and make's sh has no pipefail, so grep's exit
-	# status hides a pg_dump that failed -- between them, a container that is
-	# down replaces the fixture the whole test suite is built from with an
-	# empty file, and reports success.
+# The \restrict/\unrestrict tokens pg_dump 17.6+ emits are random per run.
+# Left in, every dump diffs against the last one and the fixture stops
+# being useful as a 'did Immich's schema move?' check. They only guard
+# psql restores against untrusted dumps; this one is ours.
+#
+# Via a temp file, never straight into the fixture. A '>' truncates before
+# pg_dump has written a byte, and make's sh has no pipefail, so grep's exit
+# status hides a pg_dump that failed -- between them, a container that is
+# down replaces the fixture the whole test suite is built from with an
+# empty file, and reports success.
 	set -e; \
 	  trap 'rm -f $(DUMP_TMP) $(DUMP_TMP).clean' EXIT; \
 	  docker exec $(PG) pg_dump -U postgres --schema-only immich > $(DUMP_TMP); \
@@ -30,12 +30,12 @@ schema-dump:  ## Re-dump the live Immich schema into the test fixture
 
 testdb: testdb-clean  ## (Re)create the scratch test database from the fixture
 	docker exec $(PG) psql -U postgres -c "CREATE DATABASE immich_test;"
-	# ON_ERROR_STOP, or psql runs the whole fixture past the first error and
-	# exits 0. The fixture opens with CREATE EXTENSION for cube, vector and
-	# earthdistance; without this, one missing extension takes every table that
-	# depends on it with it, `make testdb` reports success, and the suite runs
-	# against a half-built schema. tests/test_harness.py checks the result too,
-	# but this is the half that fails at the point of the mistake.
+# ON_ERROR_STOP, or psql runs the whole fixture past the first error and
+# exits 0. The fixture opens with CREATE EXTENSION for cube, vector and
+# earthdistance; without this, one missing extension takes every table that
+# depends on it with it, `make testdb` reports success, and the suite runs
+# against a half-built schema. tests/test_harness.py checks the result too,
+# but this is the half that fails at the point of the mistake.
 	docker exec -i $(PG) psql -v ON_ERROR_STOP=1 -U postgres -q -d immich_test < tests/fixtures/schema_v3.2.0.sql
 
 testdb-clean:  ## Drop the scratch test database

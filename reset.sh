@@ -21,7 +21,9 @@ DB_USERNAME=$(get_env DB_USERNAME postgres)
 DB_PASSWORD=$(get_env DB_PASSWORD)
 DB_DATABASE_NAME=$(get_env DB_DATABASE_NAME immich)
 EXTERNAL_LIBRARY_DIR=$(get_env EXTERNAL_LIBRARY_DIR)
-POSTGRES_CONTAINER="immich_postgres"
+# Overridable like the Makefile's PG and run-utility.sh's NETWORK, for a
+# compose project not named "immich".
+POSTGRES_CONTAINER="${PG:-immich_postgres}"
 
 # ON_ERROR_STOP is load-bearing, not hygiene. Without it psql exits 0 after a
 # failed statement, so `set -e` never fires and the script marches on to drop

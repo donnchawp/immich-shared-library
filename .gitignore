@@ -26,3 +26,7 @@ docs/
 plans/
 whats-next.md
 code-masher.txt
+
+# make schema-dump's temp files. The EXIT trap removes them, but it does not
+# fire reliably when make is interrupted.
+.schema-dump.tmp*

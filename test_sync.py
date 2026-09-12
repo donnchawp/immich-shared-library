@@ -98,29 +98,47 @@ async def main():
 
     print("\n=== Source face health (after) ===")
     after = await _source_face_health(source_user_ids)
-    regressed = False
+    # Two separate regressions, because they have different causes and only
+    # one of them was checked. A rise in *unassigned* is the group-emptying
+    # signature the docstring describes. A fall in *total* means source face
+    # rows were deleted outright, which no statement here should ever do and
+    # which leaves unassigned unchanged -- so the original check printed "OK"
+    # for it. Between them they cover the whole "wrote into the source account"
+    # family.
+    unassigned_rose = False
+    total_fell = False
     for uid in sorted(set(before) | set(after), key=str):
         was_unassigned, was_total = before.get(uid, (0, 0))
         now_unassigned, now_total = after.get(uid, (0, 0))
         delta = now_unassigned - was_unassigned
+        total_delta = now_total - was_total
         print(
             f"  source {uid}: {now_unassigned} unassigned of {now_total} faces "
-            f"(was {was_unassigned} of {was_total}, delta {delta:+d})"
+            f"(was {was_unassigned} of {was_total}, delta {delta:+d}, "
+            f"total {total_delta:+d})"
         )
         if delta > 0:
-            regressed = True
+            unassigned_rose = True
+        if total_delta < 0:
+            total_fell = True
 
-    if regressed:
+    if unassigned_rose or total_fell:
+        cause = (
+            "  A shared person_group was emptied — Immich's deleteEmptyGroups\n"
+            "  then nulls every face in that group.\n"
+            if unassigned_rose else
+            "  Source asset_face rows were deleted outright. Nothing here has any\n"
+            "  business deleting a face the source user owns.\n"
+        )
         print(
-            "\n  *** STOP: a source user's own faces lost their person assignment. ***\n"
-            "  The sidecar must never write to the source account. This is the\n"
-            "  signature of a shared person_group being emptied — Immich's\n"
-            "  deleteEmptyGroups then nulls every face in that group.\n"
+            "\n  *** STOP: the sidecar changed the source user's own faces. ***\n"
+            "  The sidecar must never write to the source account.\n"
+            + cause +
             "  Do not run another cycle. Restore from your pre-run pg_dump and\n"
             "  report which statement ran, from the DEBUG log above."
         )
     else:
-        print("\n  OK — no source faces lost their person assignment.")
+        print("\n  OK — no source faces lost their person assignment or disappeared.")
 
     # Verify results
     from src.db import fetch_all, fetch_one
@@ -182,18 +200,22 @@ async def main():
 
     await close_pool()
 
-    if regressed:
+    if unassigned_rose or total_fell:
         # Repeated, because the banner above is now thousands of lines up the
         # scrollback, and returned so the exit status carries it too. The
         # verification dump is left in deliberately: if this has fired, it is
         # the evidence you want.
+        what = (
+            "lost their person assignment" if unassigned_rose
+            else "were deleted"
+        )
         print(
-            "\n=== FAILED: a source user's own faces lost their person assignment ==="
+            f"\n=== FAILED: a source user's own faces {what} ==="
             "\n    Scroll up to the face-health section. Do not run another cycle."
         )
     else:
         print("\n=== Done ===")
-    return regressed
+    return unassigned_rose or total_fell
 
 
 if __name__ == "__main__":

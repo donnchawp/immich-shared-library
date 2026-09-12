@@ -34,25 +34,14 @@ docker compose up --build
 
 **Run a single manual sync cycle (for testing):**
 ```bash
-# Must run inside a Docker container on the immich_default network
-# (Postgres is not exposed to the host)
-docker run --rm --network immich_default \
-  -v $(pwd):/app \
-  -v /path/to/immich-app/library:/data \
-  -v /path/to/immich-app/external_library:/external_library \
-  -e DB_HOSTNAME=<postgres-container-ip> \
-  -e DB_PORT=5432 -e DB_USERNAME=postgres -e DB_PASSWORD=postgres \
-  -e DB_DATABASE_NAME=immich \
-  -e IMMICH_API_URL=http://immich_server:2283 \
-  -e IMMICH_API_KEY=<key> \
-  -e SOURCE_USER_ID=<uuid> -e TARGET_USER_ID=<uuid> \
-  -e TARGET_LIBRARY_ID=<uuid> \
-  -e SHARED_PATH_PREFIX=/external_library/source_user/ \
-  -e TARGET_PATH_PREFIX=/external_library/target_user/ \
-  -e LOG_LEVEL=DEBUG \
-  -w /app python:3.12-slim \
-  bash -c 'pip install asyncpg httpx pydantic pydantic-settings && python test_sync.py'
+./run-utility.sh test_sync.py
 ```
+
+Postgres is not exposed to the host, so this has to run in a container on the
+Immich network; `run-utility.sh` is what arranges that, taking its dependency
+list from `pyproject.toml` and its settings from `.env`. Do not hand-roll the
+`docker run` — `test_sync.py` exits 1 without a `.env`, and points `CONFIG_FILE`
+at `config.yaml` when one exists, at which point `src.config` needs pyyaml.
 
 The repo has an automated test suite (pytest) run against a scratch `immich_test` database built from a real schema dump. `make help` lists the targets: `test`, `testdb`, `testdb-clean`, `schema-dump`, `lint`. Postgres isn't published to the host, so `make test` runs pytest in a container on the `immich_default` network — running `pytest` directly on the host will fail to connect. `test_sync.py` remains the manual integration test that runs one full sync cycle against a real, live Immich instance and prints verification queries; its invocation is unchanged, only its printed output labels changed for v3.2.0.
 
