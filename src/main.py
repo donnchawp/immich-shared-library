@@ -5,7 +5,7 @@ import sys
 import asyncpg
 
 from src.config import settings
-from src.db import acquire, close_pool, execute, fetch_one, init_pool, reset_pool
+from src.db import acquire, close_pool, execute, fetch_one, init_pool, reset_pool, should_reset_pool
 from src.health import start_health_server, stop_health_server
 from src.immich_api import ImmichAPI
 from src.schema import validate_cluster_group, validate_schema
@@ -301,15 +301,6 @@ def validate_config() -> bool:
     return True
 
 
-def _is_connection_error(exc: Exception) -> bool:
-    """Check if an exception indicates a broken database connection."""
-    return isinstance(exc, (
-        OSError,  # covers ConnectionResetError, socket.gaierror, etc.
-        asyncpg.exceptions.ConnectionDoesNotExistError,
-        asyncpg.exceptions.InterfaceError,
-    ))
-
-
 async def sync_loop() -> None:
     """Main sync loop that periodically syncs assets."""
     while True:
@@ -317,7 +308,7 @@ async def sync_loop() -> None:
             await run_full_sync()
         except Exception as e:
             logger.exception("Error in sync loop")
-            if _is_connection_error(e) or (e.__cause__ and _is_connection_error(e.__cause__)):
+            if should_reset_pool(e) or (e.__cause__ and should_reset_pool(e.__cause__)):
                 logger.info("Detected connection error, resetting database pool")
                 try:
                     await reset_pool()

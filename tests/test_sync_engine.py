@@ -5,8 +5,11 @@ table, so the sidecar no longer maps source persons to target persons. Tasks
 3-5 removed every read/write of `_face_sync_person_map`; this task retires
 the table itself.
 """
+import asyncio
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 
+import asyncpg
 import pytest
 
 from src import main as main_module
@@ -14,6 +17,7 @@ from src.cleanup import cleanup_reassigned_faces
 from src.main import _drop_person_map_table
 from src.ml_sync import sync_faces_for_asset, sync_faces_incremental
 from src.person_sync import cleanup_orphaned_persons, sync_person_names
+from src.schema import SchemaValidationError
 from src import sync_engine
 from src.sync_engine import _sync_faces_guarded
 from tests.conftest import (
@@ -420,7 +424,14 @@ async def test_a_failed_phase_4_step_does_not_undo_the_deletions_before_it(conn,
         return 1
 
     async def always_fails(c):
-        raise RuntimeError("Immich dropped the group between our read and our write")
+        # A real constraint violation, not a Python raise. A Python raise
+        # leaves the transaction perfectly healthy, so a _cleanup_step with no
+        # savepoint at all -- a bare try/except -- passes every assertion
+        # below, including the closing SELECT 1. Only an aborted transaction
+        # tells the two implementations apart.
+        await c.execute(
+            'INSERT INTO asset_face (id, "assetId") VALUES (gen_random_uuid(), NULL)'
+        )
 
     monkeypatch.setattr(sync_engine, "transaction", patched_transaction)
     monkeypatch.setattr(sync_engine.settings, "sync_jobs", [])
@@ -446,4 +457,177 @@ async def test_a_failed_phase_4_step_does_not_undo_the_deletions_before_it(conn,
 
 
 async def _zero():
+    return 0
+
+
+def _quiet_cycle(monkeypatch, conn):
+    """Neutralise every phase and point them all at one connection.
+
+    Returns nothing; callers re-patch whichever phase they are exercising.
+    """
+    @asynccontextmanager
+    async def patched_transaction():
+        yield conn
+
+    monkeypatch.setattr(sync_engine, "transaction", patched_transaction)
+    monkeypatch.setattr(sync_engine.settings, "sync_jobs", [])
+    for name in (
+        "cleanup_stale_mappings", "sync_faces_incremental", "sync_person_names",
+        "sync_person_thumbnails", "cleanup_deleted_assets",
+        "cleanup_reassigned_faces", "cleanup_orphaned_persons",
+    ):
+        monkeypatch.setattr(sync_engine, name, lambda c: _zero())
+
+
+async def test_a_batch_that_syncs_nothing_stops_instead_of_spinning(conn, monkeypatch):
+    """Phase 1's only termination condition when the batch stays full.
+
+    sync_asset's catch-all returns None without recording anything, so a batch
+    of persistently failing assets comes back identical every time. The short-
+    batch exit never fires because the batch is never short. Without the
+    no-progress break this loops forever inside a process whose only liveness
+    signal is a health server that keeps answering 200.
+    """
+    _quiet_cycle(monkeypatch, conn)
+
+    job = SimpleNamespace(
+        name="stuck", source_user_id=None, target_user_id=None, album_id=None,
+    )
+    monkeypatch.setattr(sync_engine.settings, "sync_jobs", [job])
+
+    # Collected, not asserted in place: an assert inside the coroutine raises
+    # AssertionError, which _phase catches and logs like any other phase
+    # failure, and the test passes while proving nothing.
+    limits = []
+
+    async def a_full_batch_of_doomed_assets(c, j, limit=None):
+        limits.append(limit)
+        # However many rows the caller asked for -- which is what makes the
+        # batch "full" from the loop's point of view.
+        return [{"id": None, "originalFileName": "x.jpg"}] * (limit or 500)
+
+    monkeypatch.setattr(sync_engine, "get_unsynced_source_assets", a_full_batch_of_doomed_assets)
+    monkeypatch.setattr(sync_engine, "validate_schema", lambda c: _zero())
+    monkeypatch.setattr(
+        sync_engine, "validate_cluster_group", lambda c, uids: _zero()
+    )
+    monkeypatch.setattr(sync_engine, "find_duplicate_filenames", lambda c, a, j: _empty_set())
+    monkeypatch.setattr(sync_engine, "sync_asset", lambda c, s, j: _none())
+
+    stats = await asyncio.wait_for(sync_engine.run_full_sync(), timeout=10)
+
+    assert len(limits) == 1, f"the loop ran {len(limits)} times; it must break after one"
+    assert stats["assets_synced"] == 0
+    # The query must be asked for BATCH_SIZE rows. If the two ever disagree,
+    # the short-batch exit decides the source is exhausted on a full batch and
+    # the no-progress guard above becomes unreachable -- the loop still
+    # terminates, so every other assertion here passes, which is why this one
+    # is separate and explicit.
+    assert limits == [sync_engine.BATCH_SIZE], (
+        f"asked for {limits}, expected [{sync_engine.BATCH_SIZE}]"
+    )
+
+
+async def test_one_job_failing_does_not_cost_the_jobs_behind_it(conn, monkeypatch):
+    """Phase 1 is guarded per job, not per phase."""
+    _quiet_cycle(monkeypatch, conn)
+
+    bad = SimpleNamespace(name="bad", source_user_id=None, target_user_id=None, album_id=None)
+    good = SimpleNamespace(name="good", source_user_id=None, target_user_id=None, album_id=None)
+    monkeypatch.setattr(sync_engine.settings, "sync_jobs", [bad, good])
+
+    seen = []
+
+    async def fails_for_the_first_job(c, j, limit=None):
+        seen.append(j.name)
+        if j.name == "bad":
+            raise RuntimeError("this job's source library is unreadable")
+        return []
+
+    monkeypatch.setattr(sync_engine, "get_unsynced_source_assets", fails_for_the_first_job)
+
+    await sync_engine.run_full_sync()
+
+    assert seen == ["bad", "good"], f"the second job never ran: {seen}"
+
+
+async def test_a_failed_phase_3_still_lets_phase_4_run(conn, monkeypatch):
+    """The asymmetry that made this the Phase 0 bug one phase later.
+
+    sync_person_thumbnails hardlinks files, so it can fail deterministically on
+    a full disk or a permissions change. Unguarded, that exception left
+    run_full_sync before Phase 4, so cleanup_deleted_assets never ran again --
+    every cycle, for as long as the disk stayed full.
+    """
+    _quiet_cycle(monkeypatch, conn)
+
+    ran = []
+
+    async def disk_is_full(c):
+        raise OSError(28, "No space left on device")
+
+    async def records_that_it_ran(c):
+        ran.append("phase4")
+        return 0
+
+    monkeypatch.setattr(sync_engine, "sync_person_thumbnails", disk_is_full)
+    monkeypatch.setattr(sync_engine, "cleanup_deleted_assets", records_that_it_ran)
+
+    stats = await sync_engine.run_full_sync()
+
+    assert ran == ["phase4"], "Phase 4 was skipped by Phase 3's failure"
+    assert stats["persons_updated"] == 0
+
+
+async def test_a_schema_change_stops_the_cycle_rather_than_limping_on(conn, monkeypatch):
+    """The one failure a phase guard must not swallow.
+
+    Every later phase is more SQL against a shape we no longer understand.
+    Continuing would turn one clear error into a burst of confusing ones.
+    """
+    _quiet_cycle(monkeypatch, conn)
+
+    ran = []
+
+    async def schema_moved(c):
+        raise SchemaValidationError("asset_face.personId is gone")
+
+    monkeypatch.setattr(sync_engine, "sync_faces_incremental", schema_moved)
+    monkeypatch.setattr(
+        sync_engine, "cleanup_deleted_assets", lambda c: _record_and_zero(ran)
+    )
+
+    with pytest.raises(SchemaValidationError):
+        await sync_engine.run_full_sync()
+
+    assert ran == [], "the cycle carried on past a schema change"
+
+
+async def test_a_broken_connection_reaches_the_sync_loop(conn, monkeypatch):
+    """sync_loop resets the pool on one, so a phase guard must not eat it.
+
+    Swallowed, it would leave every later phase failing against a dead
+    connection and the pool never rebuilt.
+    """
+    _quiet_cycle(monkeypatch, conn)
+
+    async def connection_died(c):
+        raise asyncpg.exceptions.ConnectionDoesNotExistError("connection is closed")
+
+    monkeypatch.setattr(sync_engine, "sync_person_names", connection_died)
+
+    with pytest.raises(asyncpg.exceptions.ConnectionDoesNotExistError):
+        await sync_engine.run_full_sync()
+
+
+async def _empty_set():
+    return set()
+
+
+async def _none():
+    return None
+
+
+async def _record_and_zero(into):
+    into.append("ran")
     return 0
