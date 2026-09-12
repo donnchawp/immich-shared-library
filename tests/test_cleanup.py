@@ -1,6 +1,9 @@
 from uuid import uuid4
 
-from src.cleanup import cleanup_deleted_assets, cleanup_reassigned_faces
+import asyncpg
+import pytest
+
+from src.cleanup import cleanup_deleted_assets, cleanup_reassigned_faces, cleanup_stale_mappings
 from tests.conftest import (
     make_cluster_group, make_asset, make_face, make_person, make_person_group,
     make_synced_pair, make_user,
@@ -161,3 +164,63 @@ async def test_one_undeletable_asset_does_not_poison_the_cleanup_transaction(con
     assert await conn.fetchval(
         "SELECT count(*) FROM _face_sync_asset_map WHERE target_asset_id = $1", doomed
     ) == 1
+
+
+async def test_stale_mapping_is_pruned_only_when_the_target_is_hard_deleted(conn):
+    """The Phase 0 contract, in one test: hard-deleted goes, trashed stays.
+
+    The trashed half is the subtle one and was only ever asserted in a
+    docstring. A trashed asset still has its row, so restoring it from the
+    trash has to find its original mapping intact — pruning there would make
+    the source re-sync and create a second copy alongside the restored one.
+    """
+    cg = await make_cluster_group(conn)
+    src = await make_user(conn, cluster_group_id=cg)
+    tgt = await make_user(conn, cluster_group_id=cg)
+
+    # Hard-deleted: the id was never inserted into `asset`, which is what a
+    # mapping looks like once Immich has emptied the trash.
+    gone_src, gone_tgt = await make_synced_pair(conn, src, tgt, target_asset_id=uuid4())
+
+    trashed_tgt = await make_asset(conn, tgt)
+    await conn.execute(
+        'UPDATE asset SET "deletedAt" = NOW() WHERE id = $1', trashed_tgt
+    )
+    _, _ = await make_synced_pair(conn, src, tgt, target_asset_id=trashed_tgt)
+
+    live_src, live_tgt = await make_synced_pair(conn, src, tgt)
+
+    assert await cleanup_stale_mappings(conn) == 1
+
+    remaining = {
+        r["target_asset_id"] for r in
+        await conn.fetch("SELECT target_asset_id FROM _face_sync_asset_map")
+    }
+    assert gone_tgt not in remaining
+    assert trashed_tgt in remaining
+    assert live_tgt in remaining
+
+
+async def test_phase_2_would_have_wedged_on_the_mapping_phase_0_prunes(conn):
+    """Why Phase 0 exists, demonstrated rather than asserted about.
+
+    The stale mapping's target asset does not exist, so inserting a face for
+    it violates asset_face's foreign key. Before the prune moved to Phase 0
+    that abort happened mid-cycle and took the prune down with it, so the
+    mapping survived and every later cycle failed identically. Here the
+    violation is provoked directly, to pin the fact that the mapping really is
+    a live foreign-key hazard and not a theoretical one, and then the prune is
+    shown to remove it.
+    """
+    cg = await make_cluster_group(conn)
+    src = await make_user(conn, cluster_group_id=cg)
+    tgt = await make_user(conn, cluster_group_id=cg)
+    _, dead_target = await make_synced_pair(conn, src, tgt, target_asset_id=uuid4())
+
+    await conn.execute("SAVEPOINT probe")
+    with pytest.raises(asyncpg.ForeignKeyViolationError):
+        await make_face(conn, dead_target)
+    await conn.execute("ROLLBACK TO SAVEPOINT probe")
+
+    assert await cleanup_stale_mappings(conn) == 1
+    assert await conn.fetchval("SELECT count(*) FROM _face_sync_asset_map") == 0
