@@ -1,3 +1,6 @@
+from uuid import uuid4
+
+import src.person_sync as person_sync
 from tests.conftest import (
     make_cluster_group, make_asset, make_face, make_person, make_person_group,
     make_synced_pair, make_user,
@@ -7,6 +10,7 @@ from src.person_sync import (
     delete_target_person_in_shared_group,
     ensure_target_person,
     sync_person_names,
+    sync_person_thumbnails,
 )
 
 
@@ -500,3 +504,130 @@ async def test_orphan_cleanup_spares_a_named_person(conn, pair):
     }
     assert named_group in survivors
     assert unnamed_group not in survivors
+
+
+# --- Person thumbnails ---------------------------------------------------
+#
+# Since v3.2.0 the path is keyed on the person *group*, not the person:
+#   {upload}/thumbs/{ownerId}/{pgid[0:2]}/{pgid[2:4]}/{pgid}{suffix}
+# Source and target share the group id, so only the owner directory changes.
+# Getting a shard slice or the owner wrong produces a plausible-looking path
+# that nothing else notices: _hardlink_person_thumbnail returns "" on any
+# OSError and sync_person_thumbnails silently counts zero.
+
+
+def _thumb_for(base, owner, pgid, suffix=".jpeg"):
+    pg = str(pgid)
+    return base / "thumbs" / str(owner) / pg[:2] / pg[2:4] / f"{pg}{suffix}"
+
+
+async def _seed_source_thumbnail(conn, tmp_path, monkeypatch, src, pg):
+    """Put a real file where the source person's thumbnail lives."""
+    monkeypatch.setattr(person_sync.settings, "upload_location_mount", str(tmp_path))
+    source_file = _thumb_for(tmp_path, src, pg)
+    source_file.parent.mkdir(parents=True, exist_ok=True)
+    source_file.write_bytes(b"jpeg-bytes")
+    await conn.execute(
+        'UPDATE person SET "thumbnailPath" = $1 WHERE "ownerId" = $2 AND "personGroupId" = $3',
+        str(source_file), src, pg,
+    )
+    return source_file
+
+
+async def test_thumbnail_is_hardlinked_to_the_group_keyed_target_path(
+    conn, pair, tmp_path, monkeypatch
+):
+    """The v3.2.0 path shape, asserted exactly rather than by "a file appeared"."""
+    cg, src, tgt = pair
+    pg = await make_person_group(conn, cg)
+    await make_person(conn, src, pg, name="Granny")
+    await make_person(conn, tgt, pg, name="Granny")
+    await _map_synced_pair(conn, src, tgt, person_group_id=pg)
+    source_file = await _seed_source_thumbnail(conn, tmp_path, monkeypatch, src, pg)
+
+    assert await sync_person_thumbnails(conn) == 1
+
+    expected = _thumb_for(tmp_path, tgt, pg)
+    assert expected.exists(), f"nothing at {expected}"
+    assert expected.stat().st_ino == source_file.stat().st_ino, "copied, not hardlinked"
+    stored = await conn.fetchval(
+        'SELECT "thumbnailPath" FROM person WHERE "ownerId" = $1 AND "personGroupId" = $2',
+        tgt, pg,
+    )
+    assert stored == str(expected)
+
+
+async def test_an_existing_target_thumbnail_is_left_alone(
+    conn, pair, tmp_path, monkeypatch
+):
+    """Fill-only: the target owns their thumbnail once they have one."""
+    cg, src, tgt = pair
+    pg = await make_person_group(conn, cg)
+    await make_person(conn, src, pg, name="Granny")
+    await make_person(conn, tgt, pg, name="Granny")
+    await _map_synced_pair(conn, src, tgt, person_group_id=pg)
+    await _seed_source_thumbnail(conn, tmp_path, monkeypatch, src, pg)
+    await conn.execute(
+        'UPDATE person SET "thumbnailPath" = $1 WHERE "ownerId" = $2 AND "personGroupId" = $3',
+        "/their/own/choice.jpeg", tgt, pg,
+    )
+
+    assert await sync_person_thumbnails(conn) == 0
+
+    stored = await conn.fetchval(
+        'SELECT "thumbnailPath" FROM person WHERE "ownerId" = $1 AND "personGroupId" = $2',
+        tgt, pg,
+    )
+    assert stored == "/their/own/choice.jpeg"
+
+
+async def test_thumbnails_are_not_linked_for_a_group_no_synced_asset_carries(
+    conn, pair, tmp_path, monkeypatch
+):
+    """_SYNCED_GROUP_SCOPE, on the one cross-user write that creates files.
+
+    The decoy map row is load-bearing here for the same reason as elsewhere:
+    without it every EXISTS over _face_sync_asset_map is false and the
+    statement cannot do anything at all, so the assertion proves nothing.
+    """
+    await _decoy_map_row(conn)
+
+    cg, src, tgt = pair
+    pg = await make_person_group(conn, cg)
+    await make_person(conn, src, pg, name="Stranger")
+    await make_person(conn, tgt, pg, name="Stranger")
+    # Mapped pair, but no synced asset carries a face in this group: the target
+    # found this person on their own photos.
+    await _map_synced_pair(conn, src, tgt)
+    await _seed_source_thumbnail(conn, tmp_path, monkeypatch, src, pg)
+
+    assert await sync_person_thumbnails(conn) == 0
+    assert not _thumb_for(tmp_path, tgt, pg).exists()
+
+
+def test_a_thumbnail_outside_the_upload_directory_is_refused(tmp_path, monkeypatch):
+    """The path comes from Immich's database, so it is not ours to trust."""
+    monkeypatch.setattr(person_sync.settings, "upload_location_mount", str(tmp_path))
+
+    result = person_sync._hardlink_person_thumbnail(
+        person_group_id=uuid4(),
+        target_user_id=uuid4(),
+        source_thumbnail_path="/etc/passwd",
+    )
+
+    assert result == ""
+
+
+def test_a_missing_source_file_is_not_recorded_as_linked(tmp_path, monkeypatch):
+    """Returning a path for a file that was never linked would leave the target
+    person pointing at nothing, and sync_person_thumbnails counting it."""
+    monkeypatch.setattr(person_sync.settings, "upload_location_mount", str(tmp_path))
+    pg, tgt = uuid4(), uuid4()
+
+    result = person_sync._hardlink_person_thumbnail(
+        person_group_id=pg,
+        target_user_id=tgt,
+        source_thumbnail_path=str(_thumb_for(tmp_path, uuid4(), pg)),
+    )
+
+    assert result == ""

@@ -13,6 +13,36 @@ from tests.conftest import (
 )
 
 
+# The tables every other test in this suite builds on. Not a full inventory:
+# enough that a fixture which loaded only its opening extensions cannot pass.
+CORE_TABLES = (
+    "user", "cluster_group", "person_group", "person", "asset", "asset_face",
+    "asset_exif", "asset_file", "asset_job_status", "face_search", "smart_search",
+    "album", "album_asset", "album_user", "system_metadata",
+)
+
+
+async def test_the_fixture_actually_loaded(conn):
+    """Assert presence before asserting absence.
+
+    test_schema_is_v3_2_0 below checks that person.id is gone by looking for it
+    in information_schema and expecting NULL. That query returns NULL just as
+    readily when `person` does not exist at all -- so on a half-loaded fixture
+    the test whose entire job is "the scratch database really is on v3.2.0"
+    passes. psql without ON_ERROR_STOP made that reachable: one failed CREATE
+    EXTENSION took every dependent table with it and `make testdb` still
+    reported success.
+    """
+    missing = [
+        t for t in CORE_TABLES
+        if await conn.fetchval("SELECT to_regclass($1)", f'"{t}"') is None
+    ]
+    assert not missing, (
+        f"the scratch database is missing {missing}; re-run `make testdb` and "
+        f"read its output for a failed CREATE EXTENSION"
+    )
+
+
 async def test_schema_is_v3_2_0(conn):
     """person.id is gone and asset_face.personGroupId exists."""
     person_id_col = await conn.fetchval(

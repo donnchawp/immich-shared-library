@@ -8,6 +8,19 @@ TEST_DB_URL = os.environ.get(
     "TEST_DB_URL", "postgresql://postgres:postgres@immich_postgres:5432/immich_test"
 )
 
+# The suite writes to whatever TEST_DB_URL names. Every test rolls back, so the
+# damage from a wrong value is bounded, but "bounded" is doing a lot of work
+# there when the obvious wrong value is the live Immich database sitting on the
+# same host under a name one word shorter. A typo should not be survivable-by-
+# luck.
+_DB_NAME = TEST_DB_URL.rsplit("/", 1)[-1].split("?")[0]
+if not _DB_NAME.endswith("_test"):
+    raise RuntimeError(
+        f"TEST_DB_URL points at {_DB_NAME!r}, which does not end in '_test'. "
+        f"Refusing to run: this suite writes to that database. Use `make test`, "
+        f"or point TEST_DB_URL at a scratch database."
+    )
+
 
 @pytest_asyncio.fixture
 async def conn():
