@@ -56,4 +56,4 @@ test:  ## Run the tests in a container on the Immich network (PYTEST_ARGS=tests/
 	  bash -c 'pip install -q -e ".[dev]" && python -m pytest -v $(PYTEST_ARGS)'
 
 lint:  ## Syntax-check all source files
-	python3 -m py_compile src/*.py
+	python3 -m py_compile src/*.py *.py tests/*.py
