@@ -8,6 +8,9 @@ ways the whole cycle used to wedge.
 """
 from uuid import uuid4
 
+import asyncpg
+
+import src.asset_sync as asset_sync
 from src.asset_sync import sync_asset
 from src.config import SyncJob
 from tests.conftest import make_asset
@@ -127,3 +130,69 @@ async def test_a_path_that_escapes_the_target_prefix_is_contained_to_its_own_ass
     assert await sync_asset(conn, source, job) is None
     assert await conn.fetchval("SELECT 1") == 1
     assert await conn.fetchval("SELECT count(*) FROM _face_sync_asset_map") == 0
+
+
+async def test_the_watermark_comes_from_the_database_clock(conn, pair):
+    """synced_at is compared against asset_face."updatedAt", which Postgres sets.
+
+    Taking it from the sidecar container's clock instead means skew puts the
+    watermark in the future, and every source face updated inside that gap is
+    permanently invisible to Phase 2, silently. Comparing it against the
+    database's own clock catches the container-clock version without having to
+    skew anything: under it the two differ by the drift, and drift is exactly
+    what is unbounded.
+    """
+    cg, src, tgt = pair
+    job = await _job(conn, src, tgt)
+
+    source = await conn.fetchrow(
+        "SELECT * FROM asset WHERE id = $1",
+        await make_asset(conn, src, original_path="/external_library/source/w.jpg"),
+    )
+    existing = await _existing_target(conn, job, "/external_library/target/w.jpg")
+
+    assert await sync_asset(conn, source, job) == existing
+
+    drift = await conn.fetchval(
+        """
+        SELECT abs(extract(epoch FROM (NOW() - synced_at)))
+        FROM _face_sync_asset_map WHERE target_asset_id = $1
+        """,
+        existing,
+    )
+    assert drift < 1, f"synced_at is {drift}s from the database clock"
+
+
+async def test_a_non_checksum_unique_violation_is_not_recorded_as_a_duplicate(
+    conn, pair, monkeypatch
+):
+    """_face_sync_skipped is permanent and never retried.
+
+    Every UniqueViolationError inside the savepoint used to land in the
+    duplicate-checksum branch, so an asset that was not a duplicate could be
+    excluded from syncing forever, under a reason naming the wrong cause. A
+    violation carrying no constraint_name must not be read as a checksum
+    collision either -- the branch keys off an exact match.
+    """
+    cg, src, tgt = pair
+    job = await _job(conn, src, tgt)
+
+    source = await conn.fetchrow(
+        "SELECT * FROM asset WHERE id = $1",
+        await make_asset(conn, src, original_path="/external_library/source/u.jpg"),
+    )
+
+    async def unique_violation_on_something_else(*a, **kw):
+        raise asyncpg.UniqueViolationError("duplicate key value violates something else")
+
+    monkeypatch.setattr(
+        asset_sync, "_sync_asset_files", unique_violation_on_something_else
+    )
+
+    assert await sync_asset(conn, source, job) is None
+
+    skipped = await conn.fetchval(
+        "SELECT count(*) FROM _face_sync_skipped WHERE source_asset_id = $1", source["id"]
+    )
+    assert skipped == 0, "a non-checksum violation was recorded as a permanent duplicate"
+    assert await conn.fetchval("SELECT 1") == 1, "the transaction is unusable"

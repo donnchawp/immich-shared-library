@@ -1,6 +1,6 @@
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import PurePosixPath
 from uuid import UUID, uuid4
 
@@ -10,6 +10,12 @@ from src.config import SyncJob
 from src.file_ops import hardlink_asset_files, remove_hardlinks
 
 logger = logging.getLogger(__name__)
+
+# The partial unique index Immich puts on external-library assets:
+# ("ownerId", "libraryId", checksum) WHERE "libraryId" IS NOT NULL. A violation
+# of this one, and only this one, means the target user already has the photo.
+_CHECKSUM_CONSTRAINT = "asset_ownerId_libraryId_checksum_idx"
+
 
 # Video stream tables added in Immich v3. All are PK'd on assetId and CASCADE
 # from asset. Copied so Immich doesn't need to re-probe synced video assets.
@@ -202,10 +208,20 @@ async def sync_asset(conn: asyncpg.Connection, source: asyncpg.Record, job: Sync
 
     Uses a savepoint so a single asset failure doesn't roll back the entire batch.
     Returns the new target asset ID, or None on failure.
+
+    Every timestamp written here is SQL NOW(), never the container's clock.
+    _face_sync_asset_map.synced_at is the watermark Phase 2 compares against
+    asset_face."updatedAt", which Postgres always sets, so the two sides have to
+    come from one clock: a sidecar container running even slightly ahead of the
+    database stamps a watermark in the future, and every source face updated
+    inside that gap is permanently invisible to Phase 2. Nothing would report
+    it. NOW() is transaction-start time, so a whole batch shares one watermark
+    and a face updated mid-batch stays inside the window -- conservative in the
+    direction that costs a re-scan rather than a lost face, which is the same
+    reasoning sync_faces_incremental documents for its own NOW().
     """
     source_id = source["id"]
     target_id = uuid4()
-    now = datetime.now(timezone.utc)
     target_user_id = job.target_user_id
     target_library_id = job.target_library_id
 
@@ -245,10 +261,10 @@ async def sync_asset(conn: asyncpg.Connection, source: asyncpg.Record, job: Sync
                 result = await conn.execute(
                     """
                     INSERT INTO _face_sync_asset_map (source_asset_id, target_asset_id, source_user_id, target_user_id, synced_at)
-                    VALUES ($1, $2, $3, $4, $5)
+                    VALUES ($1, $2, $3, $4, NOW())
                     ON CONFLICT DO NOTHING
                     """,
-                    source_id, existing, job.source_user_id, target_user_id, now,
+                    source_id, existing, job.source_user_id, target_user_id,
                 )
                 if result == "INSERT 0 1":
                     logger.info("Recovered mapping for existing asset %s -> %s", source_id, existing)
@@ -322,12 +338,11 @@ async def sync_asset(conn: asyncpg.Connection, source: asyncpg.Record, job: Sync
             await conn.execute(
                 """
                 INSERT INTO asset_job_status ("assetId", "facesRecognizedAt", "metadataExtractedAt", "duplicatesDetectedAt", "ocrAt")
-                SELECT $1, $2, $2, $2, src."ocrAt"
+                SELECT $1, NOW(), NOW(), NOW(), src."ocrAt"
                 FROM asset_job_status src
-                WHERE src."assetId" = $3
+                WHERE src."assetId" = $2
                 """,
                 target_id,
-                now,
                 source_id,
             )
 
@@ -400,19 +415,32 @@ async def sync_asset(conn: asyncpg.Connection, source: asyncpg.Record, job: Sync
             await conn.execute(
                 """
                 INSERT INTO _face_sync_asset_map (source_asset_id, target_asset_id, source_user_id, target_user_id, synced_at)
-                VALUES ($1, $2, $3, $4, $5)
+                VALUES ($1, $2, $3, $4, NOW())
                 """,
                 source_id,
                 target_id,
                 job.source_user_id,
                 target_user_id,
-                now,
             )
 
             logger.info("Synced asset %s -> %s (%s)", source_id, target_id, source["originalFileName"])
             return target_id
 
-    except asyncpg.UniqueViolationError:
+    except asyncpg.UniqueViolationError as e:
+        # Only the checksum constraint means "the target already has this
+        # photo". Every other unique violation inside this savepoint was
+        # landing here too and being written to _face_sync_skipped, which is
+        # permanent and never retried -- so an asset that was not a duplicate
+        # could be excluded from syncing forever, under a reason that names the
+        # wrong cause. The realistic other candidate is the mapping INSERT
+        # above, whose target_asset_id is a fresh uuid4.
+        if e.constraint_name != _CHECKSUM_CONSTRAINT:
+            remove_hardlinks(created_files)
+            logger.exception(
+                "Failed to sync asset %s: unique violation on %s",
+                source_id, e.constraint_name,
+            )
+            return None
         remove_hardlinks(created_files)
         await conn.execute(
             """
