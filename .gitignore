@@ -1,5 +1,7 @@
 __pycache__/
 *.pyc
+*.egg-info/
+.pip-cache/
 .venv/
 .superpowers/
 .DS_Store

@@ -69,7 +69,7 @@ The interactive setup wizard handles everything: connecting to Immich, detecting
 **Prerequisites:** Create an admin API key in Immich (**Account Settings > API Keys**) and have `python3` installed on the host.
 
 ```bash
-python3 setup.py
+python3 configure.py
 ```
 
 The wizard will:
@@ -128,11 +128,11 @@ volumes:
   - ./config.yaml:/app/config.yaml:ro
 ```
 
-The setup wizard (`python3 setup.py`) generates both files and enables the volume mount automatically.
+The setup wizard (`python3 configure.py`) generates both files and enables the volume mount automatically.
 
 **Backward compatibility:** If no `config.yaml` exists, the sidecar falls back to per-job environment variables (`SOURCE_USER_ID`, `TARGET_USER_ID`, etc.), so existing `.env`-only deployments continue to work unchanged.
 
-> **Migrating from env vars to config.yaml:** Create a `config.yaml` with your job(s), move album config from `TARGET_ALBUM_ID` to per-job `album_id`, add the volume mount to `docker-compose.yml`, and remove the per-job env vars from `.env`. Re-running `python3 setup.py` does this automatically.
+> **Migrating from env vars to config.yaml:** Create a `config.yaml` with your job(s), move album config from `TARGET_ALBUM_ID` to per-job `album_id`, add the volume mount to `docker-compose.yml`, and remove the per-job env vars from `.env`. Re-running `python3 configure.py` does this automatically.
 
 ### Manual Setup
 
@@ -505,7 +505,7 @@ Because identity is shared rather than mirrored, there's no merge step and no du
 
 ### Development Setup
 
-This is optional. The sidecar runs entirely in Docker and `setup.py` uses only the Python standard library. A local venv is only useful for IDE autocomplete, linting, and syntax checking.
+This is optional. The sidecar runs entirely in Docker and `configure.py` uses only the Python standard library. A local venv is only useful for IDE autocomplete, linting, and syntax checking.
 
 ```bash
 python3 -m venv .venv
@@ -549,7 +549,7 @@ make test     # run the tests
 1. Run the setup wizard to configure your `.env` and connect to a local Immich instance:
 
    ```bash
-   python3 setup.py
+   python3 configure.py
    ```
 
 2. Copy some photos into the source user's watched folders or upload them via the Immich app/web UI. Wait for Immich to finish processing (metadata, thumbnails, CLIP, faces).

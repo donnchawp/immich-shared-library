@@ -28,18 +28,26 @@ schema-dump:  ## Re-dump the live Immich schema into the test fixture
 	  test -s $(DUMP_TMP).clean; \
 	  mv $(DUMP_TMP).clean tests/fixtures/schema_v3.2.0.sql
 
-testdb:  ## (Re)create the scratch test database from the fixture
-	docker exec $(PG) psql -U postgres -c "DROP DATABASE IF EXISTS immich_test;"
+testdb: testdb-clean  ## (Re)create the scratch test database from the fixture
 	docker exec $(PG) psql -U postgres -c "CREATE DATABASE immich_test;"
 	docker exec -i $(PG) psql -U postgres -q -d immich_test < tests/fixtures/schema_v3.2.0.sql
 
 testdb-clean:  ## Drop the scratch test database
 	docker exec $(PG) psql -U postgres -c "DROP DATABASE IF EXISTS immich_test;"
 
+# The pip cache is mounted, not rebuilt: the container is thrown away each run,
+# so without it every `make test` re-downloads and re-builds seven wheels before
+# a single test runs.
+#
+# Dependencies come from pyproject.toml, not a list repeated here. The setup
+# wizard is named configure.py precisely so this works: as setup.py it was
+# executed by the build frontend, which blocked on its input() prompt and died
+# with EOFError.
 test:  ## Run the tests in a container on the Immich network (PYTEST_ARGS=tests/x.py to narrow)
 	docker run --rm --network $(NETWORK) -v $(CURDIR):/app -w /app \
+	  -v $(CURDIR)/.pip-cache:/root/.cache/pip \
 	  -e TEST_DB_URL=$(TEST_DB_URL) python:3.12-slim \
-	  bash -c 'pip install -q asyncpg pytest pytest-asyncio pydantic pydantic-settings httpx pyyaml && python -m pytest -v $(PYTEST_ARGS)'
+	  bash -c 'pip install -q -e ".[dev]" && python -m pytest -v $(PYTEST_ARGS)'
 
 lint:  ## Syntax-check all source files
 	python3 -m py_compile src/*.py
