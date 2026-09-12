@@ -61,20 +61,29 @@ async def test_drop_person_map_table_removes_it(conn):
     """The migration step must actually drop _face_sync_person_map.
 
     Asserting against `to_regclass` on the ambient scratch DB alone would be
-    vacuous either way: the fixture (dumped from a live instance) still
-    creates the table, so a fresh `make testdb` always has it, and a
-    same-session re-run would find it already dropped by an earlier test.
-    Neither state proves anything about the sidecar's own code.
+    vacuous either way: a same-session re-run would find the table already
+    dropped by an earlier test, and whether a fresh `make testdb` has it at
+    all depends on when the fixture was last dumped. Neither state proves
+    anything about the sidecar's own code.
 
-    Instead this exercises the real drop statement (`src.main.
-    _drop_person_map_table`) directly against the per-test transactional
-    connection, and checks the *transition*: the table is present
-    beforehand (so a no-op implementation would fail this test) and gone
-    afterward. The transaction rolls back at the end of the test, so the
-    shared scratch DB is untouched for the next test.
+    So the table is seeded here rather than assumed, like the migration tests
+    below do. It used to lean on the fixture still carrying it, which was a
+    trap: the sidecar drops that table from any live instance it runs against,
+    so the first `make schema-dump` after deploying this branch took it out of
+    the fixture and broke this test with an error about the wrong thing.
+
+    This exercises the real drop statement (`src.main._drop_person_map_table`)
+    against the per-test transactional connection and checks the *transition*:
+    present beforehand, so a no-op implementation fails, and gone afterward.
+    The transaction rolls back, so the shared scratch DB is untouched.
     """
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS _face_sync_person_map (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid()
+        )
+    """)
     before = await conn.fetchval("SELECT to_regclass('_face_sync_person_map')")
-    assert before is not None, "fixture no longer seeds the table -- update this test"
+    assert before is not None
 
     await _drop_person_map_table(conn)
 

@@ -2,7 +2,6 @@
 -- PostgreSQL database dump
 --
 
-\restrict QHfP56dk7S2LHjpVMI2hzHCHmZIOEYbSzbZZjuvnT3g2EQrEaGNEAIomt7MG2Nu
 
 -- Dumped from database version 14.19 (Debian 14.19-1.pgdg12+1)
 -- Dumped by pg_dump version 14.19 (Debian 14.19-1.pgdg12+1)
@@ -656,21 +655,6 @@ CREATE TABLE public._face_sync_meta (
 
 
 ALTER TABLE public._face_sync_meta OWNER TO postgres;
-
---
--- Name: _face_sync_person_map; Type: TABLE; Schema: public; Owner: postgres
---
-
-CREATE TABLE public._face_sync_person_map (
-    id uuid DEFAULT gen_random_uuid() NOT NULL,
-    source_person_id uuid NOT NULL,
-    target_person_id uuid NOT NULL,
-    source_user_id uuid NOT NULL,
-    target_user_id uuid NOT NULL
-);
-
-
-ALTER TABLE public._face_sync_person_map OWNER TO postgres;
 
 --
 -- Name: _face_sync_skipped; Type: TABLE; Schema: public; Owner: postgres
@@ -1971,22 +1955,6 @@ ALTER TABLE ONLY public._face_sync_meta
 
 
 --
--- Name: _face_sync_person_map _face_sync_person_map_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
---
-
-ALTER TABLE ONLY public._face_sync_person_map
-    ADD CONSTRAINT _face_sync_person_map_pkey PRIMARY KEY (id);
-
-
---
--- Name: _face_sync_person_map _face_sync_person_map_source_person_id_target_user_id_key; Type: CONSTRAINT; Schema: public; Owner: postgres
---
-
-ALTER TABLE ONLY public._face_sync_person_map
-    ADD CONSTRAINT _face_sync_person_map_source_person_id_target_user_id_key UNIQUE (source_person_id, target_user_id);
-
-
---
 -- Name: _face_sync_skipped _face_sync_skipped_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
@@ -2723,6 +2691,13 @@ CREATE UNIQUE INDEX "UQ_assets_owner_checksum" ON public.asset USING btree ("own
 
 
 --
+-- Name: _face_sync_asset_map_user_pair_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX _face_sync_asset_map_user_pair_idx ON public._face_sync_asset_map USING btree (target_user_id, source_user_id);
+
+
+--
 -- Name: activity_albumId_assetId_idx; Type: INDEX; Schema: public; Owner: postgres
 --
 
@@ -3280,13 +3255,6 @@ CREATE INDEX face_index ON public.face_search USING vchordrq (embedding public.v
         build_threads = 4
         sampling_factor = 1024
         ');
-
-
---
--- Name: idx_face_sync_person_map_target; Type: INDEX; Schema: public; Owner: postgres
---
-
-CREATE INDEX idx_face_sync_person_map_target ON public._face_sync_person_map USING btree (target_person_id);
 
 
 --
@@ -4722,5 +4690,4 @@ ALTER TABLE ONLY public.workflow_step
 -- PostgreSQL database dump complete
 --
 
-\unrestrict QHfP56dk7S2LHjpVMI2hzHCHmZIOEYbSzbZZjuvnT3g2EQrEaGNEAIomt7MG2Nu
 

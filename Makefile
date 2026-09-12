@@ -8,7 +8,12 @@ help:  ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  %-14s %s\n", $$1, $$2}'
 
 schema-dump:  ## Re-dump the live Immich schema into the test fixture
-	docker exec $(PG) pg_dump -U postgres --schema-only immich > tests/fixtures/schema_v3.2.0.sql
+	# The \restrict/\unrestrict tokens pg_dump 17.6+ emits are random per run.
+	# Left in, every dump diffs against the last one and the fixture stops
+	# being useful as a 'did Immich's schema move?' check. They only guard
+	# psql restores against untrusted dumps; this one is ours.
+	docker exec $(PG) pg_dump -U postgres --schema-only immich \
+	  | grep -vE '^\\(un)?restrict ' > tests/fixtures/schema_v3.2.0.sql
 
 testdb:  ## (Re)create the scratch test database from the fixture
 	docker exec $(PG) psql -U postgres -c "DROP DATABASE IF EXISTS immich_test;"
