@@ -367,12 +367,20 @@ split; nothing else will.
    only record of which target person mirrored which source person:
    ```bash
    docker exec immich_postgres pg_dump -U postgres -d immich -t _face_sync_person_map > person_map.sql
+   grep -c INSERT person_map.sql
    ```
    This fails with "no matching tables were found" if you never ran a sidecar
    old enough to have mirrored persons. That's fine, there is nothing to save.
-3. **Save your people.** The reset in step 5 deletes every person for every member of the group, names
+
+   Check the count, though, and read the error if there is one. The shell truncates `person_map.sql`
+   before `pg_dump` runs, so a wrong container name or a failed authentication leaves you with an empty
+   file that looks exactly like the "nothing to save" case. Step 5 drops the table and this is the only
+   copy.
+3. **Save your people.** The reset in step 6 deletes every person for every member of the group, names
    and birth dates included, and there is no undo. Export the names and copy each person's face
-   thumbnail out first, so you can re-apply them afterwards:
+   thumbnail out first, so you can re-apply them afterwards. This query is written for the schema you
+   are still on: if you have already upgraded Immich, `person.id` and `asset_face."personId"` are gone,
+   so join on `p."personGroupId" = af."personGroupId"` and drop `p.id`.
    ```bash
    docker exec immich_postgres psql -U postgres -d immich --csv -c "
      SELECT u.name AS owner, p.name AS person_name, p.\"birthDate\", p.\"thumbnailPath\",
@@ -389,11 +397,34 @@ split; nothing else will.
    than schema v4. It runs `_migrate_v4()`, which strips the copied face embeddings, and then exits with
    a cluster-group error. That error is expected, and it is what makes this step safe: startup runs the
    migration first and validates the cluster group second, so the migration commits and the process dies
-   before any sync can touch anything. Confirm you see both lines:
+   before any sync can touch anything.
+
+   You need this version of the sidecar to get `_migrate_v4()` at all, so pull and rebuild. Running
+   `docker compose up -d` on its own reuses the old image, which has no v4 migration, and the step
+   quietly does nothing:
+   ```bash
+   git pull
+   docker compose up -d --build
+   docker compose logs --tail 40
+   ```
+   Confirm you see the migration line, followed by the process dying on the cluster group:
    ```
    Migrated tracking tables from v3 to v4
-   ERROR ... do not share one cluster group
+   ...
+   src.schema.SchemaValidationError: All configured users must share one cluster group so face
+   identity can be copied between them. Found 3 groups: ...
    ```
+   It is an unhandled traceback, not a logged error. That is the intended outcome here.
+
+   Then **stop it again**:
+   ```bash
+   docker compose down
+   ```
+   This is not optional. `docker-compose.yml` sets `restart: always`, so the container is in a crash
+   loop right now, dying on the cluster-group check and being restarted. That is harmless while the
+   check keeps failing. The moment you join the group in step 6 it starts passing, and the next restart
+   walks straight into a sync cycle while Immich is rewriting every `personGroupId` in the group.
+
    Skip this step and every synced face still votes twice in the reset below, which invents people that
    should not exist. (If you had already reset before finding this out, see
    [prune_inflated_people.py](#utility-scripts), which undoes the damage after the fact.)
