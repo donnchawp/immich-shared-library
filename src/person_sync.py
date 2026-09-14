@@ -263,6 +263,13 @@ async def cleanup_orphaned_persons(conn: asyncpg.Connection) -> int:
     account in the database — this table is the only durable record of "the
     sidecar created assets/persons for this pair."
 
+    That guard probes ``person`` by group first and checks the user pair
+    second. Written the other way round, as ``map JOIN person``, it is the same
+    predicate but Postgres ran it as a correlated subplan that seq-scanned
+    ``person`` once per candidate row: 8 minutes a cycle on ~54k persons, with
+    the sidecar re-running it every minute. This shape plans as a hash anti
+    join and takes 0.2s.
+
     Note: a target person row can exist for one cycle before the map gains a
     row for that pair (e.g. if person-metadata sync ever ran ahead of the
     asset sync that produces the first mapped asset). That row is simply
@@ -290,10 +297,13 @@ async def cleanup_orphaned_persons(conn: asyncpg.Connection) -> int:
               WHERE m.target_user_id = t."ownerId"
           )
           AND NOT EXISTS (
-              SELECT 1 FROM _face_sync_asset_map m
-              JOIN person s ON s."personGroupId" = t."personGroupId"
-                           AND s."ownerId" = m.source_user_id
-              WHERE m.target_user_id = t."ownerId"
+              SELECT 1 FROM person s
+              WHERE s."personGroupId" = t."personGroupId"
+                AND EXISTS (
+                    SELECT 1 FROM _face_sync_asset_map m
+                    WHERE m.target_user_id = t."ownerId"
+                      AND m.source_user_id = s."ownerId"
+                )
           )
           AND NOT EXISTS (
               SELECT 1 FROM asset_face af
