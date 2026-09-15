@@ -2,10 +2,58 @@ import logging
 
 import asyncpg
 
-from src.file_ops import remove_hardlinks
-from src.person_sync import get_or_create_target_person
+from src.file_ops import owned_file_paths, remove_hardlinks
 
 logger = logging.getLogger(__name__)
+
+
+async def delete_target_asset(conn: asyncpg.Connection, target_asset_id) -> bool:
+    """Delete one target asset: its hardlinks, its album rows, the asset, the mapping.
+
+    Files go before records. If the unlink fails the DB records stay and the
+    next cycle retries; if the DB delete fails afterwards, the hardlinks are
+    merely orphan files, which is safe — the source still holds a link to the
+    inode.
+
+    Runs inside its own savepoint. Callers batch these in one transaction, and
+    catching the exception is not enough on its own: a failed statement leaves
+    Postgres in an aborted transaction, so without the rollback every later
+    item dies with InFailedSQLTransactionError and the whole batch unwinds
+    because of one bad asset.
+
+    Returns True if the asset was deleted, False if it failed.
+    """
+    try:
+        async with conn.transaction():
+            # Paths we created and may delete — excludes the XMP sidecar,
+            # which is not ours. See file_ops.owned_file_paths.
+            file_paths = await owned_file_paths(conn, target_asset_id)
+            remove_hardlinks(file_paths)
+
+            # Belt and braces: album_asset."assetId" is already ON DELETE
+            # CASCADE, and the album_asset_delete_audit trigger fires either
+            # way (it is guarded on pg_trigger_depth() <= 1). Kept as a
+            # statement of intent and against the FK changing, at the cost of
+            # one round trip per deleted asset.
+            await conn.execute(
+                'DELETE FROM album_asset WHERE "assetId" = $1',
+                target_asset_id,
+            )
+
+            # Cascades to exif, files, faces, smart_search, job_status
+            await conn.execute("DELETE FROM asset WHERE id = $1", target_asset_id)
+
+            await conn.execute(
+                "DELETE FROM _face_sync_asset_map WHERE target_asset_id = $1",
+                target_asset_id,
+            )
+        return True
+    except Exception:
+        # A savepoint can't survive a lost connection; see sync_engine._cleanup_step.
+        if conn.is_closed():
+            raise
+        logger.exception("Failed to delete target asset %s", target_asset_id)
+        return False
 
 
 async def cleanup_deleted_assets(conn: asyncpg.Connection) -> int:
@@ -29,42 +77,12 @@ async def cleanup_deleted_assets(conn: asyncpg.Connection) -> int:
     count = 0
     for row in orphaned:
         target_id = row["target_asset_id"]
-        source_id = row["source_asset_id"]
-
-        try:
-            # Get file paths before deleting records
-            files = await conn.fetch(
-                'SELECT path FROM asset_file WHERE "assetId" = $1',
-                target_id,
+        if await delete_target_asset(conn, target_id):
+            logger.info(
+                "Cleaned up deleted asset: source=%s target=%s",
+                row["source_asset_id"], target_id,
             )
-            file_paths = [f["path"] for f in files]
-
-            # Remove hardlinked files first — if this fails, DB records stay
-            # and we can retry next cycle. If DB delete fails after file removal,
-            # the hardlinks are just orphan files (safe, since they're hardlinks
-            # and the source still has a link to the inode).
-            remove_hardlinks(file_paths)
-
-            # Remove from albums before deleting asset
-            await conn.execute(
-                'DELETE FROM album_asset WHERE "assetId" = $1',
-                target_id,
-            )
-
-            # Delete the target asset (cascades to exif, files, faces, smart_search, job_status)
-            await conn.execute("DELETE FROM asset WHERE id = $1", target_id)
-
-            # Remove the mapping
-            await conn.execute(
-                "DELETE FROM _face_sync_asset_map WHERE target_asset_id = $1",
-                target_id,
-            )
-
-            logger.info("Cleaned up deleted asset: source=%s target=%s", source_id, target_id)
             count += 1
-
-        except Exception:
-            logger.exception("Failed to clean up target asset %s", target_id)
 
     return count
 
@@ -97,72 +115,81 @@ async def cleanup_stale_mappings(conn: asyncpg.Connection) -> int:
 
 
 async def cleanup_reassigned_faces(conn: asyncpg.Connection) -> int:
-    """Handle person merges: when source faces are reassigned to different persons.
+    """Propagate source-side face reassignment to the target copy.
 
-    Detects when a source face's personId no longer matches the expected mapping
-    and updates the target face accordingly.
-    Returns the number of faces updated.
+    Under cluster groups the person group id is shared, so this is a straight
+    copy — no mapping table, no canonical resolution, no mirror-of-mirror loop.
+    Matching is by exact bounding box, which is how the face was copied in the
+    first place.
+
+    The UPDATE is idempotent: once the target matches the source the WHERE
+    clause stops selecting it, so repeated cycles converge.
+
+    The source is authoritative. If the target user reassigns a copied face
+    to a different person themselves, this reverts it on the next cycle,
+    because the bounding box still matches and the group ids now differ
+    again. That is intentional, not a bug.
+
+    It is also the last source-authoritative write left -- names are fill-only
+    and visibility is not synced at all, both per-user by design in v3.2.0 --
+    so the case for it stands on its own: the copies carry no embedding and
+    sourceType 'manual', so they cannot re-cluster themselves out of a bad
+    assignment, and the source is the only account whose recognition still runs
+    on these faces.
+
+    Known limitations, left unhandled because they are edge cases rather than
+    correctness defects:
+    - If the source asset has two faces with identical bounding boxes,
+      Postgres picks one arbitrarily for the join.
+    - If the target user edits a copied face's bounding box, the match fails
+      on every future cycle and that face is never reconciled again.
+
+    Like ``sync_faces_for_asset`` (src/ml_sync.py), this refuses to point a
+    target face at a group the target user has no ``person`` row on: with no
+    row, Immich's ``deleteEmptyGroups`` can drop the group and null the face.
+    Phase 2 normally creates that row via ``ensure_target_person``, but Phase 2
+    runs in its own transaction (src/sync_engine.py) and may have failed, so
+    the guard is stated here rather than assumed. An unassignment
+    (``sf."personGroupId" IS NULL``) needs no person row and still propagates.
+
+    Cost, understood and accepted: this is a full scan of
+    ``_face_sync_asset_map`` joined twice to ``asset_face``, every cycle,
+    forever, and it does nothing almost every time. Unlike Phase 2 it has no
+    watermark, and it must not grow one — a watermark records that work was
+    done, and this function's whole job is to converge state that *something
+    else* failed to apply, including a Phase 2 pass that advanced its own
+    watermark before dying. A drift it skips once it would skip permanently.
+    The cost is bounded by index lookups and grows linearly with the library;
+    if that stops being acceptable the answer is a cheap pre-check (does any
+    mapped source face have ``updatedAt`` past the last full pass?) gating the
+    expensive statement, not a watermark on the statement itself.
     """
-    # Find target faces where the source face's person has changed.
-    # User IDs are derived from the tracking table instead of global settings.
-    #
-    # The expected target person is computed the same way get_or_create_target_person
-    # resolves it, so mirror faces don't get flagged as mismatched every cycle:
-    #   - `origin` catches the loop-guard case: the source face's person is itself
-    #     a sidecar mirror whose canonical origin lives in the target account, so
-    #     the face maps straight to that real person.
-    #   - `pm` is the normal mirror mapping keyed on the source person.
-    mismatched = await conn.fetch(
+    updated = await conn.fetch(
         """
-        SELECT
-            tf.id AS target_face_id,
-            sf."personId" AS new_source_person_id,
-            tf."personId" AS current_target_person_id,
-            m.source_user_id,
-            m.target_user_id
+        UPDATE asset_face tf
+        SET "personGroupId" = sf."personGroupId"
         FROM _face_sync_asset_map m
         JOIN asset_face sf ON sf."assetId" = m.source_asset_id AND sf."deletedAt" IS NULL
-        JOIN asset_face tf ON tf."assetId" = m.target_asset_id AND tf."deletedAt" IS NULL
-            AND tf."boundingBoxX1" = sf."boundingBoxX1"
-            AND tf."boundingBoxY1" = sf."boundingBoxY1"
-            AND tf."boundingBoxX2" = sf."boundingBoxX2"
-            AND tf."boundingBoxY2" = sf."boundingBoxY2"
-        LEFT JOIN _face_sync_person_map pm ON pm.source_person_id = sf."personId"
-            AND pm.target_user_id = m.target_user_id
-        LEFT JOIN _face_sync_person_map mir ON mir.target_person_id = sf."personId"
-        LEFT JOIN person origin ON origin.id = mir.source_person_id
-            AND origin."ownerId" = m.target_user_id
-        WHERE tf."personId" IS DISTINCT FROM COALESCE(origin.id, pm.target_person_id)
+        WHERE tf."assetId" = m.target_asset_id
+          AND tf."deletedAt" IS NULL
+          AND tf."boundingBoxX1" = sf."boundingBoxX1"
+          AND tf."boundingBoxY1" = sf."boundingBoxY1"
+          AND tf."boundingBoxX2" = sf."boundingBoxX2"
+          AND tf."boundingBoxY2" = sf."boundingBoxY2"
+          AND tf."personGroupId" IS DISTINCT FROM sf."personGroupId"
+          AND (
+              sf."personGroupId" IS NULL
+              OR EXISTS (
+                  SELECT 1 FROM person p
+                  WHERE p."ownerId" = m.target_user_id
+                    AND p."personGroupId" = sf."personGroupId"
+              )
+          )
+        RETURNING tf.id, tf."personGroupId"
         """,
     )
 
-    count = 0
-    for row in mismatched:
-        new_target_person_id = None
-        if row["new_source_person_id"] is not None:
-            new_target_person_id = await get_or_create_target_person(
-                conn, row["new_source_person_id"],
-                row["source_user_id"], row["target_user_id"],
-            )
+    if updated:
+        logger.info("Reassigned %d target faces to match source", len(updated))
 
-        # Idempotency guard. get_or_create_target_person is the authoritative
-        # resolver: it walks the full mirror chain to the canonical person. The
-        # SELECT above only approximates that with a single hop (mir/origin), so
-        # for chained/bidirectional mirrors it flags faces that already hold the
-        # correct canonical person. Rewriting the same value every cycle is the
-        # "Updated N faces due to person reassignment" loop — only write when the
-        # resolved person genuinely differs from the current one.
-        if new_target_person_id == row["current_target_person_id"]:
-            continue
-
-        await conn.execute(
-            'UPDATE asset_face SET "personId" = $1 WHERE id = $2',
-            new_target_person_id,
-            row["target_face_id"],
-        )
-        count += 1
-
-    if count > 0:
-        logger.info("Updated %d faces due to person reassignment", count)
-
-    return count
+    return len(updated)

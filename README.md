@@ -1,10 +1,10 @@
 # Immich Shared Library
 
-A Docker sidecar service that syncs a subset of [Immich](https://immich.app/) photos from one user to another — without duplicating ML processing.
+A Docker sidecar service that syncs a subset of [Immich](https://immich.app/) photos from one user to another, without duplicating ML processing.
 
 ## The Problem
 
-Immich's built-in partner sharing lets you view another user's library, but it's limited: you share your entire library or nothing, and face recognition doesn't work on partner-shared photos — you can't search for or browse by people in your partner's library.
+Immich's built-in partner sharing lets you view another user's library, but it shares your entire library or nothing, and shared assets stay in the other user's account, so they don't land in your own timeline, memories, or albums. Since v3.2.0 cluster groups do let you see your own people in shared assets, so if a shared album is enough for you, you may not need this sidecar at all. Use it when you want the other user to genuinely *own* a curated subset of the photos.
 
 The common workaround is symlinking an external library directory so both users point at the same photos. This gives each user their own copy of the assets with full face recognition support, but Immich processes each user's assets independently through the full ML pipeline:
 
@@ -15,10 +15,10 @@ The common workaround is symlinking an external library directory so both users 
 | CLIP embedding (smart search) | 2x (GPU) | 1x (copied) |
 | Face detection | 2x (GPU) | 1x (copied) |
 | Face recognition | 2x (GPU) | 1x (copied) |
-| Person clustering | Independent per user | Mirrored from source |
-| Person names | Must name separately | Synced automatically |
+| Person clustering | Independent per user | Shared identity (`personGroupId` copied verbatim) |
+| Person names | Must name separately | Auto-filled once if empty; never overwritten after |
 
-With 1,000 shared photos, the symlink approach queues 5,000+ extra ML jobs (metadata, thumbnails, CLIP, face detection, face recognition) that produce identical results. Each user also gets independent person clusters, so you'd need to name each person twice — and the clusters may group faces differently.
+With 1,000 shared photos, the symlink approach queues 5,000+ extra ML jobs (metadata, thumbnails, CLIP, face detection, face recognition) that produce identical results. Each user also gets independent person clusters, so you'd need to name each person twice, and the clusters may group faces differently.
 
 ## How It Works
 
@@ -27,15 +27,16 @@ This sidecar connects directly to Immich's PostgreSQL database and, for each sha
 1. Creates a target asset record with remapped file paths
 2. Copies EXIF metadata, CLIP embeddings, face detection results, face recognition data, and edit history (crop/rotate/mirror)
 3. Hardlinks thumbnail and preview files (zero extra disk space)
-4. Creates mirrored person records with hardlinked face thumbnails
+4. Copies each face's `personGroupId` verbatim and, if the target has no `person` row for that group yet, creates one (with hardlinked face thumbnail). Person identity is shared across the cluster group, so there's nothing to mirror
 5. Pre-populates job status so Immich skips all ML processing for these assets
 
-The target user's assets appear instantly with full search, face recognition, and timeline support — no ML queue, no GPU time. The sidecar runs continuously, syncing new assets, propagating person name changes, and cleaning up deletions.
+The target user's assets appear instantly with full search, face recognition, and timeline support. Immich queues no ML jobs for them and spends no GPU time on them. The sidecar runs continuously, syncing new assets, filling in empty person names, and cleaning up deletions.
 
 ## Prerequisites
 
-- **Docker** with `docker compose` — the sidecar builds and runs entirely in Docker, no other development tools required
-- **Immich v3.1.0** (tested). Other v3.x versions may work but the database schema can change between releases — check the [Immich release notes](https://github.com/immich-app/immich/releases) before upgrading. Note: since v3, album ownership lives in `album_user` (role `owner`), and the sidecar copies OCR results (`asset_ocr`/`ocr_search`) and video stream metadata (`asset_video`/`asset_audio`/`asset_keyframe`) alongside CLIP embeddings.
+- **Docker** with `docker compose`. The sidecar builds and runs entirely in Docker, so you need nothing else installed
+- **Immich v3.2.0** (tested). Earlier versions are not supported: v3.2.0 moved person identity into `person_group` and dropped `person.id`. Other v3.2.x versions may work but the database schema can change between releases, so check the [Immich release notes](https://github.com/immich-app/immich/releases) before upgrading. Note: since v3, album ownership lives in `album_user` (role `owner`), and the sidecar copies OCR results (`asset_ocr`/`ocr_search`) and video stream metadata (`asset_video`/`asset_audio`/`asset_keyframe`) alongside CLIP embeddings.
+- **All configured users must share one Immich cluster group** (Account Settings > Sharing > Cluster group). The sidecar copies `asset_face."personGroupId"` verbatim, so source and target must resolve the same identities. It refuses to start otherwise. Joining a group does *not* delete anyone: Immich moves your existing person groups across intact. But until you run **Reset facial recognition** for the group, every member keeps their own separate person groups, so the same human stays split across members and the sidecar has no shared identity to copy. That reset is the step that costs you something: it deletes all people for all users in the group, and existing names and birth dates are lost. Plan for it before you configure anything else. If you are upgrading an instance that already ran an older version of this sidecar, read [Upgrading from Immich v3.1.x](#upgrading-from-immich-v31x) first.
 - Two or more Immich users (at least one source and one target)
 - Source assets must be fully processed by Immich (metadata, faces, CLIP)
 
@@ -53,7 +54,7 @@ The sidecar supports two sync methods. You can use one or both:
 
 ### Example scenario
 
-Alice manages the family photo library in Lightroom Classic and imports the finished edits into Immich via an external library. She uses **External Library Sync** to share a curated subset of family photos with Bob — just the family shots, not the street photography or landscapes.
+Alice manages the family photo library in Lightroom Classic and imports the finished edits into Immich via an external library. She uses **External Library Sync** to share a curated subset of family photos with Bob: just the family shots, not the street photography or landscapes.
 
 Bob uploads all his phone photos through the Immich app. Alice uses **Upload Sync** to pull Bob's entire upload library into her account. The ML data (CLIP embeddings, face detection, face recognition) is copied along with the assets, so Alice gets full search and face recognition on Bob's photos without any duplicate GPU processing.
 
@@ -68,7 +69,7 @@ The interactive setup wizard handles everything: connecting to Immich, detecting
 **Prerequisites:** Create an admin API key in Immich (**Account Settings > API Keys**) and have `python3` installed on the host.
 
 ```bash
-python3 setup.py
+python3 configure.py
 ```
 
 The wizard will:
@@ -77,7 +78,7 @@ The wizard will:
 2. Auto-detect volume mount paths from Immich's `docker-compose.yml`
 3. Let you choose which sync method(s) to configure (external library, upload sync, or both)
 4. Walk you through selecting source/target users
-5. Create the necessary symlinks and external libraries in Immich (with `**/*` exclusion so Immich won't scan them — you must also disable Immich's periodic scan, see [Setup](#setup))
+5. Create the necessary symlinks and external libraries in Immich (with `**/*` exclusion so Immich won't scan them; you must also disable Immich's periodic scan, see [Setup](#setup))
 6. Optionally set up album assignment
 7. Generate a `.env` file with all the correct UUIDs and path prefixes
 
@@ -127,11 +128,11 @@ volumes:
   - ./config.yaml:/app/config.yaml:ro
 ```
 
-The setup wizard (`python3 setup.py`) generates both files and enables the volume mount automatically.
+The setup wizard (`python3 configure.py`) generates both files and enables the volume mount automatically.
 
-**Backward compatibility:** If no `config.yaml` exists, the sidecar falls back to per-job environment variables (`SOURCE_USER_ID`, `TARGET_USER_ID`, etc.) — existing `.env`-only deployments continue to work unchanged.
+**Backward compatibility:** If no `config.yaml` exists, the sidecar falls back to per-job environment variables (`SOURCE_USER_ID`, `TARGET_USER_ID`, etc.), so existing `.env`-only deployments continue to work unchanged.
 
-> **Migrating from env vars to config.yaml:** Create a `config.yaml` with your job(s), move album config from `TARGET_ALBUM_ID` to per-job `album_id`, add the volume mount to `docker-compose.yml`, and remove the per-job env vars from `.env`. Re-running `python3 setup.py` does this automatically.
+> **Migrating from env vars to config.yaml:** Create a `config.yaml` with your job(s), move album config from `TARGET_ALBUM_ID` to per-job `album_id`, add the volume mount to `docker-compose.yml`, and remove the per-job env vars from `.env`. Re-running `python3 configure.py` does this automatically.
 
 ### Manual Setup
 
@@ -172,7 +173,7 @@ Now configure one or both sync methods ([external library](#external-library-syn
 
 Syncs assets from a source user's external library into the target user's account. Use this when both users should see the same set of externally-managed photos (e.g., a shared photo directory on a NAS).
 
-The source user (User A) has an external library that Immich scans and processes normally. You create a *second* external library for the target user (User B) containing a symlink to the same photos. The sidecar creates asset records for User B directly in the database — Immich never scans this target library.
+The source user (User A) has an external library that Immich scans and processes normally. You create a *second* external library for the target user (User B) containing a symlink to the same photos. The sidecar creates asset records for User B directly in the database. Immich never scans this target library.
 
 **Create the symlink** so the target user's external library points to the source user's photos:
 
@@ -184,10 +185,10 @@ The source user (User A) has an external library that Immich scans and processes
     shared/             # Subdirectory to share with User B
       photo2.jpg
       photo3.jpg
-  user_b_shared -> user_a/shared   # Target user's external library (NOT scanned — sidecar handles it)
+  user_b_shared -> user_a/shared   # Target user's external library (NOT scanned, sidecar handles it)
 ```
 
-You can symlink the entire source directory or just a subdirectory — the `SHARED_PATH_PREFIX` controls which source assets are synced.
+You can symlink the entire source directory or just a subdirectory. The `SHARED_PATH_PREFIX` controls which source assets are synced.
 
 **Create the target external library in Immich** for the target user (User B) with an import path that covers the symlink directory (e.g., `/external_library/user_b_shared/`).
 
@@ -205,13 +206,13 @@ Because the target library has the `**/*` exclusion pattern, Immich will ignore 
 
 > **⚠️ Disable Immich's periodic scan, and never run a manual scan on a target library.**
 >
-> Library *watching* (inotify) respects the `**/*` exclusion and is safe. A *scan* is not: it crawls the target library, finds 0 files (because of the exclusion), concludes every sidecar-managed asset is missing from disk, and marks them all **offline** — soft-deleting them so the target user's shared photos disappear. A full library's worth of assets can be offlined in a single scan.
+> Library *watching* (inotify) respects the `**/*` exclusion and is safe. A *scan* is not: it crawls the target library, finds 0 files (because of the exclusion), concludes every sidecar-managed asset is missing from disk, and marks them all **offline**, which soft-deletes them so the target user's shared photos disappear. A full library's worth of assets can be offlined in a single scan.
 >
 > To avoid this:
 > 1. Turn off **Administration > Settings > External Library > Periodic Scanning** (or set no cron schedule). Rely on library watching to discover new *source* files instead.
 > 2. Never click **Scan** on a target library in the UI.
 >
-> Do **not** work around this by removing the `**/*` exclusion pattern. Without it, Immich imports and runs full ML processing (thumbnails, transcoding, CLIP, faces) on every target file itself — duplicating all the work this sidecar exists to avoid. See [issue #3](https://github.com/donnchawp/immich-shared-library/issues/3).
+> Do **not** work around this by removing the `**/*` exclusion pattern. Without it, Immich imports and runs full ML processing (thumbnails, transcoding, CLIP, faces) on every target file itself, which duplicates all the work this sidecar exists to avoid. See [issue #3](https://github.com/donnchawp/immich-shared-library/issues/3).
 
 > **Note:** The sidecar does not trigger library scans itself. It relies on Immich's library watching (or manual scans) to discover new source files. If library watching doesn't work in your environment (e.g., network drives), you can trigger scans manually:
 > ```bash
@@ -234,13 +235,13 @@ TARGET_PATH_PREFIX=/external_library/user_b_shared/
 
 Syncs app/website uploads from a source user into the target user's account. Use this when the source user uploads photos via the Immich mobile app or web UI and you want them to appear in the target user's library too.
 
-The source user (User C) uploads photos normally — Immich stores them in its upload directory and runs ML processing. You create an external library for the target user (User B) containing a symlink to User C's upload directory. The sidecar creates asset records for User B directly in the database.
+The source user (User C) uploads photos normally, so Immich stores them in its upload directory and runs ML processing. You create an external library for the target user (User B) containing a symlink to User C's upload directory. The sidecar creates asset records for User B directly in the database.
 
 **Create the symlink** from a directory inside the target user's external library to the source user's upload directory:
 
 ```
 /external_library/
-  user_b_uploads/     # Target user's external library (NOT scanned — sidecar handles it)
+  user_b_uploads/     # Target user's external library (NOT scanned, sidecar handles it)
     user_c -> /data/upload/cccccccc-cccc-cccc-cccc-cccccccccccc/
 ```
 
@@ -291,7 +292,7 @@ sync_jobs:
     album_id: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"  # Alice's album
 ```
 
-**With env vars (legacy):** Add `TARGET_ALBUM_ID` to `.env` — this applies the same album to all jobs:
+**With env vars (legacy):** Add `TARGET_ALBUM_ID` to `.env`. This applies the same album to all jobs:
 
 ```env
 TARGET_ALBUM_ID=aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa
@@ -309,7 +310,7 @@ The sidecar runs as a standalone compose project that connects to Immich's Docke
 docker compose up -d
 ```
 
-> **Network configuration:** The `docker-compose.yml` assumes Immich's Docker network is named `immich_default` (the default when Immich's compose project is named `immich`). If your Immich setup uses a different network name — for example because of a custom `COMPOSE_PROJECT_NAME`, a different directory name, or a manually defined network — edit the `networks` section at the bottom of `docker-compose.yml` to match:
+> **Network configuration:** The `docker-compose.yml` assumes Immich's Docker network is named `immich_default` (the default when Immich's compose project is named `immich`). If your Immich setup uses a different network name (a custom `COMPOSE_PROJECT_NAME`, a different directory name, or a manually defined network), edit the `networks` section at the bottom of `docker-compose.yml` to match:
 > ```yaml
 > networks:
 >   immich:
@@ -322,7 +323,8 @@ The `UPLOAD_LOCATION` and `EXTERNAL_LIBRARY_DIR` in `.env` must point to the sam
 
 The sidecar will:
 - Wait for the Immich server to become available
-- Create its tracking tables (`_face_sync_asset_map`, `_face_sync_person_map`)
+- Create its tracking tables (`_face_sync_asset_map`, `_face_sync_meta`, `_face_sync_skipped`)
+- Validate the schema and that all configured users share one cluster group
 - Run a sync cycle every 60 seconds (configurable via `SYNC_INTERVAL_SECONDS`)
 
 ## Updating
@@ -334,7 +336,7 @@ git pull
 docker compose up -d --build
 ```
 
-The `--build` flag is required — without it, Docker will keep using the previously built image and your code changes won't take effect.
+The `--build` flag is required. Without it, Docker keeps using the previously built image and your code changes never take effect.
 
 Then check the logs to confirm the sidecar is running cleanly and syncing photos:
 
@@ -342,7 +344,113 @@ Then check the logs to confirm the sidecar is running cleanly and syncing photos
 docker compose logs -f
 ```
 
-Look for "Schema validation passed" on startup and periodic sync cycle messages. If schema validation fails, the logs will tell you exactly which columns or tables changed — this usually means Immich added new required columns that the sidecar needs to supply.
+Look for "Schema validation passed" on startup and periodic sync cycle messages. If schema validation fails, the logs will tell you exactly which columns or tables changed. That usually means Immich added new required columns that the sidecar needs to supply.
+
+### Upgrading from Immich v3.1.x
+
+If you are upgrading an instance that was already running an older version of this sidecar, the order
+matters. Immich's cluster-group migration gives **every user its own new cluster group**, so the moment
+you upgrade, your configured users no longer share one and the sidecar will refuse to start until you
+join them.
+
+Your existing synced data also needs a decision. The older sidecar mirrored each source person into a
+private person row on the target user. Immich's migration turns every one of those mirrored persons
+into its own person group, so the same human ends up split between the source's group and the target's
+leftover mirror, and newly synced assets will use the source's group, leaving two entries for one
+person that drift further apart every cycle. Resetting facial recognition for the group collapses that
+split; nothing else will.
+
+1. **Stop the sidecar** before upgrading Immich. It must not be writing while Immich runs its
+   migrations.
+2. **Back up the database** (see the `pg_dump` note under [Prerequisites](#prerequisites)). Also dump
+   `_face_sync_person_map` on its own, because the sidecar drops that table on its first start and it is the
+   only record of which target person mirrored which source person:
+   ```bash
+   docker exec immich_postgres pg_dump -U postgres -d immich -t _face_sync_person_map > person_map.sql
+   grep -c INSERT person_map.sql
+   ```
+   This fails with "no matching tables were found" if you never ran a sidecar
+   old enough to have mirrored persons. That's fine, there is nothing to save.
+
+   Check the count, though, and read the error if there is one. The shell truncates `person_map.sql`
+   before `pg_dump` runs, so a wrong container name or a failed authentication leaves you with an empty
+   file that looks exactly like the "nothing to save" case. Step 5 drops the table and this is the only
+   copy.
+3. **Save your people.** The reset in step 6 deletes every person for every member of the group, names
+   and birth dates included, and there is no undo. Export the names and copy each person's face
+   thumbnail out first, so you can re-apply them afterwards. This query is written for the schema you
+   are still on: if you have already upgraded Immich, `person.id` and `asset_face."personId"` are gone,
+   so join on `p."personGroupId" = af."personGroupId"` and drop `p.id`.
+   ```bash
+   docker exec immich_postgres psql -U postgres -d immich --csv -c "
+     SELECT u.name AS owner, p.name AS person_name, p.\"birthDate\", p.\"thumbnailPath\",
+            (SELECT count(*) FROM asset_face af
+              WHERE af.\"personId\" = p.id AND af.\"deletedAt\" IS NULL) AS face_count
+       FROM person p JOIN \"user\" u ON u.id = p.\"ownerId\"
+      WHERE p.name <> '' OR p.\"birthDate\" IS NOT NULL
+      ORDER BY face_count DESC;" > named_people.csv
+   ```
+   Then `docker cp immich_server:<thumbnailPath> .` for each row. Without the thumbnails you are
+   re-naming thousands of unlabelled clusters from memory.
+4. **Upgrade Immich** to v3.2.0 and let its migrations finish.
+5. **Start the sidecar once, before joining the group**, but only if you are coming from a sidecar older
+   than schema v4. It runs `_migrate_v4()`, which strips the copied face embeddings, and then exits with
+   a cluster-group error. That error is expected, and it is what makes this step safe: startup runs the
+   migration first and validates the cluster group second, so the migration commits and the process dies
+   before any sync can touch anything.
+
+   You need this version of the sidecar to get `_migrate_v4()` at all, so pull and rebuild. Running
+   `docker compose up -d` on its own reuses the old image, which has no v4 migration, and the step
+   quietly does nothing:
+   ```bash
+   git pull
+   docker compose up -d --build
+   docker compose logs --tail 40
+   ```
+   Confirm you see the migration line, followed by the process dying on the cluster group:
+   ```
+   Migrated tracking tables from v3 to v4
+   ...
+   src.schema.SchemaValidationError: All configured users must share one cluster group so face
+   identity can be copied between them. Found 3 groups: ...
+   ```
+   It is an unhandled traceback, not a logged error. That is the intended outcome here.
+
+   Then **stop it again**:
+   ```bash
+   docker compose down
+   ```
+   This is not optional. `docker-compose.yml` sets `restart: always`, so the container is in a crash
+   loop right now, dying on the cluster-group check and being restarted. That is harmless while the
+   check keeps failing. The moment you join the group in step 6 it starts passing, and the next restart
+   walks straight into a sync cycle while Immich is rewriting every `personGroupId` in the group.
+
+   Skip this step and every synced face still votes twice in the reset below, which invents people that
+   should not exist. (If you had already reset before finding this out, see
+   [prune_inflated_people.py](#utility-scripts), which undoes the damage after the fact.)
+6. **Join the users into one cluster group** (Account Settings > Sharing > Cluster group), then run
+   **Reset facial recognition** for that group and wait for the re-recognition job to finish. Joining
+   alone is not enough: it preserves each member's separate person groups, so identity is still not
+   shared.
+
+   Watch for table bloat while it runs. Nulling every `personGroupId` leaves one dead tuple per face, and
+   each reassignment adds another. Autovacuum reclaims them only if nothing pins the vacuum horizon. A
+   stalled Immich sync stream (`state = active`, `wait_event = ClientRead`) will, and then every recognition
+   query walks the dead index entries instead of the live ones. On a ~950k-face library that was the
+   difference between 132 and 1,000 faces/minute. Check for it with:
+   ```bash
+   docker exec immich_postgres psql -U postgres -d immich -c "select pid, now()-xact_start as age,
+     wait_event from pg_stat_activity where datname='immich' and xact_start < now() - interval '5 minutes';"
+   ```
+   Then `pg_terminate_backend(<pid>)`, followed by `VACUUM (ANALYZE) asset_face;`. Terminate rather than
+   `pg_cancel_backend`: a backend parked in `ClientRead` has no running query to cancel.
+7. **Rebuild and start the sidecar** (`docker compose up -d --build`). It validates the schema and the
+   cluster group on startup and drops the retired `_face_sync_person_map` table.
+8. **Re-apply the names** from your CSV.
+
+Apart from the single migration-only start in step 5, leave the sidecar stopped until step 7.
+Re-recognition rewrites `asset_face."personGroupId"` across the whole cluster group, and the sidecar's
+face-reassignment pass has no reason to race it.
 
 ## Configuration Reference
 
@@ -393,36 +501,42 @@ At least one of `SHARED_PATH_PREFIX` or `UPLOAD_SOURCE_USER_ID` must be set. Bot
 
 ## How the Sync Works
 
-Each sync cycle runs five phases:
+Each sync cycle runs six phases:
 
-1. **New assets** — For each configured sync job (external library, uploads), finds fully-processed source assets not yet synced. Creates target asset records with copied EXIF, CLIP embeddings, faces, and hardlinked thumbnails.
-1b. **Album assignment** — Adds newly synced assets to the target album (if configured). Backfills any previously synced assets that are missing from the album.
-2. **Incremental faces** — Detects face updates on already-synced assets (using a watermark timestamp) and copies new faces.
-3. **Person metadata** — Syncs person name changes, visibility (`isHidden`), and thumbnail updates from source to target.
-4. **Cleanup** — Removes target assets (and their album entries) whose source was deleted or trashed. Detects person merges (face reassignment). Removes orphaned target persons.
+0. **Stale mapping prune**. Drops mappings whose target asset was hard-deleted in Immich, so the source syncs again next cycle. (Trashed targets keep their mapping.) It runs before anything else reads the map, so every later phase can assume its mapping points at a live asset. Run it any later and a hard-deleted target wedges the sidecar permanently: Phase 2 hits a foreign key violation inserting a face for the vanished asset, the cycle aborts, and the prune that would have fixed it never runs.
+1. **New assets**. For each configured sync job (external library, uploads), finds fully-processed source assets not yet synced. Creates target asset records with copied EXIF, CLIP embeddings, faces, and hardlinked thumbnails.
+1b. **Album assignment**. Adds newly synced assets to the target album (if configured). Backfills any previously synced assets that are missing from the album.
+2. **Incremental faces**. Detects face updates on already-synced assets (using a watermark timestamp) and copies new faces.
+3. **Person metadata**. Fills in empty target person names from source and hardlinks missing thumbnails. Visibility is not synced; see below.
+4. **Cleanup**. Removes target assets (and their album entries) whose source was deleted or trashed. Reassigns target faces back to the source's `personGroupId` if they've drifted. Removes unnamed target persons left with no faces. Each of the three is savepointed separately: Phase 4 unlinks thumbnails before deleting the rows that name them, and the filesystem doesn't roll back.
 
 ## How Faces Are Handled
 
-When the sidecar syncs an asset, it copies the source user's face detection data (bounding boxes, embeddings) and creates a **mirrored person** for the target user. The source user's person names, visibility, and thumbnails are propagated to these mirrored persons automatically on every sync cycle. The source user is the authority — if they rename "Mom" to "Mother", the target user's mirrored person updates to match.
+Under cluster groups, person identity (`personGroupId`) is shared between source and target, so there's nothing to mirror. When the sidecar syncs a face, it copies the `personGroupId` verbatim and, if the target user has no `person` row for that group yet, creates one (copying name, thumbnail, visibility, birth date from the source's row).
 
-### Duplicate people
+After that, per-cycle sync is asymmetric by design:
+- **Names**: only fills an *empty* target name. If the target user has named the person themselves, the sidecar never overwrites it. Names are per-user in v3.2.0.
+- **Visibility** (`isHidden`): inherited once when the target's `person` row is created, then owned by the target user. Nothing in a cycle overwrites it, so each user can show or hide the same person independently. Unlike `name`, a boolean has no "unset" value to test, so there is no fill-only middle ground. It is either synced or not, and it is not.
+- **Face reassignment**: the source is authoritative. If the target user reassigns a synced face to a different person, the sidecar reverts it on the next cycle (matching by bounding box). This is the one place the source still wins over a target-side edit.
 
-If the target user already has their own photos with detected faces, they'll see duplicate person entries: their own person (from their uploads) and the sidecar's mirrored person (from synced assets). To unify them, use Immich's merge feature in the People view. The sidecar detects the merge on the next cycle and adopts the surviving person, so name and visibility sync continue to work regardless of which direction you merge.
+Because identity is shared rather than mirrored, there's no merge step and no duplicate-person cleanup to perform. A face either belongs to the same `person_group` on both accounts, or it doesn't.
 
 ## Caveats
 
 - **`force=true` jobs**: If someone triggers a force re-process in Immich, it will re-run ML on the target user's assets, overwriting the copied data. The sidecar will re-sync on the next cycle, but there will be temporary GPU usage.
 - **Same filesystem required**: Hardlinks only work when the sidecar container mounts the same volume as Immich. Cross-filesystem setups would need file copies instead.
-- **Regenerating a target thumbnail writes through the hardlink**: Immich overwrites thumbnail files in place rather than writing a temp file and renaming, so any job that rewrites a target asset's thumbnail at the same path (a force re-process, a regenerate-thumbnails run) also rewrites the source user's copy — they share an inode. Applying an edit is *not* affected: Immich writes the edited renders to separate `_edited` filenames, leaving the base thumbnails untouched.
+- **Regenerating a target thumbnail writes through the hardlink**: Immich overwrites thumbnail files in place rather than writing a temp file and renaming, so any job that rewrites a target asset's thumbnail at the same path (a force re-process, a regenerate-thumbnails run) also rewrites the source user's copy, because they share an inode. Applying an edit is *not* affected: Immich writes the edited renders to separate `_edited` filenames, leaving the base thumbnails untouched.
 - **Edits are copied once**: Crop/rotate/mirror history (`asset_edit`) is copied when the asset is first synced, so the target's `isEdited` flag and thumbnails agree. Edits made on the source *after* that aren't propagated, the same as EXIF and OCR data.
-- **Direct database access**: This service writes directly to Immich's database. Tested with v3.1.0 — schema changes in other versions may require updates to this sidecar. Always back up your database before use.
+- **Direct database access**: This service writes directly to Immich's database. Tested with v3.2.0. Schema changes in other versions may require updates to this sidecar. Always back up your database before use.
+- **Cluster group membership is enforced on startup**: the sidecar checks `user.clusterGroupId` for every configured user on startup (and again at the start of each cycle, once there's new work) and refuses to run if they don't match.
+- **Copied faces are invisible to Immich's facial recognition, on purpose**: a copy gets no `face_search` row and `sourceType = 'manual'`. Without both, a cluster-group *Reset facial recognition* double-counts every shared face. A copied embedding is byte-identical to its source, so it sits at distance 0 and votes a second time when recognition checks `minFaces`. A person in two synced photos then becomes a person who should not exist. Sidecars before schema v4 did copy embeddings; `_migrate_v4()` strips them from existing copies on upgrade. The trade-off is that the target's faces can no longer be recognized independently, because the source owns their identity, so leaving the cluster group needs a face-detection re-run.
 - **Single direction**: Sync is one-way (source → target). Changes made to target assets in Immich are not propagated back.
 
 ## Contributing
 
 ### Development Setup
 
-This is optional — the sidecar runs entirely in Docker and `setup.py` uses only the Python standard library. A local venv is only useful for IDE autocomplete, linting, and syntax checking.
+This is optional. The sidecar runs entirely in Docker and `configure.py` uses only the Python standard library. A local venv is only useful for IDE autocomplete, linting, and syntax checking.
 
 ```bash
 python3 -m venv .venv
@@ -440,19 +554,33 @@ The utility scripts read configuration from `.env` (the same file used by `docke
 ./run-utility.sh delete_synced.py
 ```
 
-- **`test_sync.py`** — Run a single sync cycle and print verification queries.
-- **`delete_synced.py`** — Delete all synced assets for a target user. Does not mark sources as skipped, so running the sync engine again will recreate everything. Useful for resetting a target account.
-- **`dedup_synced.py`** — Detect and remove synced assets that duplicate the target user's own uploads (matched by filename + capture date). Use `--match-time` to compare the full timestamp (with TZ normalisation) instead of just the date. Marks duplicates as skipped so the sync engine won't recreate them.
-- **`reset.sh`** — Full reset: stops the sidecar container, deletes all synced assets and mirrored persons from Immich, drops the tracking tables, and removes symlinks from the external library directory. Run directly on the host (not via `run-utility.sh`). Shows a summary and prompts for confirmation before making changes.
+- **`test_sync.py`**. Run a single sync cycle and print verification queries.
+- **`delete_synced.py`**. Deletes all synced assets for a target user. Does not mark sources as skipped, so running the sync engine again will recreate everything. Useful for resetting a target account.
+- **`dedup_synced.py`**. Detects and removes synced assets that duplicate the target user's own uploads (matched by filename + capture date). Use `--match-time` to compare the full timestamp (with TZ normalisation) instead of just the date. Marks duplicates as skipped so the sync engine won't recreate them.
+- **`prune_inflated_people.py`**. Remediation for an instance that ran facial recognition *before* the sidecar reached schema v4. Copied faces used to carry a byte-identical `face_search` embedding, so every synced face was a distance-0 twin of its source and voted twice towards `minFaces`. Clusters cleared the threshold that shouldn't have, and became people who should not exist. `_migrate_v4()` strips the twins, but it can't undo a recognition run that already happened; this can. It judges each person group on its *original* faces alone (a face on an asset that is a target in `_face_sync_asset_map` is a copy) and deletes groups that fall below `minFaces`, leaving their faces unassigned exactly where the threshold would have left them. Named people are never touched, nor is any group that holds no copied face, so a legitimate small person, or one that has since shrunk, is safe. **Dry run by default: read the list of groups it prints before re-running with `--apply`, because the delete is irreversible.** Pass `--min-faces` matching your instance's setting; the script reads Immich's configured value and warns if you disagree with it.
+- **`reset.sh`**. Full reset: stops the sidecar container, deletes all synced assets and the target's person rows on shared groups from Immich, drops the tracking tables, and removes symlinks from the external library directory. Run directly on the host (not via `run-utility.sh`). Shows a summary and prompts for confirmation before making changes. Note it leaves the hardlinked thumbnail files behind. They cost no disk space, being hardlinks, but nothing afterwards knows their paths. `delete_synced.py` removes the files first and is the better tool if you want the filesystem clean.
 
 `delete_synced.py` and `dedup_synced.py` are interactive: they show a summary and prompt for confirmation before making changes, with a dry-run option.
 
-### Testing
+### Automated Tests
+
+The project has an automated test suite (pytest) run against a scratch `immich_test` database built from a real Immich schema dump (`tests/fixtures/schema_v3.2.0.sql`):
+
+```bash
+make testdb   # (re)create the scratch database from the fixture
+make test     # run the tests
+```
+
+`make help` lists all targets (`test`, `testdb`, `testdb-clean`, `schema-dump`, `lint`). Postgres isn't published to the host, so `make test` runs pytest inside a container on the `immich_default` network. Running `pytest` directly on the host will fail to connect. Narrow to one file with `make test PYTEST_ARGS=tests/test_person_sync.py`. If your Immich network or Postgres container is named differently, override them: `NETWORK=myproject_default PG=myproject-postgres-1 make test`. The defaults are `immich_default` and `immich_postgres`.
+
+### Manual Integration Testing
+
+`test_sync.py` is a manual integration script for exercising the sidecar against a real, live Immich instance. The automated tests above don't replace it for end-to-end checks against real data.
 
 1. Run the setup wizard to configure your `.env` and connect to a local Immich instance:
 
    ```bash
-   python3 setup.py
+   python3 configure.py
    ```
 
 2. Copy some photos into the source user's watched folders or upload them via the Immich app/web UI. Wait for Immich to finish processing (metadata, thumbnails, CLIP, faces).
@@ -475,29 +603,31 @@ The utility scripts read configuration from `.env` (the same file used by `docke
    ./run-utility.sh delete_synced.py
    ```
 
-6. Run `test_sync.py` again — it will recreate the deleted assets, confirming the full round-trip works.
+6. Run `test_sync.py` again. It recreates the deleted assets, which confirms the full round-trip works.
 
 ### Project Structure
 
 ```
 src/
-  main.py          — Entry point: config validation, health check, concurrent loops
-  sync_engine.py   — Orchestrates 5-phase sync cycle
-  asset_sync.py    — Asset record creation, EXIF copy, path remapping
-  ml_sync.py       — Face and embedding sync
-  person_sync.py   — Person mirroring, name/visibility sync
-  album_sync.py    — Album assignment and backfill
-  cleanup.py       — Deletion detection and cleanup
-  file_ops.py      — Hardlink creation and removal
-  db.py            — asyncpg connection pool and transaction helpers
-  config.py        — SyncJob dataclass, YAML loader, Pydantic Settings (env var fallback)
-  immich_api.py    — Immich REST API client (health check)
-  health.py        — TCP health check server
+  main.py          - Entry point: config validation, tracking-table migrations, health check, concurrent loops
+  sync_engine.py   - Orchestrates the 6-phase sync cycle
+  asset_sync.py    - Asset record creation, EXIF copy, path remapping
+  ml_sync.py       - Face and embedding sync (copies `personGroupId` verbatim)
+  person_sync.py   - Target person creation, name/thumbnail sync, orphan cleanup
+  album_sync.py    - Album assignment and backfill
+  cleanup.py       - Deletion detection, face reassignment, and cleanup
+  file_ops.py      - Hardlink creation and removal
+  db.py            - asyncpg connection pool and transaction helpers
+  config.py        - SyncJob dataclass, YAML loader, Pydantic Settings (env var fallback)
+  schema.py        - Immich schema validation + cluster-group membership check
+  immich_api.py    - Immich REST API client (health check)
+  health.py        - TCP health check server
 ```
 
 ### Key Things to Know
 
 - Immich tables are **singular** (`asset`, not `assets`) with **camelCase** columns that must be double-quoted in SQL.
-- The sidecar creates two tracking tables prefixed with `_face_sync_` to avoid colliding with Immich's schema.
+- The sidecar creates tracking tables prefixed with `_face_sync_` to avoid colliding with Immich's schema: `_face_sync_asset_map`, `_face_sync_meta` (schema version), `_face_sync_skipped`.
 - Each asset sync uses a PostgreSQL SAVEPOINT so one failure doesn't roll back the entire batch.
 - Cleanup deletes hardlinked files before DB records to avoid orphan files on crash.
+- Person identity (`personGroupId`) is shared across the cluster group, so the sidecar copies it verbatim rather than maintaining a source-to-target person mapping.
