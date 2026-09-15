@@ -168,6 +168,9 @@ async def sync_faces_for_asset_guarded(
                 conn, source_asset_id, target_asset_id, source_user_id, target_user_id,
             )
     except Exception:
+        # A savepoint can't survive a lost connection; see sync_engine._cleanup_step.
+        if conn.is_closed():
+            raise
         logger.exception("Failed to sync faces for asset %s", source_asset_id)
         return None
 
