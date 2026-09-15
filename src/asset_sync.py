@@ -455,6 +455,9 @@ async def sync_asset(conn: asyncpg.Connection, source: asyncpg.Record, job: Sync
         return None
     except Exception:
         remove_hardlinks(created_files)
+        # A savepoint can't survive a lost connection; see sync_engine._cleanup_step.
+        if conn.is_closed():
+            raise
         logger.exception("Failed to sync asset %s", source_id)
         return None
 

@@ -8,20 +8,23 @@ the table itself.
 import asyncio
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
+from uuid import uuid4
 
 import asyncpg
 import pytest
 
 from src import main as main_module
-from src.cleanup import cleanup_reassigned_faces
+from src.asset_sync import sync_asset
+from src.cleanup import cleanup_reassigned_faces, delete_target_asset
+from src.db import is_connection_error
 from src.main import _drop_person_map_table
-from src.ml_sync import sync_faces_for_asset, sync_faces_incremental
+from src.ml_sync import sync_faces_for_asset, sync_faces_for_asset_guarded, sync_faces_incremental
 from src.person_sync import cleanup_orphaned_persons, sync_person_names
 from src.schema import SchemaValidationError
 from src import sync_engine
-from src.sync_engine import _sync_faces_guarded
+from src.sync_engine import _cleanup_step, _sync_faces_guarded
 from tests.conftest import (
-    make_asset, make_face, make_person, make_person_group,
+    TEST_DB_URL, make_asset, make_face, make_person, make_person_group,
     make_synced_pair, make_user,
 )
 
@@ -704,3 +707,47 @@ async def _none():
 async def _record_and_zero(into):
     into.append("ran")
     return 0
+
+
+async def _select_one(c):
+    return await c.fetchval("SELECT 1")
+
+
+_GUARDS = {
+    "cleanup_step": lambda c: _cleanup_step(c, _select_one),
+    "face_guard": lambda c: sync_faces_for_asset_guarded(c, uuid4(), uuid4(), uuid4(), uuid4()),
+    "sync_asset": lambda c: sync_asset(
+        c, {"id": uuid4(), "originalPath": "/nowhere"},
+        SimpleNamespace(target_user_id=uuid4(), target_library_id=uuid4()),
+    ),
+    "delete_target_asset": lambda c: delete_target_asset(c, uuid4()),
+}
+
+
+@pytest.mark.parametrize("guard", _GUARDS.values(), ids=_GUARDS.keys())
+async def test_a_savepoint_guard_does_not_swallow_a_lost_connection(conn, guard):
+    """A dropped connection must reach sync_loop, not be logged and absorbed.
+
+    Restarting Immich's Postgres under a running sidecar killed the connection
+    mid-way through Phase 4. _cleanup_step caught it like any failed statement,
+    logged "the rest of the cycle stands" for a cycle that had committed
+    nothing, and ran the next step into "connection has been released back to
+    the pool". Every per-item savepoint guard has the same shape, so each is
+    checked: killed underneath, it must raise something _phase re-raises as a
+    connection error (db.is_connection_error, which should_reset_pool also
+    accepts), so it reaches sync_loop and the pool gets reset.
+
+    The victim is a connection of its own; the fixture's `conn` does the
+    killing, because its teardown needs it alive to roll back.
+    """
+    victim = await asyncpg.connect(TEST_DB_URL)
+    try:
+        pid = await victim.fetchval("SELECT pg_backend_pid()")
+        await conn.execute("SELECT pg_terminate_backend($1)", pid)
+
+        with pytest.raises(Exception) as caught:
+            await guard(victim)
+    finally:
+        victim.terminate()
+
+    assert is_connection_error(caught.value), repr(caught.value)

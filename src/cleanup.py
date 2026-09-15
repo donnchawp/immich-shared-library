@@ -49,6 +49,9 @@ async def delete_target_asset(conn: asyncpg.Connection, target_asset_id) -> bool
             )
         return True
     except Exception:
+        # A savepoint can't survive a lost connection; see sync_engine._cleanup_step.
+        if conn.is_closed():
+            raise
         logger.exception("Failed to delete target asset %s", target_asset_id)
         return False
 

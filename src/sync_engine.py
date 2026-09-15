@@ -60,11 +60,20 @@ async def _cleanup_step(conn, fn) -> int:
     leave Immich showing broken assets, indefinitely if the failure is
     deterministic. This is the same reasoning _sync_faces_guarded applies to
     Phase 1; it just hadn't been carried down here.
+
+    A lost connection is re-raised, not absorbed. A savepoint contains a failed
+    statement, not a dead socket: nothing already done in this transaction will
+    commit, and every later step would fail on the same closed connection.
+    Swallowing it logged "the rest of the cycle stands" for a cycle that stood
+    nowhere, then ran the next step into "connection has been released back to
+    the pool". Raised, it reaches sync_loop, which resets the pool.
     """
     try:
         async with conn.transaction():
             return await fn(conn)
     except Exception:
+        if conn.is_closed():
+            raise
         logger.exception("Phase 4 step '%s' failed; the rest of the cycle stands", fn.__name__)
         return 0
 
