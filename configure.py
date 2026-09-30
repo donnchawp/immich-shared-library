@@ -5,7 +5,7 @@ Runs on the host (not in Docker) — needs filesystem access for symlinks
 and the Immich web API is typically exposed on the host.
 
 Usage:
-    python3 setup.py
+    python3 configure.py
 """
 
 import getpass

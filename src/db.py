@@ -9,6 +9,37 @@ from src.config import settings
 
 logger = logging.getLogger(__name__)
 
+def is_connection_error(exc: BaseException) -> bool:
+    """Whether this exception is the database connection itself dying.
+
+    Deliberately narrow, and deliberately not the same question as
+    should_reset_pool below. sync_engine's per-phase guard re-raises on this
+    rather than swallowing it, so a false positive here kills a cycle that
+    should have carried on -- which is how a full disk inside
+    sync_person_thumbnails (OSError, errno 28) came to look like a dead socket.
+
+    ConnectionError rather than OSError for exactly that reason: it covers
+    ConnectionResetError and friends without claiming every failed syscall.
+    """
+    return isinstance(exc, (
+        ConnectionError,
+        asyncpg.exceptions.ConnectionDoesNotExistError,
+        asyncpg.exceptions.InterfaceError,
+    ))
+
+
+def should_reset_pool(exc: BaseException) -> bool:
+    """Whether sync_loop should rebuild the pool after this exception.
+
+    Broader than is_connection_error on purpose. This one is a heuristic and
+    its false positives are cheap -- rebuilding a healthy pool costs a
+    reconnect -- so it keeps the whole OSError family, which is what catches
+    socket.gaierror and the rest of the DNS and socket failures that leave a
+    pool full of unusable connections.
+    """
+    return isinstance(exc, OSError) or is_connection_error(exc)
+
+
 _pool: asyncpg.Pool | None = None
 _pool_lock = asyncio.Lock()
 

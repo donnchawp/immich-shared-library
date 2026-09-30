@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPTS=("test_sync.py" "dedup_synced.py" "delete_synced.py")
-NETWORK="immich_default"
+SCRIPTS=("test_sync.py" "dedup_synced.py" "delete_synced.py" "prune_inflated_people.py")
+NETWORK="${NETWORK:-immich_default}"
 IMAGE="python:3.12-slim"
 
 usage() {
@@ -82,4 +82,5 @@ exec docker run --rm -it --network "$NETWORK" \
     -v "${UPLOAD_LOCATION}:${UPLOAD_LOCATION_MOUNT}" \
     -v "${EXTERNAL_LIBRARY_DIR}:${EXTERNAL_LIBRARY_MOUNT}" \
     -w /app "$IMAGE" \
-    bash -c "pip install -q asyncpg httpx pydantic pydantic-settings pyyaml && python $SCRIPT $*"
+    bash -c 'pip install -q -e . && exec python "$@"' \
+    _ "$SCRIPT" "$@"

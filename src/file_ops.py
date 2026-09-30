@@ -132,3 +132,27 @@ def _remap_path(
             parts[i] = part.replace(src_aid, tgt_aid, 1)
 
     return Path(*parts) if parts else source_path
+
+
+async def owned_file_paths(conn, asset_id) -> list[str]:
+    """Paths of an asset's files that the sidecar created and may delete.
+
+    Excludes sidecar (XMP) rows, and that exclusion is a safety guard rather
+    than tidiness. A sidecar row points into the external library, where the
+    target's directory is a symlink to the source's, so unlinking the target's
+    XMP path destroys the SOURCE user's own file. The sidecar never created
+    that file: it was already visible at the target path through the symlink,
+    and only the asset_file row was ever ours. The row still goes, via the
+    CASCADE from asset.
+
+    ``remove_hardlinks``' own ``validate_path_within_upload`` check happens to
+    reject those paths today, but that is a backstop. Callers must not depend
+    on it, which is why the exclusion lives here, once, instead of at each
+    deletion site.
+    """
+    rows = await conn.fetch(
+        'SELECT path FROM asset_file WHERE "assetId" = $1 AND type <> $2',
+        asset_id,
+        "sidecar",
+    )
+    return [r["path"] for r in rows]

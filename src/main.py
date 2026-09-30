@@ -5,16 +5,16 @@ import sys
 import asyncpg
 
 from src.config import settings
-from src.db import close_pool, execute, fetch_one, init_pool, reset_pool
+from src.db import acquire, close_pool, execute, fetch_one, init_pool, reset_pool, should_reset_pool
 from src.health import start_health_server, stop_health_server
 from src.immich_api import ImmichAPI
-from src.schema import validate_schema
+from src.schema import validate_cluster_group, validate_schema
 from src.sync_engine import run_full_sync
 
 logger = logging.getLogger(__name__)
 
 
-SCHEMA_VERSION = 2  # Bump when tracking table schema changes
+SCHEMA_VERSION = 4  # Bump when tracking table schema changes
 
 
 async def ensure_tracking_tables() -> None:
@@ -38,22 +38,14 @@ async def ensure_tracking_tables() -> None:
             UNIQUE (source_asset_id, target_user_id)
         )
     """)
+    # Supports the EXISTS semi-joins in person_sync.py (Task 3), which
+    # correlate on both target_user_id and source_user_id. target_user_id
+    # first: the semi-joins filter on the target side. Without this, those
+    # queries are sequential scans that grow with the library (one row per
+    # synced asset).
     await execute("""
-        CREATE TABLE IF NOT EXISTS _face_sync_person_map (
-            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-            source_person_id UUID NOT NULL,
-            target_person_id UUID NOT NULL,
-            source_user_id UUID NOT NULL,
-            target_user_id UUID NOT NULL,
-            UNIQUE (source_person_id, target_user_id)
-        )
-    """)
-    # Index the reverse lookup: canonical-person resolution and the reassignment
-    # cleanup both query by target_person_id (which the UNIQUE above doesn't cover).
-    # Without it those run sequential scans on every sync cycle.
-    await execute("""
-        CREATE INDEX IF NOT EXISTS idx_face_sync_person_map_target
-            ON _face_sync_person_map (target_person_id)
+        CREATE INDEX IF NOT EXISTS _face_sync_asset_map_user_pair_idx
+            ON _face_sync_asset_map (target_user_id, source_user_id)
     """)
     await execute("""
         CREATE TABLE IF NOT EXISTS _face_sync_skipped (
@@ -81,6 +73,12 @@ async def _run_migrations() -> None:
 
     if current < 2:
         await _migrate_v2()
+
+    if current < 3:
+        await _migrate_v3()
+
+    if current < 4:
+        await _migrate_v4()
 
     await execute(
         """
@@ -137,6 +135,95 @@ async def _migrate_v2() -> None:
             END IF;
         END $$
     """)
+
+
+async def _drop_person_map_table(conn: asyncpg.Connection) -> None:
+    """Drop the retired _face_sync_person_map table.
+
+    v3.2.0 cluster-group port: person identity is now shared via Immich's
+    person_group table, so the sidecar no longer maps source persons to
+    target persons (Tasks 3-5 removed every read/write of this table).
+    Idempotent (IF EXISTS), so safe to run on every migration pass.
+
+    Takes an explicit connection (rather than using the module-level
+    `execute()` pool helper) so the statement itself can be exercised
+    directly in tests against a transactional test connection.
+    """
+    await conn.execute("DROP TABLE IF EXISTS _face_sync_person_map")
+
+
+async def _migrate_v3() -> None:
+    """v3.2.0 cluster-group port: drop the retired person mapping table."""
+    async with acquire() as conn:
+        await _drop_person_map_table(conn)
+
+
+async def _strip_copied_face_embeddings(conn: asyncpg.Connection) -> tuple[int, int]:
+    """Take the sidecar's copied faces out of Immich's recognition candidate pool.
+
+    Copies made before v4 carry a byte-identical clone of the source embedding
+    and the source's 'machine-learning' sourceType. Both are wrong, and only
+    together: searchFaces() inner-joins face_search, so the clone sits at
+    distance 0 from its source and votes a second time when recognition counts
+    matches against minFaces — a person in two synced photos reaches a
+    threshold of 3 on two real sightings. Deleting the embedding stops that;
+    flipping sourceType stops getAllFaces() queueing the copy at all, so it is
+    skipped rather than failing on the embedding we just removed.
+
+    Scoped to target assets in _face_sync_asset_map: these are the rows the
+    sidecar created, and nothing else in the database should be touched.
+
+    Order matters, and so does the transaction. The reclassification goes
+    first: between the two statements the copies are whatever the one already
+    run has left them, and 'machine-learning' with no embedding is the single
+    state this function exists to prevent — getAllFaces() queues those and
+    handleRecognizeFaces fails each one on the embedding that is no longer
+    there. 'manual' with an embedding, the other order's intermediate state, is
+    inert, because sourceType is checked first. The caller wraps both in one
+    transaction so no other connection sees either state, but the order stands
+    on its own for the crash case.
+
+    Returns (embeddings deleted, faces reclassified). Idempotent — a second run
+    finds nothing left to do.
+    """
+    faces = await conn.execute(
+        """
+        UPDATE asset_face af
+        SET "sourceType" = 'manual'
+        FROM _face_sync_asset_map m
+        WHERE af."assetId" = m.target_asset_id
+          AND af."sourceType" <> 'manual'
+        """
+    )
+    embeddings = await conn.execute(
+        """
+        DELETE FROM face_search fs
+        USING asset_face af, _face_sync_asset_map m
+        WHERE fs."faceId" = af.id
+          AND af."assetId" = m.target_asset_id
+        """
+    )
+    return (
+        int(embeddings.rsplit(" ", 1)[-1]),
+        int(faces.rsplit(" ", 1)[-1]),
+    )
+
+
+async def _migrate_v4() -> None:
+    """Stop the sidecar's face copies distorting Immich facial recognition.
+
+    One transaction, not two autocommitted statements: a recognition job that
+    runs between them would see the half-migrated state, and asyncpg
+    autocommits each statement on a bare acquire().
+    """
+    async with acquire() as conn:
+        async with conn.transaction():
+            deleted, reclassified = await _strip_copied_face_embeddings(conn)
+    logger.info(
+        "Removed %d copied face embeddings and reclassified %d copied faces as "
+        "'manual' so Immich's facial recognition ignores them",
+        deleted, reclassified,
+    )
 
 
 async def validate_user_and_library_ids() -> None:
@@ -230,15 +317,6 @@ def validate_config() -> bool:
     return True
 
 
-def _is_connection_error(exc: Exception) -> bool:
-    """Check if an exception indicates a broken database connection."""
-    return isinstance(exc, (
-        OSError,  # covers ConnectionResetError, socket.gaierror, etc.
-        asyncpg.exceptions.ConnectionDoesNotExistError,
-        asyncpg.exceptions.InterfaceError,
-    ))
-
-
 async def sync_loop() -> None:
     """Main sync loop that periodically syncs assets."""
     while True:
@@ -246,7 +324,7 @@ async def sync_loop() -> None:
             await run_full_sync()
         except Exception as e:
             logger.exception("Error in sync loop")
-            if _is_connection_error(e) or (e.__cause__ and _is_connection_error(e.__cause__)):
+            if should_reset_pool(e) or (e.__cause__ and should_reset_pool(e.__cause__)):
                 logger.info("Detected connection error, resetting database pool")
                 try:
                     await reset_pool()
@@ -290,9 +368,22 @@ async def main() -> None:
     await wait_for_immich(api)
 
     await init_pool()
-    await ensure_tracking_tables()
+    # Schema first, migrations second. _migrate_v4 issues a DELETE against
+    # Immich's own face_search table, and running that before anything has
+    # checked Immich's schema means a version that moved or renamed it gives
+    # the operator a raw UndefinedTableError from inside a destructive
+    # statement, rather than the curated "Immich was upgraded" message that
+    # validate_schema exists to produce. Nothing in validate_schema reads the
+    # tracking tables, so the order costs nothing.
     await validate_schema()
+    await ensure_tracking_tables()
+    # Users and libraries first: both this and validate_cluster_group reject a
+    # missing user, but only this one can say which job and which side it came
+    # from. validate_cluster_group keeps its own check for the per-cycle call
+    # in sync_engine, where this function never runs.
     await validate_user_and_library_ids()
+    async with acquire() as conn:
+        await validate_cluster_group(conn, settings.configured_user_ids)
 
     await start_health_server()
 

@@ -1,6 +1,6 @@
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import PurePosixPath
 from uuid import UUID, uuid4
 
@@ -10,6 +10,12 @@ from src.config import SyncJob
 from src.file_ops import hardlink_asset_files, remove_hardlinks
 
 logger = logging.getLogger(__name__)
+
+# The partial unique index Immich puts on external-library assets:
+# ("ownerId", "libraryId", checksum) WHERE "libraryId" IS NOT NULL. A violation
+# of this one, and only this one, means the target user already has the photo.
+_CHECKSUM_CONSTRAINT = "asset_ownerId_libraryId_checksum_idx"
+
 
 # Video stream tables added in Immich v3. All are PK'd on assetId and CASCADE
 # from asset. Copied so Immich doesn't need to re-probe synced video assets.
@@ -43,6 +49,22 @@ def _remap_asset_path(source_path: str, job: SyncJob) -> str:
                 )
             return normalized
     return os.path.normpath(source_path)
+
+
+def _remap_sidecar_path(source_path: str, job: SyncJob) -> str | None:
+    """Remap a sidecar (XMP) file path, or None if the job's prefixes don't cover it.
+
+    Unlike _remap_asset_path, which falls back to returning the source path
+    unchanged, this returns None. A sidecar row is a pointer: writing the
+    source's own path into the target's asset_file would make the target
+    reference a file in the source user's tree, which cleanup could then try
+    to unlink. Better to have no sidecar row than a wrong one.
+    """
+    if not (job.source_path_prefix and job.target_path_prefix):
+        return None
+    if not source_path.startswith(job.source_path_prefix):
+        return None
+    return _remap_asset_path(source_path, job)
 
 
 async def get_unsynced_source_assets(
@@ -186,195 +208,239 @@ async def sync_asset(conn: asyncpg.Connection, source: asyncpg.Record, job: Sync
 
     Uses a savepoint so a single asset failure doesn't roll back the entire batch.
     Returns the new target asset ID, or None on failure.
+
+    Every timestamp written here is SQL NOW(), never the container's clock.
+    _face_sync_asset_map.synced_at is the watermark Phase 2 compares against
+    asset_face."updatedAt", which Postgres always sets, so the two sides have to
+    come from one clock: a sidecar container running even slightly ahead of the
+    database stamps a watermark in the future, and every source face updated
+    inside that gap is permanently invisible to Phase 2. Nothing would report
+    it. NOW() is transaction-start time, so a whole batch shares one watermark
+    and a face updated mid-batch stays inside the window -- conservative in the
+    direction that costs a re-scan rather than a lost face, which is the same
+    reasoning sync_faces_incremental documents for its own NOW().
     """
     source_id = source["id"]
     target_id = uuid4()
-    now = datetime.now(timezone.utc)
     target_user_id = job.target_user_id
     target_library_id = job.target_library_id
 
-    target_path = _remap_asset_path(source["originalPath"], job)
-
-    # Idempotency: check if a target asset already exists for this path + owner + library
-    existing = await conn.fetchval(
-        """
-        SELECT id FROM asset
-        WHERE "ownerId" = $1 AND "libraryId" = $2 AND "originalPath" = $3 AND "deletedAt" IS NULL
-        """,
-        target_user_id,
-        target_library_id,
-        target_path,
-    )
-    if existing is not None:
-        # Already synced but mapping was lost (crash recovery) — re-create mapping
-        # Use conflict on the composite key (source_asset_id, target_user_id) since
-        # that's our unique constraint. Also catches target_asset_id conflicts.
-        result = await conn.execute(
-            """
-            INSERT INTO _face_sync_asset_map (source_asset_id, target_asset_id, source_user_id, target_user_id, synced_at)
-            VALUES ($1, $2, $3, $4, $5)
-            ON CONFLICT (source_asset_id, target_user_id) DO NOTHING
-            """,
-            source_id, existing, job.source_user_id, target_user_id, now,
-        )
-        if result == "INSERT 0 1":
-            logger.info("Recovered mapping for existing asset %s -> %s", source_id, existing)
-        return existing
-
-    # Use a savepoint so failure rolls back only this asset, not the whole transaction
-    await conn.execute("SAVEPOINT sync_asset")
+    # The savepoint opens before the path remap and the idempotency check, not
+    # after them (asyncpg issues a SAVEPOINT for a transaction nested inside
+    # the batch's). Both can raise — _remap_asset_path when a path normalizes
+    # out of the target prefix, the recovery INSERT below on a unique
+    # violation — and bare inside the batch transaction either one aborts all
+    # 500 assets, rolling their mappings back while their hardlinked thumbnails
+    # stay on disk with nothing left that knows the paths.
     created_files: list[str] = []
     try:
-        # 1. Insert asset record
-        await conn.execute(
-            """
-            INSERT INTO asset (
-                id, "ownerId", type, "originalPath",
-                "fileCreatedAt", "fileModifiedAt", "isFavorite", duration,
-                checksum, "checksumAlgorithm", "livePhotoVideoId", "originalFileName",
-                thumbhash, "isOffline", "libraryId", "isExternal", "localDateTime",
-                "stackId", "duplicateId", status, visibility, width, height
-            ) VALUES (
-                $1, $2, $3, $4,
-                $5, $6, $7, $8,
-                $9, $10, $11, $12,
-                $13, $14, $15, $16, $17,
-                $18, $19, $20, $21, $22, $23
+        async with conn.transaction():
+            target_path = _remap_asset_path(source["originalPath"], job)
+
+            # Idempotency: check if a target asset already exists for this path + owner + library
+            existing = await conn.fetchval(
+                """
+                SELECT id FROM asset
+                WHERE "ownerId" = $1 AND "libraryId" = $2 AND "originalPath" = $3 AND "deletedAt" IS NULL
+                """,
+                target_user_id,
+                target_library_id,
+                target_path,
             )
-            """,
-            target_id,
-            target_user_id,
-            source["type"],
-            target_path,
-            source["fileCreatedAt"],
-            source["fileModifiedAt"],
-            False,  # isFavorite — don't copy preference
-            source["duration"],
-            source["checksum"],
-            source["checksumAlgorithm"],
-            None,  # livePhotoVideoId — handle separately if needed
-            source["originalFileName"],
-            source["thumbhash"],
-            source["isOffline"],
-            target_library_id,
-            True,  # isExternal
-            source["localDateTime"],
-            None,  # stackId
-            None,  # duplicateId
-            source["status"],
-            source["visibility"],
-            source["width"],
-            source["height"],
-            # isEdited is omitted deliberately: it's a derived flag that the
-            # asset_edit_insert/asset_edit_delete triggers maintain. It defaults
-            # to false here and step 5d flips it by copying the edit rows.
-        )
+            if existing is not None:
+                # Already synced but the mapping was lost (crash recovery) — re-create it.
+                #
+                # Bare DO NOTHING, with no inference target: _face_sync_asset_map
+                # has two unique constraints, and naming one only swallows that
+                # one. The other, target_asset_id, is reachable — a source asset
+                # removed from the external library and rescanned comes back with
+                # a new id pointing at the same remapped target path, so this
+                # INSERT collides with the old source's mapping. Phase 0 doesn't
+                # prune that mapping (its target is alive), so an uncaught
+                # violation here wedged the cycle on every pass.
+                result = await conn.execute(
+                    """
+                    INSERT INTO _face_sync_asset_map (source_asset_id, target_asset_id, source_user_id, target_user_id, synced_at)
+                    VALUES ($1, $2, $3, $4, NOW())
+                    ON CONFLICT DO NOTHING
+                    """,
+                    source_id, existing, job.source_user_id, target_user_id,
+                )
+                if result == "INSERT 0 1":
+                    logger.info("Recovered mapping for existing asset %s -> %s", source_id, existing)
+                    return existing
+                # Something else already claims this pair. Leave the asset for a
+                # later cycle: Phase 4 removes target assets whose source is gone,
+                # which drops the stale mapping and lets this source through next
+                # time.
+                logger.warning(
+                    "Target asset %s is already mapped to another source; leaving source %s unsynced",
+                    existing, source_id,
+                )
+                return None
 
-        # 2. Copy exif
-        await _copy_exif(conn, source_id, target_id)
-
-        # 3. Hardlink thumbnails/previews and create asset_files records
-        created_files = await _sync_asset_files(conn, source_id, target_id, source["ownerId"], target_user_id)
-
-        # 4. Set job status to mark as fully processed.
-        # ocrAt comes from the source row: if the source hasn't been OCR'd
-        # (e.g. OCR disabled), it stays NULL so Immich can OCR the target itself.
-        await conn.execute(
-            """
-            INSERT INTO asset_job_status ("assetId", "facesRecognizedAt", "metadataExtractedAt", "duplicatesDetectedAt", "ocrAt")
-            SELECT $1, $2, $2, $2, src."ocrAt"
-            FROM asset_job_status src
-            WHERE src."assetId" = $3
-            """,
-            target_id,
-            now,
-            source_id,
-        )
-
-        # 5. Copy smart_search embedding
-        await conn.execute(
-            """
-            INSERT INTO smart_search ("assetId", embedding)
-            SELECT $1, embedding
-            FROM smart_search
-            WHERE "assetId" = $2
-            """,
-            target_id,
-            source_id,
-        )
-
-        # 5b. Copy OCR results (detected text boxes + search text), same
-        # pattern as smart_search. asset_ocr.id and updateId have DB defaults.
-        await conn.execute(
-            """
-            INSERT INTO asset_ocr ("assetId", x1, y1, x2, y2, x3, y3, x4, y4,
-                                   "boxScore", "textScore", text, "isVisible")
-            SELECT $1, x1, y1, x2, y2, x3, y3, x4, y4,
-                   "boxScore", "textScore", text, "isVisible"
-            FROM asset_ocr
-            WHERE "assetId" = $2
-            """,
-            target_id,
-            source_id,
-        )
-        await conn.execute(
-            """
-            INSERT INTO ocr_search ("assetId", text)
-            SELECT $1, text
-            FROM ocr_search
-            WHERE "assetId" = $2
-            """,
-            target_id,
-            source_id,
-        )
-
-        # 5c. Copy video/audio stream metadata and keyframe index.
-        # The INSERT...SELECT is a no-op for photos (no source rows).
-        for table, columns in _VIDEO_STREAM_TABLES:
+            # 1. Insert asset record
             await conn.execute(
-                f'INSERT INTO {table} ("assetId", {columns}) '
-                f'SELECT $1, {columns} FROM {table} WHERE "assetId" = $2',
+                """
+                INSERT INTO asset (
+                    id, "ownerId", type, "originalPath",
+                    "fileCreatedAt", "fileModifiedAt", "isFavorite", duration,
+                    checksum, "checksumAlgorithm", "livePhotoVideoId", "originalFileName",
+                    thumbhash, "isOffline", "libraryId", "isExternal", "localDateTime",
+                    "stackId", "duplicateId", status, visibility, width, height
+                ) VALUES (
+                    $1, $2, $3, $4,
+                    $5, $6, $7, $8,
+                    $9, $10, $11, $12,
+                    $13, $14, $15, $16, $17,
+                    $18, $19, $20, $21, $22, $23
+                )
+                """,
+                target_id,
+                target_user_id,
+                source["type"],
+                target_path,
+                source["fileCreatedAt"],
+                source["fileModifiedAt"],
+                False,  # isFavorite — don't copy preference
+                source["duration"],
+                source["checksum"],
+                source["checksumAlgorithm"],
+                None,  # livePhotoVideoId — handle separately if needed
+                source["originalFileName"],
+                source["thumbhash"],
+                source["isOffline"],
+                target_library_id,
+                True,  # isExternal
+                source["localDateTime"],
+                None,  # stackId
+                None,  # duplicateId
+                source["status"],
+                source["visibility"],
+                source["width"],
+                source["height"],
+                # isEdited is omitted deliberately: it's a derived flag that the
+                # asset_edit_insert/asset_edit_delete triggers maintain. It defaults
+                # to false here and step 5d flips it by copying the edit rows.
+            )
+
+            # 2. Copy exif
+            await _copy_exif(conn, source_id, target_id)
+
+            # 3. Hardlink thumbnails/previews and create asset_files records
+            created_files = await _sync_asset_files(
+                conn, source_id, target_id, source["ownerId"], target_user_id, job
+            )
+
+            # 4. Set job status to mark as fully processed.
+            # ocrAt comes from the source row: if the source hasn't been OCR'd
+            # (e.g. OCR disabled), it stays NULL so Immich can OCR the target itself.
+            await conn.execute(
+                """
+                INSERT INTO asset_job_status ("assetId", "facesRecognizedAt", "metadataExtractedAt", "duplicatesDetectedAt", "ocrAt")
+                SELECT $1, NOW(), NOW(), NOW(), src."ocrAt"
+                FROM asset_job_status src
+                WHERE src."assetId" = $2
+                """,
                 target_id,
                 source_id,
             )
 
-        # 5d. Copy edit history (crop/rotate/mirror). The hardlinked thumbnails
-        # are the source's *edited* renders, so the target must claim the same
-        # edits to stay consistent. Inserting these fires asset_edit_insert,
-        # which sets asset."isEdited" = true — that's why step 1 doesn't supply
-        # it. parameters is pure geometry (no asset ids or paths), so it copies
-        # verbatim. id/updatedAt/updateId have DB defaults. Copy-once, like
-        # exif and OCR: later source edits won't propagate.
-        await conn.execute(
-            """
-            INSERT INTO asset_edit ("assetId", action, parameters, sequence)
-            SELECT $1, action, parameters, sequence
-            FROM asset_edit
-            WHERE "assetId" = $2
-            """,
-            target_id,
-            source_id,
-        )
+            # 5. Copy smart_search embedding
+            await conn.execute(
+                """
+                INSERT INTO smart_search ("assetId", embedding)
+                SELECT $1, embedding
+                FROM smart_search
+                WHERE "assetId" = $2
+                """,
+                target_id,
+                source_id,
+            )
 
-        # 6. Track the mapping
-        await conn.execute(
-            """
-            INSERT INTO _face_sync_asset_map (source_asset_id, target_asset_id, source_user_id, target_user_id, synced_at)
-            VALUES ($1, $2, $3, $4, $5)
-            """,
-            source_id,
-            target_id,
-            job.source_user_id,
-            target_user_id,
-            now,
-        )
+            # 5b. Copy OCR results (detected text boxes + search text), same
+            # pattern as smart_search. asset_ocr.id and updateId have DB defaults.
+            await conn.execute(
+                """
+                INSERT INTO asset_ocr ("assetId", x1, y1, x2, y2, x3, y3, x4, y4,
+                                       "boxScore", "textScore", text, "isVisible")
+                SELECT $1, x1, y1, x2, y2, x3, y3, x4, y4,
+                       "boxScore", "textScore", text, "isVisible"
+                FROM asset_ocr
+                WHERE "assetId" = $2
+                """,
+                target_id,
+                source_id,
+            )
+            await conn.execute(
+                """
+                INSERT INTO ocr_search ("assetId", text)
+                SELECT $1, text
+                FROM ocr_search
+                WHERE "assetId" = $2
+                """,
+                target_id,
+                source_id,
+            )
 
-        await conn.execute("RELEASE SAVEPOINT sync_asset")
-        logger.info("Synced asset %s -> %s (%s)", source_id, target_id, source["originalFileName"])
-        return target_id
+            # 5c. Copy video/audio stream metadata and keyframe index.
+            # The INSERT...SELECT is a no-op for photos (no source rows).
+            for table, columns in _VIDEO_STREAM_TABLES:
+                await conn.execute(
+                    f'INSERT INTO {table} ("assetId", {columns}) '
+                    f'SELECT $1, {columns} FROM {table} WHERE "assetId" = $2',
+                    target_id,
+                    source_id,
+                )
 
-    except asyncpg.UniqueViolationError:
-        await conn.execute("ROLLBACK TO SAVEPOINT sync_asset")
+            # 5d. Copy edit history (crop/rotate/mirror). The hardlinked thumbnails
+            # are the source's *edited* renders, so the target must claim the same
+            # edits to stay consistent. Inserting these fires asset_edit_insert,
+            # which sets asset."isEdited" = true — that's why step 1 doesn't supply
+            # it. parameters is pure geometry (no asset ids or paths), so it copies
+            # verbatim. id/updatedAt/updateId have DB defaults. Copy-once, like
+            # exif and OCR: later source edits won't propagate.
+            await conn.execute(
+                """
+                INSERT INTO asset_edit ("assetId", action, parameters, sequence)
+                SELECT $1, action, parameters, sequence
+                FROM asset_edit
+                WHERE "assetId" = $2
+                """,
+                target_id,
+                source_id,
+            )
+
+            # 6. Track the mapping
+            await conn.execute(
+                """
+                INSERT INTO _face_sync_asset_map (source_asset_id, target_asset_id, source_user_id, target_user_id, synced_at)
+                VALUES ($1, $2, $3, $4, NOW())
+                """,
+                source_id,
+                target_id,
+                job.source_user_id,
+                target_user_id,
+            )
+
+            logger.info("Synced asset %s -> %s (%s)", source_id, target_id, source["originalFileName"])
+            return target_id
+
+    except asyncpg.UniqueViolationError as e:
+        # Only the checksum constraint means "the target already has this
+        # photo". Every other unique violation inside this savepoint was
+        # landing here too and being written to _face_sync_skipped, which is
+        # permanent and never retried -- so an asset that was not a duplicate
+        # could be excluded from syncing forever, under a reason that names the
+        # wrong cause. The realistic other candidate is the mapping INSERT
+        # above, whose target_asset_id is a fresh uuid4.
+        if e.constraint_name != _CHECKSUM_CONSTRAINT:
+            remove_hardlinks(created_files)
+            logger.exception(
+                "Failed to sync asset %s: unique violation on %s",
+                source_id, e.constraint_name,
+            )
+            return None
         remove_hardlinks(created_files)
         await conn.execute(
             """
@@ -388,8 +454,10 @@ async def sync_asset(conn: asyncpg.Connection, source: asyncpg.Record, job: Sync
         logger.warning("Skipping asset %s: duplicate checksum for target user", source_id)
         return None
     except Exception:
-        await conn.execute("ROLLBACK TO SAVEPOINT sync_asset")
         remove_hardlinks(created_files)
+        # A savepoint can't survive a lost connection; see sync_engine._cleanup_step.
+        if conn.is_closed():
+            raise
         logger.exception("Failed to sync asset %s", source_id)
         return None
 
@@ -439,43 +507,77 @@ async def _sync_asset_files(
     target_id: UUID,
     source_user_id: UUID,
     target_user_id: UUID,
+    job: SyncJob,
 ) -> list[str]:
     """Hardlink source asset files and create records for target asset.
 
     Returns the list of created target file paths (for rollback cleanup).
+    Sidecar paths are deliberately excluded from that list — see below.
     """
     files = await conn.fetch(
         'SELECT id, "assetId", type, path, "isEdited", "isProgressive" FROM asset_file WHERE "assetId" = $1',
         source_id,
     )
-    if not files:
-        return []
 
-    source_files = [
-        {"type": f["type"], "path": f["path"], "is_edited": f["isEdited"], "is_progressive": f["isProgressive"]}
-        for f in files
-    ]
+    # Sidecar (XMP) files are not hardlinked. They live beside the original in
+    # the external library rather than under the upload location, and the
+    # target's library directory is a symlink to the source's — so the file is
+    # already present at the remapped target path. Only the pointer row needs
+    # creating. Hardlinking would fail the upload-directory check and lose the
+    # row entirely, which is how target assets ended up with no XMP reference.
+    sidecars = [f for f in files if f["type"] == "sidecar"]
+    files = [f for f in files if f["type"] != "sidecar"]
+
+    # (type, path, isEdited, isProgressive) for every row to create. Sidecars
+    # and hardlinked files differ only in whether a file was put on disk for
+    # them, so they share one insert.
+    rows = []
+    for sc in sidecars:
+        target_sidecar = _remap_sidecar_path(sc["path"], job)
+        if target_sidecar is None:
+            logger.warning(
+                "Sidecar %s is outside job %s's path prefixes; target asset %s "
+                "will have no XMP reference",
+                sc["path"], job.name, target_id,
+            )
+            continue
+        rows.append(("sidecar", target_sidecar, sc["isEdited"], sc["isProgressive"]))
+        logger.debug("Linked sidecar reference %s -> %s", sc["path"], target_sidecar)
 
     new_files = hardlink_asset_files(
         source_user_id=source_user_id,
         target_user_id=target_user_id,
         source_asset_id=source_id,
         target_asset_id=target_id,
-        source_files=source_files,
+        source_files=[
+            {"type": f["type"], "path": f["path"],
+             "is_edited": f["isEdited"], "is_progressive": f["isProgressive"]}
+            for f in files
+        ],
+    ) if files else []
+
+    rows.extend(
+        (nf["type"], nf["path"], nf["is_edited"], nf["is_progressive"])
+        for nf in new_files
     )
 
-    for nf in new_files:
+    if rows:
+        # One statement per asset rather than one per file. An asset has 2-4 of
+        # these, so on a large initial sync it is the difference between one
+        # round trip and four.
         await conn.execute(
             """
             INSERT INTO asset_file (id, "assetId", type, path, "isEdited", "isProgressive")
-            VALUES ($1, $2, $3, $4, $5, $6)
+            SELECT t.id, $1, t.type, t.path, t.is_edited, t.is_progressive
+            FROM unnest($2::uuid[], $3::text[], $4::text[], $5::bool[], $6::bool[])
+                 AS t(id, type, path, is_edited, is_progressive)
             """,
-            uuid4(),
             target_id,
-            nf["type"],
-            nf["path"],
-            nf["is_edited"],
-            nf["is_progressive"],
+            [uuid4() for _ in rows],
+            *(list(col) for col in zip(*rows)),
         )
 
+    # Only the hardlinked paths go back for rollback cleanup. The sidecar is
+    # not ours to delete: the target path resolves through the external-library
+    # symlink to the source user's own file.
     return [nf["path"] for nf in new_files]

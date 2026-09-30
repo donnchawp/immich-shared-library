@@ -1,7 +1,7 @@
 import logging
 import os
 from pathlib import Path
-from uuid import UUID, uuid4
+from uuid import UUID
 
 import asyncpg
 
@@ -10,16 +10,46 @@ from src.file_ops import validate_path_within_upload
 
 logger = logging.getLogger(__name__)
 
+# The scope shared by every cross-user write below: a person group the sidecar
+# actually put on this pair's synced assets.
+#
+# Both halves are load-bearing. The first bounds the write to managed user
+# pairs. The second is the one that is easy to talk yourself out of: cluster
+# groups make Immich file BOTH users' faces into the same person_group by
+# construction, so "same group + mapped pair" also matches people the target
+# found entirely on their own photos. Without it the source's metadata lands
+# on strangers.
+#
+# Written as semi-joins, not joins. _face_sync_asset_map holds one row per
+# synced asset, so joining it directly fans every person row out across the
+# whole library. Interpolated rather than shared as a view because these run
+# against Immich's database, which the sidecar does not own the schema of.
+_SYNCED_GROUP_SCOPE = """
+          AND EXISTS (
+              SELECT 1 FROM _face_sync_asset_map m
+              WHERE m.source_user_id = s."ownerId"
+                AND m.target_user_id = t."ownerId"
+          )
+          AND EXISTS (
+              SELECT 1 FROM _face_sync_asset_map m2
+              JOIN asset_face af ON af."assetId" = m2.target_asset_id
+              WHERE m2.target_user_id = t."ownerId"
+                AND af."personGroupId" = t."personGroupId"
+                AND af."deletedAt" IS NULL
+          )
+"""
+
 
 def _hardlink_person_thumbnail(
-    target_person_id: UUID,
+    person_group_id: UUID,
     target_user_id: UUID,
     source_thumbnail_path: str,
 ) -> str:
-    """Hardlink a person's cropped face thumbnail from source to target user directory.
+    """Hardlink a person's cropped face thumbnail into the target user's directory.
 
-    Person thumbnails follow: /data/thumbs/{userId}/{personId[0:2]}/{personId[2:4]}/{personId}.jpeg
-    Returns the new thumbnail path for the target person.
+    Since v3.2.0 person thumbnails are keyed on the *person group*, not the
+    person: /data/thumbs/{ownerId}/{pgid[0:2]}/{pgid[2:4]}/{pgid}.jpeg
+    Source and target share the group id, so only the owner directory changes.
     """
     if not source_thumbnail_path:
         return ""
@@ -37,12 +67,9 @@ def _hardlink_person_thumbnail(
         logger.warning("Source person thumbnail does not exist: %s", source)
         return ""
 
-    # Build target path using target user ID and target person ID
-    # Use upload_base instead of traversing parent directories (avoids depth assumptions)
-    pid = str(target_person_id)
-    ext = source.suffix  # .jpeg
-    target_dir = upload_base / "thumbs" / str(target_user_id) / pid[:2] / pid[2:4]
-    target = target_dir / f"{pid}{ext}"
+    pgid = str(person_group_id)
+    target_dir = upload_base / "thumbs" / str(target_user_id) / pgid[:2] / pgid[2:4]
+    target = target_dir / f"{pgid}{source.suffix}"
 
     try:
         validate_path_within_upload(target)
@@ -65,358 +92,317 @@ def _hardlink_person_thumbnail(
     return str(target)
 
 
-async def _try_adopt_surviving_person(
+async def ensure_target_person(
     conn: asyncpg.Connection,
-    source_person_id: UUID,
-    stale_target_person_id: UUID,
-    target_user_id: UUID,
-) -> UUID | None:
-    """When a mapped target person was deleted (e.g. merged by target user),
-    find the surviving person by checking where synced faces ended up.
-
-    If found, updates the mapping to the survivor and returns it.
-    If not found, deletes the stale mapping and returns None.
-    """
-    # Look at bounding-box-matched target faces to find where they were reassigned
-    surviving = await conn.fetchval(
-        """
-        SELECT tf."personId"
-        FROM _face_sync_asset_map m
-        JOIN asset_face sf ON sf."assetId" = m.source_asset_id
-            AND sf."personId" = $1
-            AND sf."deletedAt" IS NULL
-        JOIN asset_face tf ON tf."assetId" = m.target_asset_id
-            AND tf."deletedAt" IS NULL
-            AND tf."boundingBoxX1" = sf."boundingBoxX1"
-            AND tf."boundingBoxY1" = sf."boundingBoxY1"
-            AND tf."boundingBoxX2" = sf."boundingBoxX2"
-            AND tf."boundingBoxY2" = sf."boundingBoxY2"
-        JOIN person p ON p.id = tf."personId"
-        WHERE tf."personId" IS NOT NULL
-        LIMIT 1
-        """,
-        source_person_id,
-    )
-
-    if surviving is not None:
-        await conn.execute(
-            """
-            UPDATE _face_sync_person_map
-            SET target_person_id = $1
-            WHERE source_person_id = $2 AND target_user_id = $3
-            """,
-            surviving,
-            source_person_id,
-            target_user_id,
-        )
-        logger.info(
-            "Adopted person %s for source %s (target user merged sidecar person %s)",
-            surviving,
-            source_person_id,
-            stale_target_person_id,
-        )
-        return surviving
-
-    # No surviving person found — clean up stale mapping
-    await conn.execute(
-        """
-        DELETE FROM _face_sync_person_map
-        WHERE source_person_id = $1 AND target_user_id = $2
-        """,
-        source_person_id,
-        target_user_id,
-    )
-    logger.warning(
-        "Cleared stale person mapping: target %s no longer exists (source: %s)",
-        stale_target_person_id,
-        source_person_id,
-    )
-    return None
-
-
-async def _check_mapping(
-    conn: asyncpg.Connection,
-    source_person_id: UUID,
-    target_user_id: UUID,
-) -> UUID | None:
-    """Check person mapping and validate the target person still exists.
-
-    Returns the target person ID if the mapping is valid.
-    If the mapped person was deleted (e.g. user merged it), tries to adopt
-    the surviving person. Returns None if no valid mapping exists.
-    """
-    existing = await conn.fetchrow(
-        """
-        SELECT target_person_id FROM _face_sync_person_map
-        WHERE source_person_id = $1 AND target_user_id = $2
-        """,
-        source_person_id,
-        target_user_id,
-    )
-    if not existing:
-        return None
-
-    # Verify the target person still exists
-    person_exists = await conn.fetchval(
-        "SELECT EXISTS(SELECT 1 FROM person WHERE id = $1)",
-        existing["target_person_id"],
-    )
-    if person_exists:
-        return existing["target_person_id"]
-
-    # Stale mapping — target person was deleted (likely merged by target user)
-    return await _try_adopt_surviving_person(
-        conn, source_person_id, existing["target_person_id"], target_user_id,
-    )
-
-
-async def _resolve_canonical_person(
-    conn: asyncpg.Connection,
-    person_id: UUID,
-) -> tuple[UUID, UUID] | None:
-    """Follow the mirror chain to the canonical (user-created) person.
-
-    A person is a sidecar-created mirror iff it appears as ``target_person_id``
-    in the mapping table. This walks ``target_person_id -> source_person_id``
-    links until it reaches a person that is nobody's mirror — the canonical
-    origin — and returns ``(canonical_person_id, canonical_owner_id)``.
-
-    This is the loop-guard: with bidirectional jobs the sidecar would otherwise
-    mirror its own mirrors back and forth, spawning mirror-of-mirror duplicates
-    that collapse catastrophically when the user merges them. A ``seen`` set
-    breaks cycles (two accounts linked as mutual mirrors of the same person).
-
-    Returns ``None`` if the resolved person no longer exists.
-    """
-    seen: set[UUID] = set()
-    current = person_id
-    while current not in seen:
-        seen.add(current)
-        parent = await conn.fetchval(
-            "SELECT source_person_id FROM _face_sync_person_map WHERE target_person_id = $1 LIMIT 1",
-            current,
-        )
-        if parent is None:
-            break  # current is nobody's mirror -> canonical origin
-        current = parent
-
-    owner = await conn.fetchval('SELECT "ownerId" FROM person WHERE id = $1', current)
-    if owner is None:
-        return None
-    return current, owner
-
-
-async def get_or_create_target_person(
-    conn: asyncpg.Connection,
-    source_person_id: UUID,
+    person_group_id: UUID,
     source_user_id: UUID,
     target_user_id: UUID,
 ) -> UUID | None:
-    """Find or create a mirrored person for the target user.
+    """Ensure the target user has a ``person`` row for this shared group.
 
-    Uses an advisory lock on the source person ID to prevent duplicate person
-    creation from concurrent transactions.
+    Under cluster groups the identity itself (``person_group``) is shared, so
+    there is nothing to mirror — only the target's own name/thumbnail row to
+    create. Immich creates this row lazily during facial recognition
+    (person.service.ts:548), which the sidecar deliberately skips, so we must
+    create it ourselves. Without it Immich's ``deleteEmptyGroups`` would later
+    drop the group and null the copied faces.
 
-    Returns the target person ID, or None if source person doesn't exist.
+    Returns ``person_group_id`` on success, or ``None`` if the source user has
+    no person row for this group (nothing to copy a name from).
     """
-    # Loop-guard: resolve to the canonical (user-created) person so we never
-    # mirror a mirror. If the canonical person already lives in the target
-    # account, that IS the real person — assign the face to it directly and
-    # never create a duplicate mirror (this closes the bidirectional loop).
-    resolved = await _resolve_canonical_person(conn, source_person_id)
-    if resolved is None:
-        logger.warning("Source person %s not found", source_person_id)
-        return None
-    canonical_id, canonical_owner = resolved
-    if canonical_owner == target_user_id:
-        return canonical_id
-    # Mirror the canonical person, not an intermediate mirror.
-    source_person_id = canonical_id
-    source_user_id = canonical_owner
-
-    # Fast path (no lock needed)
-    target = await _check_mapping(conn, source_person_id, target_user_id)
-    if target is not None:
-        return target
-
-    # Serialize person creation for this source person to prevent orphan duplicates
-    await conn.execute(
-        "SELECT pg_advisory_xact_lock(hashtext($1::text))",
-        str(source_person_id),
+    source = await conn.fetchrow(
+        'SELECT name, "thumbnailPath", "isHidden", "birthDate", color '
+        'FROM person WHERE "ownerId" = $1 AND "personGroupId" = $2',
+        source_user_id,
+        person_group_id,
     )
-
-    # Re-check after acquiring lock (another transaction may have created it)
-    target = await _check_mapping(conn, source_person_id, target_user_id)
-    if target is not None:
-        return target
-
-    # Get source person details
-    source = await conn.fetchrow("SELECT * FROM person WHERE id = $1", source_person_id)
     if source is None:
-        logger.warning("Source person %s not found", source_person_id)
+        logger.debug(
+            "Source user %s has no person row for group %s", source_user_id, person_group_id
+        )
         return None
 
-    target_person_id = uuid4()
+    already = await conn.fetchval(
+        'SELECT 1 FROM person WHERE "ownerId" = $1 AND "personGroupId" = $2',
+        target_user_id,
+        person_group_id,
+    )
+    if already:
+        return person_group_id
 
     target_thumbnail = _hardlink_person_thumbnail(
-        target_person_id=target_person_id,
+        person_group_id=person_group_id,
         target_user_id=target_user_id,
         source_thumbnail_path=source["thumbnailPath"],
     )
 
-    await conn.execute(
+    # The composite PK makes this race-safe without an advisory lock: a
+    # concurrent transaction inserting the same (ownerId, personGroupId) loses
+    # the conflict and we keep whichever row landed first.
+    created = await conn.fetch(
         """
-        INSERT INTO person (id, "ownerId", name, "thumbnailPath", "isHidden", "birthDate", "faceAssetId", "isFavorite", color)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        INSERT INTO person ("ownerId", "personGroupId", name, "thumbnailPath",
+                            "isHidden", "birthDate", "isFavorite", color)
+        VALUES ($1, $2, $3, $4, $5, $6, FALSE, $7)
+        ON CONFLICT ("ownerId", "personGroupId") DO NOTHING
+        RETURNING "personGroupId"
         """,
-        target_person_id,
         target_user_id,
+        person_group_id,
         source["name"],
         target_thumbnail,
         source["isHidden"],
         source["birthDate"],
-        None,  # faceAssetId — set after face sync
-        False,
         source["color"],
     )
 
-    # Track the mapping
-    await conn.execute(
+    # RETURNING yields nothing when the ON CONFLICT swallowed the insert, so
+    # this says "created" only when a row was. Logging it unconditionally
+    # reported a creation that did not happen on a lost race -- the kind of
+    # line someone reads during an incident and believes.
+    if created:
+        logger.info(
+            "Created person for user %s in group %s (name=%r)",
+            target_user_id, person_group_id, source["name"],
+        )
+    elif target_thumbnail:
+        # We hardlinked a thumbnail for a row we did not end up writing. The
+        # file is harmless (the source holds the inode) but nothing references
+        # it, so say so rather than leaving it silently on disk.
+        logger.debug(
+            "Lost the insert race for group %s; unreferenced thumbnail at %s",
+            person_group_id, target_thumbnail,
+        )
+    return person_group_id
+
+
+async def sync_person_names(conn: asyncpg.Connection) -> int:
+    """Copy source person names onto target persons that have no name yet.
+
+    Only fills empty names. Names are per-user in v3.2.0 by design — if the
+    target user has named someone themselves, that is their choice and the
+    sidecar must not stomp it.
+
+    The fill-only rule bounds the damage but not the reach, so this carries
+    ``_SYNCED_GROUP_SCOPE`` like the other cross-user writes.
+    """
+    updated = await conn.fetch(
         """
-        INSERT INTO _face_sync_person_map (source_person_id, target_person_id, source_user_id, target_user_id)
-        VALUES ($1, $2, $3, $4)
-        ON CONFLICT (source_person_id, target_user_id) DO NOTHING
+        UPDATE person t
+        SET name = s.name
+        FROM person s
+        WHERE s."personGroupId" = t."personGroupId"
+          AND s.name <> ''
+          AND t.name = ''
+        """
+        + _SYNCED_GROUP_SCOPE
+        + """
+        RETURNING t."ownerId", t."personGroupId", t.name
         """,
-        source_person_id,
-        target_person_id,
-        source_user_id,
-        target_user_id,
     )
 
-    logger.info("Created mirrored person %s -> %s (name=%s)", source_person_id, target_person_id, source["name"])
-    return target_person_id
+    for row in updated:
+        logger.info(
+            "Named person group %s for user %s: %r",
+            row["personGroupId"], row["ownerId"], row["name"],
+        )
+
+    return len(updated)
+
+
 
 
 async def sync_person_thumbnails(conn: asyncpg.Connection) -> int:
-    """Sync person thumbnail paths from source to target.
+    """Hardlink thumbnails for target persons that still have none.
 
-    Handles cases where:
-    - Target person has empty thumbnailPath but source has one (initial creation gap)
-    - Source thumbnail was regenerated (path changed)
+    Carries ``_SYNCED_GROUP_SCOPE`` like the other cross-user writes. It is
+    fill-only on ``thumbnailPath = ''``, but it creates files on disk, so the
+    reach is worth bounding.
     """
+    # DISTINCT ON, not DISTINCT: with two jobs into one target, the same
+    # (target, group) appears once per source, and those sources can hold
+    # different thumbnailPath values. Plain DISTINCT keeps both rows, so the
+    # file gets linked once, the UPDATE runs twice and the count over-reports.
+    # Picking the lowest source ownerId is arbitrary but stated, which beats
+    # arbitrary and incidental.
     rows = await conn.fetch(
         """
-        SELECT m.target_person_id,
-               m.target_user_id,
-               s."thumbnailPath" as source_thumb
-        FROM _face_sync_person_map m
-        JOIN person s ON s.id = m.source_person_id
-        JOIN person t ON t.id = m.target_person_id
-        WHERE s."thumbnailPath" != ''
-          AND (t."thumbnailPath" = '' OR t."thumbnailPath" IS NULL)
+        SELECT DISTINCT ON (t."ownerId", t."personGroupId")
+               t."ownerId" AS target_user_id,
+               t."personGroupId" AS person_group_id,
+               s."thumbnailPath" AS source_thumb
+        FROM person t
+        JOIN person s ON s."personGroupId" = t."personGroupId"
+        WHERE s."thumbnailPath" <> ''
+          AND t."thumbnailPath" = ''
+        """
+        + _SYNCED_GROUP_SCOPE
+        + """
+        ORDER BY t."ownerId", t."personGroupId", s."ownerId"
         """,
     )
 
     count = 0
     for row in rows:
         target_thumb = _hardlink_person_thumbnail(
-            target_person_id=row["target_person_id"],
+            person_group_id=row["person_group_id"],
             target_user_id=row["target_user_id"],
             source_thumbnail_path=row["source_thumb"],
         )
         if target_thumb:
             await conn.execute(
-                'UPDATE person SET "thumbnailPath" = $1 WHERE id = $2',
-                target_thumb,
-                row["target_person_id"],
+                'UPDATE person SET "thumbnailPath" = $1 '
+                'WHERE "ownerId" = $2 AND "personGroupId" = $3',
+                target_thumb, row["target_user_id"], row["person_group_id"],
             )
-            logger.info("Updated person %s thumbnail", row["target_person_id"])
             count += 1
 
     return count
 
 
-async def sync_person_names(conn: asyncpg.Connection) -> int:
-    """Sync person name changes from source to target.
-
-    Returns the number of names updated.
-    """
-    updated = await conn.fetch(
-        """
-        UPDATE person t
-        SET name = s.name
-        FROM _face_sync_person_map m
-        JOIN person s ON s.id = m.source_person_id
-        WHERE t.id = m.target_person_id
-          AND t.name IS DISTINCT FROM s.name
-        RETURNING t.id, s.name
-        """,
-    )
-
-    for row in updated:
-        logger.info("Updated person %s name to '%s'", row["id"], row["name"])
-
-    return len(updated)
-
-
-async def sync_person_visibility(conn: asyncpg.Connection) -> int:
-    """Sync person isHidden changes from source to target."""
-    updated = await conn.fetch(
-        """
-        UPDATE person t
-        SET "isHidden" = s."isHidden"
-        FROM _face_sync_person_map m
-        JOIN person s ON s.id = m.source_person_id
-        WHERE t.id = m.target_person_id
-          AND t."isHidden" IS DISTINCT FROM s."isHidden"
-        RETURNING t.id
-        """,
-    )
-    return len(updated)
-
-
 async def cleanup_orphaned_persons(conn: asyncpg.Connection) -> int:
-    """Remove target persons whose source person has been deleted.
+    """Remove unnamed target person rows that no longer have any faces.
 
-    Safety: only delete a mirror person that has NO remaining assigned faces.
-    Deleting a person in Immich sets its faces' personId to NULL (ON DELETE SET
-    NULL), so removing a mirror that still owns faces silently unassigns them.
-    When the target user has merged/adopted a mirror it keeps its faces, so we
-    leave it as a standalone person instead of stranding those faces.
+    This is what lets an emptied person group be collected at all: Immich's
+    ``deleteEmptyGroups`` drops groups with no *person* rows, so while the
+    sidecar's row sits there the group survives as a person with no photos.
+
+    Safety: only delete a person row when its group has NO remaining faces at
+    all, owned by anyone. Immich sets ``asset_face."personGroupId"`` to NULL
+    when the last person row in a group goes (``deleteEmptyGroups``), and it
+    does so for *every* face in the group, not just the deleting user's. This
+    is the only statement in the sync cycle that can empty a group, so it is
+    the only path that could write into the source user's own library — hence
+    the face guard is group-scoped, not owner-scoped. Anything narrower risks
+    silently unassigning the source user's faces on their own photos.
+
+    That includes soft-deleted faces, which is why this guard alone does not
+    filter on ``deletedAt``. A trashed face still carries its
+    ``"personGroupId"``, and the FK is ON DELETE SET NULL, so emptying the
+    group nulls it exactly like a live one — except the source user cannot see
+    it happen and restoring from trash will not bring the assignment back. The
+    question this guard asks is "does any row still reference this group", and
+    a soft-deleted row does. The ``deletedAt IS NULL`` filters elsewhere in
+    this module are inclusion scopes ("which groups are worth syncing"), where
+    ignoring trashed faces is correct.
+
+    Scope: restricted to target users the sidecar actually manages, via
+    ``_face_sync_asset_map``, plus a ``NOT EXISTS`` guard that *no* mapped
+    source for that target still has a person row for the group. The negation
+    must wrap the whole map lookup: nested inside the ``EXISTS`` it would be
+    satisfied by any single mapped source lacking a row, which with two jobs
+    sharing a target makes every group deletion-eligible. Compare the
+    mirror-image shape in ``delete_synced.py`` / ``reset.sh``, which require a
+    source row to *exist*. Without this scoping the sweep would touch every
+    account in the database — this table is the only durable record of "the
+    sidecar created assets/persons for this pair."
+
+    That guard probes ``person`` by group first and checks the user pair
+    second. Written the other way round, as ``map JOIN person``, it is the same
+    predicate but Postgres ran it as a correlated subplan that seq-scanned
+    ``person`` once per candidate row: 8 minutes a cycle on ~54k persons, with
+    the sidecar re-running it every minute. This shape plans as a hash anti
+    join and takes 0.2s.
+
+    Note: a target person row can exist for one cycle before the map gains a
+    row for that pair (e.g. if person-metadata sync ever ran ahead of the
+    asset sync that produces the first mapped asset). That row is simply
+    skipped by this sweep until the map catches up — harmless and
+    self-correcting, unlike widening the DELETE's scope to compensate.
+
+    Names are the one piece of provenance left. Nothing here proves the
+    sidecar *created* the row it is about to delete — ``_face_sync_person_map``
+    carried that and v3.2.0 retired it — and the three guards above are all
+    satisfied by a person the target user found on their own photos and then
+    deleted the photos of. So a named row is never touched, on the same
+    principle prune_inflated_people.py uses: a name means a human decided this
+    person was real. ``ensure_target_person`` creates rows with an empty name,
+    and sync_person_names only fills one when the group still carries a synced
+    face, which this sweep requires to be gone. The cost is that a named
+    person can outlive its last face as an empty entry in the target's people
+    list, which the target user can delete themselves.
     """
     deleted = await conn.fetch(
         """
         DELETE FROM person t
-        USING _face_sync_person_map m
-        WHERE t.id = m.target_person_id
-          AND NOT EXISTS (SELECT 1 FROM person WHERE id = m.source_person_id)
+        WHERE t.name = ''
+          AND EXISTS (
+              SELECT 1 FROM _face_sync_asset_map m
+              WHERE m.target_user_id = t."ownerId"
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM person s
+              WHERE s."personGroupId" = t."personGroupId"
+                AND EXISTS (
+                    SELECT 1 FROM _face_sync_asset_map m
+                    WHERE m.target_user_id = t."ownerId"
+                      AND m.source_user_id = s."ownerId"
+                )
+          )
           AND NOT EXISTS (
               SELECT 1 FROM asset_face af
-              WHERE af."personId" = t.id AND af."deletedAt" IS NULL
+              WHERE af."personGroupId" = t."personGroupId"
           )
-        RETURNING t.id
+        RETURNING t."ownerId", t."personGroupId"
         """,
     )
 
     if deleted:
-        await conn.execute(
-            """
-            DELETE FROM _face_sync_person_map
-            WHERE target_person_id = ANY($1)
-            """,
-            [row["id"] for row in deleted],
-        )
-        logger.info("Cleaned up %d orphaned mirrored persons", len(deleted))
-
-    # Prune any mapping whose source person is gone but whose target survived
-    # (e.g. a mirror we kept because it still has faces). The target becomes a
-    # standalone person; leaving the dangling row would make canonical
-    # resolution walk into a deleted person.
-    await conn.execute(
-        """
-        DELETE FROM _face_sync_person_map m
-        WHERE NOT EXISTS (SELECT 1 FROM person WHERE id = m.source_person_id)
-        """,
-    )
+        logger.info("Cleaned up %d orphaned target persons", len(deleted))
 
     return len(deleted)
+
+
+async def delete_target_person_in_shared_group(
+    conn: asyncpg.Connection, target_user_id: UUID, person_group_id: UUID,
+) -> bool:
+    """Teardown: drop one target person row from a group a source still holds.
+
+    For the teardown tools (``delete_synced.py``, ``reset.sh``), not the sync
+    cycle. Returns True if a row was actually deleted.
+
+    This is the mirror image of ``cleanup_orphaned_persons``, and the two
+    guards are deliberately not the same shape — the difference is worth
+    stating, because it reads like drift and is not:
+
+    * The ``EXISTS`` requires a *mapped source* to still hold a person row on
+      the group. That, not the face guard, is what makes this safe: the group
+      keeps a row, so Immich's ``deleteEmptyGroups`` cannot drop it and null
+      every face in it. ``cleanup_orphaned_persons`` requires the opposite
+      (``NOT EXISTS``) because it runs when the sidecar's persons are the last
+      ones left, and so it needs the group-scoped face guard instead.
+    * The face guard here is therefore free to be *owner-scoped*: "is the
+      target still using this person?". Group-scoped, as in
+      ``cleanup_orphaned_persons``, it would match the source's faces on the
+      source's own photos — the normal state during teardown — and refuse
+      every deletion, making both tools silent no-ops.
+
+    One statement, so both conditions are evaluated at delete time.
+    ``delete_synced.py`` lists its candidates before an interactive prompt,
+    which leaves a human-scale window in which the source's person row could
+    go; re-checking here closes it.
+    """
+    deleted = await conn.fetchval(
+        """
+        DELETE FROM person t
+        WHERE t."ownerId" = $1
+          AND t."personGroupId" = $2
+          AND EXISTS (
+              SELECT 1 FROM _face_sync_asset_map m
+              JOIN person s ON s."personGroupId" = t."personGroupId"
+                           AND s."ownerId" = m.source_user_id
+              WHERE m.target_user_id = t."ownerId"
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM asset_face af
+              JOIN asset a ON a.id = af."assetId"
+              WHERE af."personGroupId" = t."personGroupId"
+                AND a."ownerId" = t."ownerId"
+                AND af."deletedAt" IS NULL
+          )
+        RETURNING t."personGroupId"
+        """,
+        target_user_id,
+        person_group_id,
+    )
+    return deleted is not None

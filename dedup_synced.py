@@ -12,32 +12,24 @@ import argparse
 import asyncio
 import os
 import sys
-from pathlib import Path
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(__file__))
 
-# Load .env file
-env_file = Path(__file__).parent / ".env"
-if not env_file.exists():
-    print("Error: .env not found. Copy env.example to .env and fill in your values.")
-    sys.exit(1)
+from src.env_bootstrap import ENV_FILE, bootstrap
 
-for line in env_file.read_text().splitlines():
-    line = line.strip()
-    if not line or line.startswith("#"):
-        continue
-    key, _, value = line.partition("=")
-    if key and value:
-        os.environ.setdefault(key.strip(), value.strip())
-
-os.environ.setdefault("SYNC_INTERVAL_SECONDS", "9999")
+# Deferred rather than exiting here, matching delete_synced.py: importing this
+# module must stay side-effect-free enough for the test suite to reach the
+# functions in it. main() does the check before it touches the database.
+bootstrap()
 
 import logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", stream=sys.stdout)
 
+from src import confirm
+from src.asset_sync import record_skipped_duplicates
+from src.cleanup import delete_target_asset
 from src.db import init_pool, close_pool, fetch_all, fetch_one
-from src.file_ops import remove_hardlinks
 from src.main import ensure_tracking_tables
 
 
@@ -95,57 +87,49 @@ async def find_duplicates(target_user_id, *, match_time: bool = False) -> list[d
     return [dict(r) for r in rows]
 
 
-async def delete_synced_asset(conn, source_asset_id, target_asset_id) -> bool:
+async def delete_synced_asset(conn, source_asset_id, target_asset_id, target_user_id) -> bool:
     """Delete a synced target asset and record the source as skipped.
 
-    Follows the same pattern as cleanup_deleted_assets:
-    remove hardlinks -> delete album_asset -> delete asset (cascades) -> delete mapping -> record skip.
+    The deletion itself is cleanup.delete_target_asset -- the same one the sync
+    engine and delete_synced.py use. This file used to carry its own copy,
+    which selected every asset_file path and handed the XMP sidecar to
+    remove_hardlinks; the target's sidecar path resolves through the
+    external-library symlink to the SOURCE user's own file.
+
+    The skip record is asset_sync.record_skipped_duplicates, for the same
+    reason: this file's own INSERT named only source_asset_id, and
+    _face_sync_skipped is keyed on (source_asset_id, target_user_id) with
+    target_user_id NOT NULL.
+
+    The two halves are deliberately not one atomic unit. delete_target_asset
+    unlinks thumbnails before deleting the rows that name them and the
+    filesystem does not roll back, so rolling the delete back on a failed skip
+    record would restore an asset whose files are gone. Losing only the skip
+    record is recoverable: the sync engine recreates the asset next cycle and
+    the tool finds it again, which is the state the user was in before running
+    it. So the delete stands, and the INSERT gets its own savepoint to keep a
+    failure off the batch.
     """
+    if not await delete_target_asset(conn, target_asset_id):
+        return False
+
     try:
-        # Get file paths before deleting records
-        files = await conn.fetch(
-            'SELECT path FROM asset_file WHERE "assetId" = $1',
-            target_asset_id,
-        )
-        file_paths = [f["path"] for f in files]
-
-        # Remove hardlinked files first
-        remove_hardlinks(file_paths)
-
-        # Remove from albums
-        await conn.execute(
-            'DELETE FROM album_asset WHERE "assetId" = $1',
-            target_asset_id,
-        )
-
-        # Delete the target asset (cascades to exif, files, faces, smart_search, job_status)
-        await conn.execute("DELETE FROM asset WHERE id = $1", target_asset_id)
-
-        # Remove the mapping
-        await conn.execute(
-            "DELETE FROM _face_sync_asset_map WHERE target_asset_id = $1",
-            target_asset_id,
-        )
-
-        # Record the source asset as skipped so the sync engine won't recreate it
-        await conn.execute(
-            """
-            INSERT INTO _face_sync_skipped (source_asset_id, reason)
-            VALUES ($1, 'duplicate_filename')
-            ON CONFLICT (source_asset_id) DO NOTHING
-            """,
-            source_asset_id,
-        )
-
+        async with conn.transaction():
+            await record_skipped_duplicates(conn, {source_asset_id}, target_user_id)
         return True
     except Exception:
         logging.getLogger(__name__).exception(
-            "Failed to delete synced asset %s", target_asset_id
+            "Deleted asset %s but failed to record source %s as skipped",
+            target_asset_id, source_asset_id,
         )
         return False
 
 
 async def main(match_time: bool = False):
+    if not ENV_FILE.exists():
+        print("Error: .env not found. Copy env.example to .env and fill in your values.")
+        sys.exit(1)
+
     from src.config import settings
     print(f"Connecting to {settings.db_hostname}:{settings.db_port}/{settings.db_database_name}")
     if match_time:
@@ -197,18 +181,14 @@ async def main(match_time: bool = False):
         print()
 
     # Step 3: Dry run or delete
-    while True:
-        action = input("Delete these synced copies? [dry-run / delete / cancel]: ").strip().lower()
-        if action in ("dry-run", "delete", "cancel", "d", "c"):
-            break
-        print("Please enter 'dry-run', 'delete', or 'cancel'.")
+    action = confirm.ask("Delete these synced copies?")
 
-    if action in ("cancel", "c"):
+    if action == confirm.CANCEL:
         print("Cancelled.")
         await close_pool()
         return
 
-    if action == "dry-run":
+    if action == confirm.DRY_RUN:
         print(f"\n[DRY RUN] Would delete {len(duplicates)} synced asset(s):")
         for d in duplicates:
             print(f"  DELETE target={d['target_asset_id']}  ({d['synced_filename']})")
@@ -217,7 +197,7 @@ async def main(match_time: bool = False):
         await close_pool()
         return
 
-    # action == "delete"
+    # action == confirm.DELETE
     total = len(duplicates)
     batch_size = 200
     print(f"\nDeleting {total} synced asset(s) in batches of {batch_size}...")
@@ -228,7 +208,9 @@ async def main(match_time: bool = False):
         batch = duplicates[batch_start:batch_start + batch_size]
         async with transaction() as conn:
             for d in batch:
-                ok = await delete_synced_asset(conn, d["source_asset_id"], d["target_asset_id"])
+                ok = await delete_synced_asset(
+                    conn, d["source_asset_id"], d["target_asset_id"], target_user["id"],
+                )
                 if ok:
                     deleted += 1
                 else:

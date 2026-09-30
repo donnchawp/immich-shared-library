@@ -14,26 +14,17 @@ from pathlib import Path
 # Add project root to path
 sys.path.insert(0, os.path.dirname(__file__))
 
-# Load .env file
-env_file = Path(__file__).parent / ".env"
-if not env_file.exists():
+from src.env_bootstrap import bootstrap
+
+if not bootstrap():
     print("Error: .env not found. Copy env.example to .env and fill in your values.")
     sys.exit(1)
-
-for line in env_file.read_text().splitlines():
-    line = line.strip()
-    if not line or line.startswith("#"):
-        continue
-    key, _, value = line.partition("=")
-    if key and value:
-        os.environ.setdefault(key.strip(), value.strip())
 
 # Point CONFIG_FILE at local config.yaml if it exists
 config_yaml = Path(__file__).parent / "config.yaml"
 if config_yaml.is_file():
     os.environ.setdefault("CONFIG_FILE", str(config_yaml))
 
-os.environ.setdefault("SYNC_INTERVAL_SECONDS", "9999")
 os.environ.setdefault("LOG_LEVEL", "DEBUG")
 
 import logging
@@ -45,12 +36,48 @@ from src.main import ensure_tracking_tables
 from src.sync_engine import run_full_sync
 
 
+async def _source_face_health(source_user_ids):
+    """Count each source user's own faces, and how many are unassigned.
+
+    This is the canary for the one failure mode where the sidecar damages the
+    account it is only supposed to read from. Immich's ``deleteEmptyGroups``
+    removes any ``person_group`` with no ``person`` row, and
+    ``asset_face."personGroupId"`` is ON DELETE SET NULL — so if the sidecar
+    ever deletes the last person row on a shared group, every face in that
+    group is silently unassigned, including the source user's faces on the
+    source user's own photos.
+
+    Nothing else printed by this script would show that: the target side would
+    look perfectly healthy. Sample before and after the cycle and compare.
+    """
+    from src.db import fetch_all
+
+    return {
+        row["ownerId"]: (row["unassigned"], row["total"])
+        for row in await fetch_all(
+            """
+            SELECT a."ownerId",
+                   COUNT(*) FILTER (WHERE af."personGroupId" IS NULL) AS unassigned,
+                   COUNT(*) AS total
+            FROM asset_face af
+            JOIN asset a ON a.id = af."assetId"
+            WHERE a."ownerId" = ANY($1)
+              AND af."deletedAt" IS NULL
+              AND a."deletedAt" IS NULL
+            GROUP BY a."ownerId"
+            """,
+            list(source_user_ids),
+        )
+    }
+
+
 async def main():
     # Use first sync job's target user for verification queries
     if not settings.sync_jobs:
         print("Error: No sync jobs configured. Check your config.yaml or .env.")
         sys.exit(1)
     target_user_id = settings.sync_jobs[0].target_user_id
+    source_user_ids = {job.source_user_id for job in settings.sync_jobs}
 
     print("=== Initializing database pool ===")
     await init_pool()
@@ -58,9 +85,60 @@ async def main():
     print("\n=== Ensuring tracking tables ===")
     await ensure_tracking_tables()
 
+    print("\n=== Source face health (before) ===")
+    before = await _source_face_health(source_user_ids)
+    for uid, (unassigned, total) in sorted(before.items(), key=lambda kv: str(kv[0])):
+        print(f"  source {uid}: {unassigned} unassigned of {total} faces")
+    if not before:
+        print("  (no source faces found — nothing to compare against)")
+
     print("\n=== Running full sync ===")
     stats = await run_full_sync()
     print(f"\n=== Sync results: {stats} ===")
+
+    print("\n=== Source face health (after) ===")
+    after = await _source_face_health(source_user_ids)
+    # Two separate regressions, because they have different causes and only
+    # one of them was checked. A rise in *unassigned* is the group-emptying
+    # signature the docstring describes. A fall in *total* means source face
+    # rows were deleted outright, which no statement here should ever do and
+    # which leaves unassigned unchanged -- so the original check printed "OK"
+    # for it. Between them they cover the whole "wrote into the source account"
+    # family.
+    unassigned_rose = False
+    total_fell = False
+    for uid in sorted(set(before) | set(after), key=str):
+        was_unassigned, was_total = before.get(uid, (0, 0))
+        now_unassigned, now_total = after.get(uid, (0, 0))
+        delta = now_unassigned - was_unassigned
+        total_delta = now_total - was_total
+        print(
+            f"  source {uid}: {now_unassigned} unassigned of {now_total} faces "
+            f"(was {was_unassigned} of {was_total}, delta {delta:+d}, "
+            f"total {total_delta:+d})"
+        )
+        if delta > 0:
+            unassigned_rose = True
+        if total_delta < 0:
+            total_fell = True
+
+    if unassigned_rose or total_fell:
+        cause = (
+            "  A shared person_group was emptied — Immich's deleteEmptyGroups\n"
+            "  then nulls every face in that group.\n"
+            if unassigned_rose else
+            "  Source asset_face rows were deleted outright. Nothing here has any\n"
+            "  business deleting a face the source user owns.\n"
+        )
+        print(
+            "\n  *** STOP: the sidecar changed the source user's own faces. ***\n"
+            "  The sidecar must never write to the source account.\n"
+            + cause +
+            "  Do not run another cycle. Restore from your pre-run pg_dump and\n"
+            "  report which statement ran, from the DEBUG log above."
+        )
+    else:
+        print("\n  OK — no source faces lost their person assignment or disappeared.")
 
     # Verify results
     from src.db import fetch_all, fetch_one
@@ -75,23 +153,23 @@ async def main():
         print(f"  {a['id']} — {a['originalFileName']} — {a['originalPath']}")
 
     target_faces = await fetch_all("""
-        SELECT af.id, af."assetId", af."personId", p.name as person_name
+        SELECT af.id, af."assetId", af."personGroupId", p.name as person_name
         FROM asset_face af
         JOIN asset a ON a.id = af."assetId"
-        LEFT JOIN person p ON p.id = af."personId"
+        LEFT JOIN person p ON p."personGroupId" = af."personGroupId" AND p."ownerId" = a."ownerId"
         WHERE a."ownerId" = $1 AND af."deletedAt" IS NULL
     """, target_user_id)
     print(f"\nTarget user's faces: {len(target_faces)}")
     for f in target_faces:
-        print(f"  face={f['id']} asset={f['assetId']} person={f['personId']} name={f['person_name']}")
+        print(f"  face={f['id']} asset={f['assetId']} person_group={f['personGroupId']} name={f['person_name']}")
 
     target_persons = await fetch_all(
-        "SELECT id, name FROM person WHERE \"ownerId\" = $1",
+        "SELECT \"personGroupId\", name FROM person WHERE \"ownerId\" = $1",
         target_user_id,
     )
     print(f"\nTarget user's persons: {len(target_persons)}")
     for p in target_persons:
-        print(f"  {p['id']} — name='{p['name']}'")
+        print(f"  group={p['personGroupId']} — name='{p['name']}'")
 
     smart_count = await fetch_one("""
         SELECT COUNT(*) as cnt FROM smart_search ss
@@ -105,14 +183,40 @@ async def main():
     for m in mappings:
         print(f"  {m['source_asset_id']} -> {m['target_asset_id']}")
 
-    person_mappings = await fetch_all("SELECT * FROM _face_sync_person_map")
-    print(f"\nPerson mappings: {len(person_mappings)}")
-    for m in person_mappings:
-        print(f"  {m['source_person_id']} -> {m['target_person_id']}")
+    # v3.2.0 cluster-group port: there is no longer a sidecar-owned person
+    # mapping table — person identity is shared directly via Immich's
+    # person_group table. Show that invariant instead: a person_group with
+    # person rows owned by more than one user is a group the sidecar has
+    # linked across the source/target pair.
+    shared_groups = await fetch_all("""
+        SELECT "personGroupId", COUNT(DISTINCT "ownerId") AS owners
+        FROM person
+        GROUP BY "personGroupId"
+        HAVING COUNT(DISTINCT "ownerId") > 1
+    """)
+    print(f"\nShared person groups (identity linked across users): {len(shared_groups)}")
+    for g in shared_groups:
+        print(f"  group={g['personGroupId']} shared by {g['owners']} users")
 
     await close_pool()
-    print("\n=== Done ===")
+
+    if unassigned_rose or total_fell:
+        # Repeated, because the banner above is now thousands of lines up the
+        # scrollback, and returned so the exit status carries it too. The
+        # verification dump is left in deliberately: if this has fired, it is
+        # the evidence you want.
+        what = (
+            "lost their person assignment" if unassigned_rose
+            else "were deleted"
+        )
+        print(
+            f"\n=== FAILED: a source user's own faces {what} ==="
+            "\n    Scroll up to the face-health section. Do not run another cycle."
+        )
+    else:
+        print("\n=== Done ===")
+    return unassigned_rose or total_fell
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    sys.exit(1 if asyncio.run(main()) else 0)

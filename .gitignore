@@ -1,4 +1,32 @@
 __pycache__/
 *.pyc
+*.egg-info/
+.pip-cache/
 .venv/
-.env
+.superpowers/
+.DS_Store
+
+# Every .env variant, not just the exact name: .env.bak and .env.generated
+# need the prefix glob, test.env needs the suffix one, and all three hold real
+# credentials.
+.env*
+*.env
+!env.example
+
+# Real user and library UUIDs.
+config.yaml*
+
+# Database dumps carry user emails and filesystem paths. The test schema
+# fixture is the one dump that belongs in the repo.
+*.sql
+!tests/fixtures/*.sql
+
+# Working notes, not deliverables.
+docs/
+plans/
+whats-next.md
+code-masher.txt
+
+# make schema-dump's temp files. The EXIT trap removes them, but it does not
+# fire reliably when make is interrupted.
+.schema-dump.tmp*
