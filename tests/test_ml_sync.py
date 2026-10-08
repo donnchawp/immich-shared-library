@@ -36,10 +36,12 @@ async def test_creates_the_target_person_row(conn, pair):
 
     await sync_faces_for_asset(conn, src_asset, tgt_asset, src, tgt)
 
+    # The row must exist (or deleteEmptyGroups can drop the group), but the
+    # source's name stays behind: names travel by Immich person sharing.
     name = await conn.fetchval(
         'SELECT name FROM person WHERE "ownerId" = $1 AND "personGroupId" = $2', tgt, pg
     )
-    assert name == "Dad"
+    assert name == ""
 
 
 async def test_unassigned_face_copies_with_null_group(conn, pair):

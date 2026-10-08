@@ -7,7 +7,7 @@ from src.cleanup import cleanup_deleted_assets, cleanup_reassigned_faces, cleanu
 from src.config import settings
 from src.db import is_connection_error, transaction
 from src.ml_sync import sync_faces_for_asset_guarded, sync_faces_incremental
-from src.person_sync import cleanup_orphaned_persons, sync_person_names, sync_person_thumbnails
+from src.person_sync import cleanup_orphaned_persons, sync_person_thumbnails
 from src.schema import SchemaValidationError, validate_cluster_group, validate_schema
 
 logger = logging.getLogger(__name__)
@@ -185,7 +185,8 @@ async def run_full_sync() -> dict:
     # Phase 2: Incremental face sync (catch new/updated faces on existing assets)
     await _phase("2", _sync_faces_phase(stats))
 
-    # Phase 3: Sync person metadata changes (names and thumbnails).
+    # Phase 3: Hardlink person thumbnails the target is still missing. Names and
+    # birth dates are left to Immich's person sharing (v3.3.0).
     # Visibility (isHidden) is deliberately absent: it is per-user, and a
     # boolean has no "unset" sentinel, so there is no fill-only option.
     await _phase("3", _sync_person_metadata(stats))
@@ -281,7 +282,6 @@ async def _sync_faces_phase(stats: dict) -> None:
 
 async def _sync_person_metadata(stats: dict) -> None:
     async with transaction() as conn:
-        stats["persons_updated"] += await sync_person_names(conn)
         stats["persons_updated"] += await sync_person_thumbnails(conn)
 
 

@@ -101,17 +101,27 @@ async def ensure_target_person(
     """Ensure the target user has a ``person`` row for this shared group.
 
     Under cluster groups the identity itself (``person_group``) is shared, so
-    there is nothing to mirror — only the target's own name/thumbnail row to
-    create. Immich creates this row lazily during facial recognition
+    there is nothing to mirror — only the target's own person row to create.
+    Immich creates this row lazily during facial recognition
     (person.service.ts:548), which the sidecar deliberately skips, so we must
     create it ourselves. Without it Immich's ``deleteEmptyGroups`` would later
     drop the group and null the copied faces.
 
+    The row is created with no name and no birth date. Those belong to Immich's
+    person sharing (v3.3.0): when the source shares the person with the target,
+    its ``person_user_after_insert`` trigger fills an empty name and birth date
+    on this row, and edits keep flowing through the share afterwards. A copy
+    made here would be a one-off snapshot that the share then refuses to
+    overwrite, since the trigger only fills blanks. An empty name also keeps
+    ``cleanup_orphaned_persons`` honest: a named target row now always means
+    the target user or a share named it, never the sidecar.
+
     Returns ``person_group_id`` on success, or ``None`` if the source user has
-    no person row for this group (nothing to copy a name from).
+    no person row for this group (nothing to take a thumbnail from, and no
+    sign the group is one the source recognises).
     """
     source = await conn.fetchrow(
-        'SELECT name, "thumbnailPath", "isHidden", "birthDate", color '
+        'SELECT "thumbnailPath", "isHidden", color '
         'FROM person WHERE "ownerId" = $1 AND "personGroupId" = $2',
         source_user_id,
         person_group_id,
@@ -141,18 +151,16 @@ async def ensure_target_person(
     # the conflict and we keep whichever row landed first.
     created = await conn.fetch(
         """
-        INSERT INTO person ("ownerId", "personGroupId", name, "thumbnailPath",
-                            "isHidden", "birthDate", "isFavorite", color)
-        VALUES ($1, $2, $3, $4, $5, $6, FALSE, $7)
+        INSERT INTO person ("ownerId", "personGroupId", "thumbnailPath",
+                            "isHidden", "isFavorite", color)
+        VALUES ($1, $2, $3, $4, FALSE, $5)
         ON CONFLICT ("ownerId", "personGroupId") DO NOTHING
         RETURNING "personGroupId"
         """,
         target_user_id,
         person_group_id,
-        source["name"],
         target_thumbnail,
         source["isHidden"],
-        source["birthDate"],
         source["color"],
     )
 
@@ -161,10 +169,7 @@ async def ensure_target_person(
     # reported a creation that did not happen on a lost race -- the kind of
     # line someone reads during an incident and believes.
     if created:
-        logger.info(
-            "Created person for user %s in group %s (name=%r)",
-            target_user_id, person_group_id, source["name"],
-        )
+        logger.info("Created person for user %s in group %s", target_user_id, person_group_id)
     elif target_thumbnail:
         # We hardlinked a thumbnail for a row we did not end up writing. The
         # file is harmless (the source holds the inode) but nothing references
@@ -174,42 +179,6 @@ async def ensure_target_person(
             person_group_id, target_thumbnail,
         )
     return person_group_id
-
-
-async def sync_person_names(conn: asyncpg.Connection) -> int:
-    """Copy source person names onto target persons that have no name yet.
-
-    Only fills empty names. Names are per-user in v3.2.0 by design — if the
-    target user has named someone themselves, that is their choice and the
-    sidecar must not stomp it.
-
-    The fill-only rule bounds the damage but not the reach, so this carries
-    ``_SYNCED_GROUP_SCOPE`` like the other cross-user writes.
-    """
-    updated = await conn.fetch(
-        """
-        UPDATE person t
-        SET name = s.name
-        FROM person s
-        WHERE s."personGroupId" = t."personGroupId"
-          AND s.name <> ''
-          AND t.name = ''
-        """
-        + _SYNCED_GROUP_SCOPE
-        + """
-        RETURNING t."ownerId", t."personGroupId", t.name
-        """,
-    )
-
-    for row in updated:
-        logger.info(
-            "Named person group %s for user %s: %r",
-            row["personGroupId"], row["ownerId"], row["name"],
-        )
-
-    return len(updated)
-
-
 
 
 async def sync_person_thumbnails(conn: asyncpg.Connection) -> int:
@@ -316,9 +285,9 @@ async def cleanup_orphaned_persons(conn: asyncpg.Connection) -> int:
     satisfied by a person the target user found on their own photos and then
     deleted the photos of. So a named row is never touched, on the same
     principle prune_inflated_people.py uses: a name means a human decided this
-    person was real. ``ensure_target_person`` creates rows with an empty name,
-    and sync_person_names only fills one when the group still carries a synced
-    face, which this sweep requires to be gone. The cost is that a named
+    person was real. ``ensure_target_person`` creates rows with an empty name
+    and nothing in the sidecar ever writes one, so a name here came from the
+    target user or from an Immich person share. The cost is that a named
     person can outlive its last face as an empty entry in the target's people
     list, which the target user can delete themselves.
     """

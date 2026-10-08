@@ -9,7 +9,6 @@ from src.person_sync import (
     cleanup_orphaned_persons,
     delete_target_person_in_shared_group,
     ensure_target_person,
-    sync_person_names,
     sync_person_thumbnails,
 )
 
@@ -47,18 +46,30 @@ async def _decoy_map_row(conn):
     return other_src, other_tgt
 
 
-async def test_creates_target_person_row_for_shared_group(conn, pair):
+async def test_creates_target_person_row_without_name_or_birth_date(conn, pair):
+    """The target row starts blank even when the source has both.
+
+    Names and birth dates are Immich's person sharing's job (v3.3.0). Its
+    trigger only fills blanks, so a copy made here would freeze the source's
+    values on the target and block the share from ever updating them.
+    """
     cg, src, tgt = pair
     pg = await make_person_group(conn, cg)
-    await make_person(conn, src, pg, name="Granny")
+    await conn.execute(
+        'INSERT INTO person ("ownerId", "personGroupId", name, "birthDate") '
+        "VALUES ($1, $2, 'Granny', '1940-05-01')",
+        src, pg,
+    )
 
     result = await ensure_target_person(conn, pg, src, tgt)
 
     assert result == pg
-    name = await conn.fetchval(
-        'SELECT name FROM person WHERE "ownerId" = $1 AND "personGroupId" = $2', tgt, pg
+    row = await conn.fetchrow(
+        'SELECT name, "birthDate" FROM person WHERE "ownerId" = $1 AND "personGroupId" = $2',
+        tgt, pg,
     )
-    assert name == "Granny"
+    assert row["name"] == ""
+    assert row["birthDate"] is None
 
 
 async def test_is_idempotent(conn, pair):
@@ -73,40 +84,6 @@ async def test_is_idempotent(conn, pair):
         'SELECT COUNT(*) FROM person WHERE "ownerId" = $1 AND "personGroupId" = $2', tgt, pg
     )
     assert count == 1
-
-
-async def test_sync_person_names_fills_empty_name(conn, pair):
-    """The positive path: an empty target name gets filled from the source."""
-    cg, src, tgt = pair
-    pg = await make_person_group(conn, cg)
-    await make_person(conn, src, pg, name="Granny")
-    await make_person(conn, tgt, pg, name="")
-    await _map_synced_pair(conn, src, tgt, person_group_id=pg)
-
-    updated = await sync_person_names(conn)
-
-    assert updated == 1
-    name = await conn.fetchval(
-        'SELECT name FROM person WHERE "ownerId" = $1 AND "personGroupId" = $2', tgt, pg
-    )
-    assert name == "Granny"
-
-
-async def test_does_not_overwrite_a_name_the_target_already_set(conn, pair):
-    """The target user's own naming wins — we only fill an empty name."""
-    cg, src, tgt = pair
-    pg = await make_person_group(conn, cg)
-    await make_person(conn, src, pg, name="Granny")
-    await make_person(conn, tgt, pg, name="Nana")
-    await _map_synced_pair(conn, src, tgt)
-
-    updated = await sync_person_names(conn)
-
-    assert updated == 0
-    name = await conn.fetchval(
-        'SELECT name FROM person WHERE "ownerId" = $1 AND "personGroupId" = $2', tgt, pg
-    )
-    assert name == "Nana"
 
 
 async def test_is_hidden_is_inherited_when_the_person_row_is_created(conn, pair):
@@ -184,16 +161,21 @@ async def test_no_cycle_function_overwrites_the_target_visibility(conn, pair):
         "cleanup_orphaned_persons",
         "delete_target_person_in_shared_group",
         "ensure_target_person",
-        "sync_person_names",
         "sync_person_thumbnails",
     ], discovered
     assert sorted(callable_here) == [
-        "cleanup_orphaned_persons", "sync_person_names", "sync_person_thumbnails",
+        "cleanup_orphaned_persons", "sync_person_thumbnails",
     ], discovered
     is_hidden = await conn.fetchval(
         'SELECT "isHidden" FROM person WHERE "ownerId" = $1 AND "personGroupId" = $2', tgt, pg
     )
     assert is_hidden is False, f"visibility overwritten by one of: {callable_here}"
+    # Same sweep, same reason: names belong to the target or to an Immich
+    # person share, never to a sync cycle.
+    name = await conn.fetchval(
+        'SELECT name FROM person WHERE "ownerId" = $1 AND "personGroupId" = $2', tgt, pg
+    )
+    assert name == "", f"name written by one of: {callable_here}"
 
 async def test_returns_none_when_source_has_no_person_row(conn, pair):
     cg, src, tgt = pair
@@ -335,62 +317,6 @@ async def test_cleanup_keeps_group_known_to_only_one_of_two_sources(conn):
         'SELECT 1 FROM person WHERE "ownerId" = $1 AND "personGroupId" = $2', tgt, pg
     )
     assert survived == 1
-
-
-async def test_sync_person_names_ignores_unmapped_user_pairs(conn):
-    """Two users in the same cluster group but with no sync relationship must
-    not have names copied between them."""
-    await _decoy_map_row(conn)
-
-    cg = await make_cluster_group(conn)
-    stranger_a = await make_user(conn, cluster_group_id=cg)
-    stranger_b = await make_user(conn, cluster_group_id=cg)
-    pg = await make_person_group(conn, cg)
-    await make_person(conn, stranger_a, pg, name="Granny")
-    await make_person(conn, stranger_b, pg, name="")
-
-    assert await sync_person_names(conn) == 0
-    name = await conn.fetchval(
-        'SELECT name FROM person WHERE "ownerId" = $1 AND "personGroupId" = $2',
-        stranger_b, pg,
-    )
-    assert name == ""
-
-
-
-
-async def test_sync_person_names_skips_groups_no_synced_asset_carries(conn, pair):
-    """Names must only reach person groups the sidecar actually synced.
-
-    Under cluster groups Immich puts both users' faces into the same
-    person_group by construction, so "same group + mapped owner pair" is not a
-    sidecar footprint. Without the synced-asset guard, the source's name lands
-    on a person the target discovered entirely on their own photos.
-    """
-    cg, src, tgt = pair
-
-    carried = await make_person_group(conn, cg)      # reached via a synced asset
-    own_only = await make_person_group(conn, cg)     # target's own discovery
-
-    for pg in (carried, own_only):
-        await make_person(conn, src, pg, name="Granny")
-        await make_person(conn, tgt, pg, name="")
-
-    # Only `carried` is present on the synced target asset.
-    await _map_synced_pair(conn, src, tgt, person_group_id=carried)
-
-    # The target's own photo carries `own_only`. It is not a synced asset.
-    own_asset = await make_asset(conn, tgt)
-    await make_face(conn, own_asset, person_group_id=own_only, bbox=(2, 2, 8, 8))
-
-    assert await sync_person_names(conn) == 1
-
-    assert await conn.fetchval(
-        'SELECT name FROM person WHERE "ownerId" = $1 AND "personGroupId" = $2', tgt, carried
-    ) == "Granny"
-    assert await conn.fetchval(
-        'SELECT name FROM person WHERE "ownerId" = $1 AND "personGroupId" = $2', tgt, own_only
-    ) == ""
 
 
 async def test_teardown_deletes_the_target_row_when_a_source_still_holds_the_group(conn, pair):
