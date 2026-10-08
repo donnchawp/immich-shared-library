@@ -18,6 +18,15 @@ SET client_min_messages = warning;
 SET row_security = off;
 
 --
+-- Name: vectors; Type: SCHEMA; Schema: -; Owner: postgres
+--
+
+CREATE SCHEMA vectors;
+
+
+ALTER SCHEMA vectors OWNER TO postgres;
+
+--
 -- Name: cube; Type: EXTENSION; Schema: -; Owner: -
 --
 
@@ -166,6 +175,19 @@ CREATE TYPE public.assets_status_enum AS ENUM (
 
 
 ALTER TYPE public.assets_status_enum OWNER TO postgres;
+
+--
+-- Name: person_user_role_enum; Type: TYPE; Schema: public; Owner: postgres
+--
+
+CREATE TYPE public.person_user_role_enum AS ENUM (
+    'read',
+    'write',
+    'admin'
+);
+
+
+ALTER TYPE public.person_user_role_enum OWNER TO postgres;
 
 --
 -- Name: sourcetype; Type: TYPE; Schema: public; Owner: postgres
@@ -431,19 +453,19 @@ ALTER FUNCTION public.f_unaccent(text) OWNER TO postgres;
 CREATE FUNCTION public.immich_uuid_v7(p_timestamp timestamp with time zone DEFAULT clock_timestamp()) RETURNS uuid
     LANGUAGE sql
     AS $$
-    select encode(
-      set_bit(
-        set_bit(
-          overlay(uuid_send(gen_random_uuid())
-                  placing substring(int8send(floor(extract(epoch from p_timestamp) * 1000)::bigint) from 3)
-                  from 1 for 6
-          ),
-          52, 1
-        ),
-        53, 1
-      ),
-      'hex')::uuid;
-  $$;
+            select encode(
+                set_bit(
+                  set_bit(
+                    overlay(uuid_send(gen_random_uuid())
+                            placing substring(int8send(floor(extract(epoch from p_timestamp) * 1000)::bigint) from 3)
+                            from 1 for 6
+                    ),
+                    52, 1
+                  ),
+                  53, 1
+                ),
+                'hex')::uuid;
+            $$;
 
 
 ALTER FUNCTION public.immich_uuid_v7(p_timestamp timestamp with time zone) OWNER TO postgres;
@@ -455,8 +477,8 @@ ALTER FUNCTION public.immich_uuid_v7(p_timestamp timestamp with time zone) OWNER
 CREATE FUNCTION public.ll_to_earth_public(latitude double precision, longitude double precision) RETURNS public.earth
     LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
     AS $$
-    SELECT public.cube(public.cube(public.cube(public.earth()*cos(radians(latitude))*cos(radians(longitude))),public.earth()*cos(radians(latitude))*sin(radians(longitude))),public.earth()*sin(radians(latitude)))::public.earth
-  $$;
+        SELECT public.cube(public.cube(public.cube(public.earth()*cos(radians(latitude))*cos(radians(longitude))),public.earth()*cos(radians(latitude))*sin(radians(longitude))),public.earth()*sin(radians(latitude)))::public.earth
+    $$;
 
 
 ALTER FUNCTION public.ll_to_earth_public(latitude double precision, longitude double precision) OWNER TO postgres;
@@ -534,6 +556,25 @@ CREATE FUNCTION public.person_delete_audit() RETURNS trigger
 ALTER FUNCTION public.person_delete_audit() OWNER TO postgres;
 
 --
+-- Name: person_delete_shares(); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.person_delete_shares() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    BEGIN
+      DELETE FROM person_user
+      USING deleted_rows
+      WHERE person_user."personGroupId" = deleted_rows."personGroupId"
+        AND person_user."sharedWithId" = deleted_rows."ownerId";
+      RETURN NULL;
+    END
+  $$;
+
+
+ALTER FUNCTION public.person_delete_shares() OWNER TO postgres;
+
+--
 -- Name: person_group_delete_audit(); Type: FUNCTION; Schema: public; Owner: postgres
 --
 
@@ -550,6 +591,34 @@ CREATE FUNCTION public.person_group_delete_audit() RETURNS trigger
 
 
 ALTER FUNCTION public.person_group_delete_audit() OWNER TO postgres;
+
+--
+-- Name: person_user_after_insert(); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.person_user_after_insert() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    BEGIN
+      INSERT INTO person ("ownerId", "personGroupId", "name", "birthDate")
+      SELECT DISTINCT ON (i."sharedWithId", i."personGroupId")
+        i."sharedWithId", i."personGroupId", shared."name", shared."birthDate"
+      FROM inserted_rows i
+      INNER JOIN person shared
+        ON shared."ownerId" = i."sharedById" AND shared."personGroupId" = i."personGroupId"
+      ORDER BY i."sharedWithId", i."personGroupId", shared."name" = '', shared."birthDate" IS NULL
+      ON CONFLICT ("ownerId", "personGroupId") DO UPDATE
+      SET
+        "name" = CASE WHEN person."name" = '' THEN EXCLUDED."name" ELSE person."name" END,
+        "birthDate" = COALESCE(person."birthDate", EXCLUDED."birthDate")
+      WHERE (person."name" = '' AND EXCLUDED."name" <> '')
+        OR (person."birthDate" IS NULL AND EXCLUDED."birthDate" IS NOT NULL);
+      RETURN NULL;
+    END
+  $$;
+
+
+ALTER FUNCTION public.person_user_after_insert() OWNER TO postgres;
 
 --
 -- Name: stack_delete_audit(); Type: FUNCTION; Schema: public; Owner: postgres
@@ -576,14 +645,14 @@ ALTER FUNCTION public.stack_delete_audit() OWNER TO postgres;
 CREATE FUNCTION public.updated_at() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
-    DECLARE
-        clock_timestamp TIMESTAMP := clock_timestamp();
-    BEGIN
-        new."updatedAt" = clock_timestamp;
-        new."updateId" = immich_uuid_v7(clock_timestamp);
-        return new;
-    END;
-  $$;
+          DECLARE
+              clock_timestamp TIMESTAMP := clock_timestamp();
+          BEGIN
+              new."updatedAt" = clock_timestamp;
+              new."updateId" = immich_uuid_v7(clock_timestamp);
+              return new;
+          END;
+          $$;
 
 
 ALTER FUNCTION public.updated_at() OWNER TO postgres;
@@ -1336,6 +1405,41 @@ CREATE TABLE public.migration_overrides (
 ALTER TABLE public.migration_overrides OWNER TO postgres;
 
 --
+-- Name: migrations; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.migrations (
+    id integer NOT NULL,
+    "timestamp" bigint NOT NULL,
+    name character varying NOT NULL
+);
+
+
+ALTER TABLE public.migrations OWNER TO postgres;
+
+--
+-- Name: migrations_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
+--
+
+CREATE SEQUENCE public.migrations_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER TABLE public.migrations_id_seq OWNER TO postgres;
+
+--
+-- Name: migrations_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: postgres
+--
+
+ALTER SEQUENCE public.migrations_id_seq OWNED BY public.migrations.id;
+
+
+--
 -- Name: move_history; Type: TABLE; Schema: public; Owner: postgres
 --
 
@@ -1510,6 +1614,24 @@ CREATE TABLE public.person_group_audit (
 
 
 ALTER TABLE public.person_group_audit OWNER TO postgres;
+
+--
+-- Name: person_user; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.person_user (
+    "personGroupId" uuid NOT NULL,
+    "sharedById" uuid NOT NULL,
+    "sharedWithId" uuid NOT NULL,
+    role public.person_user_role_enum NOT NULL,
+    "createdAt" timestamp with time zone DEFAULT now() NOT NULL,
+    "updatedAt" timestamp with time zone DEFAULT now() NOT NULL,
+    "updateId" uuid DEFAULT public.immich_uuid_v7() NOT NULL,
+    CONSTRAINT "person_user_sharedBy_sharedWith_chk" CHECK (("sharedById" <> "sharedWithId"))
+);
+
+
+ALTER TABLE public.person_user OWNER TO postgres;
 
 --
 -- Name: plugin; Type: TABLE; Schema: public; Owner: postgres
@@ -1738,12 +1860,12 @@ CREATE TABLE public."user" (
     "isAdmin" boolean DEFAULT false NOT NULL,
     "shouldChangePassword" boolean DEFAULT true NOT NULL,
     "deletedAt" timestamp with time zone,
-    "oauthId" character varying DEFAULT ''::character varying NOT NULL,
+    "oauthId" character varying,
     "updatedAt" timestamp with time zone DEFAULT now() NOT NULL,
     "storageLabel" character varying,
     name character varying DEFAULT ''::character varying NOT NULL,
     "quotaSizeInBytes" bigint,
-    "quotaUsageInBytes" bigint DEFAULT 0 NOT NULL,
+    "quotaUsageInBytes" bigint DEFAULT '0'::bigint NOT NULL,
     status character varying DEFAULT 'active'::character varying NOT NULL,
     "profileChangedAt" timestamp with time zone DEFAULT now() NOT NULL,
     "updateId" uuid DEFAULT public.immich_uuid_v7() NOT NULL,
@@ -1905,6 +2027,21 @@ CREATE TABLE public.workflow_step (
 
 
 ALTER TABLE public.workflow_step OWNER TO postgres;
+
+--
+-- Name: migrations id; Type: DEFAULT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.migrations ALTER COLUMN id SET DEFAULT nextval('public.migrations_id_seq'::regclass);
+
+
+--
+-- Name: migrations PK_8c82d7f526340ab734260ea46be; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.migrations
+    ADD CONSTRAINT "PK_8c82d7f526340ab734260ea46be" PRIMARY KEY (id);
+
 
 --
 -- Name: move_history UQ_entityId_pathType; Type: CONSTRAINT; Schema: public; Owner: postgres
@@ -2368,6 +2505,14 @@ ALTER TABLE ONLY public.person_group
 
 ALTER TABLE ONLY public.person
     ADD CONSTRAINT person_pkey PRIMARY KEY ("ownerId", "personGroupId");
+
+
+--
+-- Name: person_user person_user_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.person_user
+    ADD CONSTRAINT person_user_pkey PRIMARY KEY ("personGroupId", "sharedById", "sharedWithId");
 
 
 --
@@ -3215,7 +3360,7 @@ CREATE INDEX "asset_updateId_idx" ON public.asset USING btree ("updateId");
 CREATE INDEX clip_index ON public.smart_search USING vchordrq (embedding public.vector_cosine_ops) WITH (options='
         residual_quantization = false
         [build.internal]
-        lists = [1]
+        lists = [1024]
         spherical_centroids = true
         build_threads = 4
         sampling_factor = 1024
@@ -3250,7 +3395,7 @@ CREATE INDEX "cluster_group_updateId_idx" ON public.cluster_group USING btree ("
 CREATE INDEX face_index ON public.face_search USING vchordrq (embedding public.vector_cosine_ops) WITH (options='
         residual_quantization = false
         [build.internal]
-        lists = [1]
+        lists = [1024]
         spherical_centroids = true
         build_threads = 4
         sampling_factor = 1024
@@ -3542,6 +3687,27 @@ CREATE INDEX "person_personGroupId_idx" ON public.person USING btree ("personGro
 --
 
 CREATE INDEX "person_updateId_idx" ON public.person USING btree ("updateId");
+
+
+--
+-- Name: person_user_sharedById_personGroupId_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX "person_user_sharedById_personGroupId_idx" ON public.person_user USING btree ("sharedById", "personGroupId");
+
+
+--
+-- Name: person_user_sharedWithId_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX "person_user_sharedWithId_idx" ON public.person_user USING btree ("sharedWithId");
+
+
+--
+-- Name: person_user_updateId_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX "person_user_updateId_idx" ON public.person_user USING btree ("updateId");
 
 
 --
@@ -4028,6 +4194,13 @@ CREATE TRIGGER person_delete_audit AFTER DELETE ON public.person REFERENCING OLD
 
 
 --
+-- Name: person person_delete_shares; Type: TRIGGER; Schema: public; Owner: postgres
+--
+
+CREATE TRIGGER person_delete_shares AFTER DELETE ON public.person REFERENCING OLD TABLE AS deleted_rows FOR EACH STATEMENT EXECUTE FUNCTION public.person_delete_shares();
+
+
+--
 -- Name: person_group person_group_delete_audit; Type: TRIGGER; Schema: public; Owner: postgres
 --
 
@@ -4046,6 +4219,20 @@ CREATE TRIGGER "person_group_updatedAt" BEFORE UPDATE ON public.person_group FOR
 --
 
 CREATE TRIGGER "person_updatedAt" BEFORE UPDATE ON public.person FOR EACH ROW EXECUTE FUNCTION public.updated_at();
+
+
+--
+-- Name: person_user person_user_after_insert; Type: TRIGGER; Schema: public; Owner: postgres
+--
+
+CREATE TRIGGER person_user_after_insert AFTER INSERT ON public.person_user REFERENCING NEW TABLE AS inserted_rows FOR EACH STATEMENT EXECUTE FUNCTION public.person_user_after_insert();
+
+
+--
+-- Name: person_user person_user_updatedAt; Type: TRIGGER; Schema: public; Owner: postgres
+--
+
+CREATE TRIGGER "person_user_updatedAt" BEFORE UPDATE ON public.person_user FOR EACH ROW EXECUTE FUNCTION public.updated_at();
 
 
 --
@@ -4468,6 +4655,22 @@ ALTER TABLE ONLY public.person
 
 ALTER TABLE ONLY public.person
     ADD CONSTRAINT "person_personGroupId_fkey" FOREIGN KEY ("personGroupId") REFERENCES public.person_group(id) ON UPDATE CASCADE ON DELETE CASCADE;
+
+
+--
+-- Name: person_user person_user_sharedById_personGroupId_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.person_user
+    ADD CONSTRAINT "person_user_sharedById_personGroupId_fkey" FOREIGN KEY ("sharedById", "personGroupId") REFERENCES public.person("ownerId", "personGroupId") ON UPDATE CASCADE ON DELETE CASCADE;
+
+
+--
+-- Name: person_user person_user_sharedWithId_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.person_user
+    ADD CONSTRAINT "person_user_sharedWithId_fkey" FOREIGN KEY ("sharedWithId") REFERENCES public."user"(id) ON UPDATE CASCADE ON DELETE CASCADE;
 
 
 --
