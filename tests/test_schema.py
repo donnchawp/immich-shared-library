@@ -48,7 +48,9 @@ async def test_person_composite_pk_is_a_startup_tripwire(conn):
     constraint on exactly those columns. person's PK is the newest and least
     settled of the three the sidecar depends on -- losing it to an Immich
     upgrade must fail at startup, not mid-sync."""
-    await conn.execute("ALTER TABLE person DROP CONSTRAINT person_pkey")
+    # CASCADE since v3.3.0: person_user's FK to (ownerId, personGroupId) hangs
+    # off this index, so an upgrade that dropped the PK would take it too.
+    await conn.execute("ALTER TABLE person DROP CONSTRAINT person_pkey CASCADE")
 
     with pytest.raises(SchemaValidationError, match="person"):
         await validate_schema(conn)

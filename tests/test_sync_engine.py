@@ -19,7 +19,7 @@ from src.cleanup import cleanup_reassigned_faces, delete_target_asset
 from src.db import is_connection_error
 from src.main import _drop_person_map_table
 from src.ml_sync import sync_faces_for_asset, sync_faces_for_asset_guarded, sync_faces_incremental
-from src.person_sync import cleanup_orphaned_persons, sync_person_names
+from src.person_sync import cleanup_orphaned_persons
 from src.schema import SchemaValidationError
 from src import sync_engine
 from src.sync_engine import _cleanup_step, _sync_faces_guarded
@@ -30,7 +30,8 @@ from tests.conftest import (
 
 
 async def test_full_face_flow_converges(conn, pair):
-    """Sync a face, rename at source, reassign at source -- all must converge."""
+    """Sync a face, rename at source -- the cycle must converge without
+    carrying the name across (that is Immich's person sharing's job)."""
     cg, src, tgt = pair
     pg = await make_person_group(conn, cg)
     await make_person(conn, src, pg, name="")
@@ -50,17 +51,15 @@ async def test_full_face_flow_converges(conn, pair):
         'UPDATE person SET name = $1 WHERE "ownerId" = $2 AND "personGroupId" = $3',
         "Jacinta", src, pg,
     )
-    assert await sync_person_names(conn) == 1
 
+    # A second pass must be a no-op everywhere, and the target stays unnamed
+    assert await sync_faces_for_asset(conn, src_asset, tgt_asset, src, tgt) == 0
+    assert await cleanup_reassigned_faces(conn) == 0
+    assert await cleanup_orphaned_persons(conn) == 0
     name = await conn.fetchval(
         'SELECT name FROM person WHERE "ownerId" = $1 AND "personGroupId" = $2', tgt, pg
     )
-    assert name == "Jacinta"
-
-    # Second cycle must be a no-op everywhere
-    assert await sync_person_names(conn) == 0
-    assert await cleanup_reassigned_faces(conn) == 0
-    assert await cleanup_orphaned_persons(conn) == 0
+    assert name == ""
 
 
 async def test_drop_person_map_table_removes_it(conn):
@@ -464,7 +463,6 @@ async def test_phase_0_prunes_the_stale_mapping_before_phase_2_reads_it(conn, mo
     monkeypatch.setattr(sync_engine.settings, "sync_jobs", [])
     monkeypatch.setattr(sync_engine, "cleanup_stale_mappings", recorder("phase0"))
     monkeypatch.setattr(sync_engine, "sync_faces_incremental", recorder("phase2"))
-    monkeypatch.setattr(sync_engine, "sync_person_names", recorder("phase3_names"))
     monkeypatch.setattr(sync_engine, "sync_person_thumbnails", recorder("phase3_thumbs"))
     monkeypatch.setattr(sync_engine, "cleanup_deleted_assets", recorder("phase4_assets"))
     monkeypatch.setattr(sync_engine, "cleanup_reassigned_faces", recorder("phase4_faces"))
@@ -513,7 +511,6 @@ async def test_a_failed_phase_4_step_does_not_undo_the_deletions_before_it(conn,
     monkeypatch.setattr(sync_engine.settings, "sync_jobs", [])
     monkeypatch.setattr(sync_engine, "cleanup_stale_mappings", lambda c: _zero())
     monkeypatch.setattr(sync_engine, "sync_faces_incremental", lambda c: _zero())
-    monkeypatch.setattr(sync_engine, "sync_person_names", lambda c: _zero())
     monkeypatch.setattr(sync_engine, "sync_person_thumbnails", lambda c: _zero())
     monkeypatch.setattr(sync_engine, "cleanup_deleted_assets", deletes_a_row)
     monkeypatch.setattr(sync_engine, "cleanup_reassigned_faces", always_fails)
@@ -548,8 +545,8 @@ def _quiet_cycle(monkeypatch, conn):
     monkeypatch.setattr(sync_engine, "transaction", patched_transaction)
     monkeypatch.setattr(sync_engine.settings, "sync_jobs", [])
     for name in (
-        "cleanup_stale_mappings", "sync_faces_incremental", "sync_person_names",
-        "sync_person_thumbnails", "cleanup_deleted_assets",
+        "cleanup_stale_mappings", "sync_faces_incremental", "sync_person_thumbnails",
+        "cleanup_deleted_assets",
         "cleanup_reassigned_faces", "cleanup_orphaned_persons",
     ):
         monkeypatch.setattr(sync_engine, name, lambda c: _zero())
@@ -690,7 +687,7 @@ async def test_a_broken_connection_reaches_the_sync_loop(conn, monkeypatch):
     async def connection_died(c):
         raise asyncpg.exceptions.ConnectionDoesNotExistError("connection is closed")
 
-    monkeypatch.setattr(sync_engine, "sync_person_names", connection_died)
+    monkeypatch.setattr(sync_engine, "sync_person_thumbnails", connection_died)
 
     with pytest.raises(asyncpg.exceptions.ConnectionDoesNotExistError):
         await sync_engine.run_full_sync()

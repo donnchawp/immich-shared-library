@@ -26,7 +26,7 @@ schema-dump:  ## Re-dump the live Immich schema into the test fixture
 	  docker exec $(PG) pg_dump -U postgres --schema-only immich > $(DUMP_TMP); \
 	  grep -vE '^\\(un)?restrict ' $(DUMP_TMP) > $(DUMP_TMP).clean; \
 	  test -s $(DUMP_TMP).clean; \
-	  mv $(DUMP_TMP).clean tests/fixtures/schema_v3.2.0.sql
+	  mv $(DUMP_TMP).clean tests/fixtures/schema_v3.3.0.sql
 
 testdb: testdb-clean  ## (Re)create the scratch test database from the fixture
 	docker exec $(PG) psql -U postgres -c "CREATE DATABASE immich_test;"
@@ -36,7 +36,7 @@ testdb: testdb-clean  ## (Re)create the scratch test database from the fixture
 # depends on it with it, `make testdb` reports success, and the suite runs
 # against a half-built schema. tests/test_harness.py checks the result too,
 # but this is the half that fails at the point of the mistake.
-	docker exec -i $(PG) psql -v ON_ERROR_STOP=1 -U postgres -q -d immich_test < tests/fixtures/schema_v3.2.0.sql
+	docker exec -i $(PG) psql -v ON_ERROR_STOP=1 -U postgres -q -d immich_test < tests/fixtures/schema_v3.3.0.sql
 
 testdb-clean:  ## Drop the scratch test database
 	docker exec $(PG) psql -U postgres -c "DROP DATABASE IF EXISTS immich_test;"
