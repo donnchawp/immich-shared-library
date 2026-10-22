@@ -25,6 +25,25 @@ async def test_copies_person_group_id_verbatim(conn, pair):
     assert copied == pg
 
 
+async def test_copied_face_takes_its_owner_from_the_target_asset(conn, pair):
+    cg, src, tgt = pair
+
+    src_asset = await make_asset(conn, src)
+    tgt_asset = await make_asset(conn, tgt)
+    await make_face(conn, src_asset)
+
+    await sync_faces_for_asset(conn, src_asset, tgt_asset, src, tgt)
+
+    # Not copied from the source face: Immich's insert trigger fills these
+    # from the asset the face lands on, which belongs to the target.
+    owner, visibility = await conn.fetchrow(
+        'SELECT "ownerId", "assetVisibility" FROM asset_face WHERE "assetId" = $1',
+        tgt_asset,
+    )
+    assert owner == tgt
+    assert visibility == "timeline"
+
+
 async def test_creates_the_target_person_row(conn, pair):
     cg, src, tgt = pair
     pg = await make_person_group(conn, cg)

@@ -170,6 +170,18 @@ INSERTED_COLUMNS: dict[str, set[str]] = {
     },
 }
 
+# NOT NULL columns Immich fills itself, from a BEFORE INSERT trigger, so the
+# sidecar must leave them out of its INSERTs. table -> (trigger, columns).
+# Since v3.3.5 asset_face carries a denormalized copy of its asset's owner and
+# visibility, which asset_face_set_asset_state copies from the asset row on
+# every insert (overwriting anything supplied) and asset_face_update_asset_state
+# keeps in step afterwards. Like asset.isEdited, it is derived, not ours to set.
+# The columns only count as supplied while the trigger exists: without it they
+# really are unsupplied, and every face INSERT would fail.
+TRIGGER_SUPPLIED_COLUMNS: dict[str, tuple[str, set[str]]] = {
+    "asset_face": ("asset_face_set_asset_state", {"ownerId", "assetVisibility"}),
+}
+
 # Child tables that must CASCADE DELETE from asset.id.
 # cleanup.py deletes from asset and relies on cascades for these.
 EXPECTED_CASCADE_CHILDREN: set[str] = {
@@ -244,11 +256,34 @@ async def validate_schema(conn: asyncpg.Connection | None = None) -> None:
             """,
             insert_tables,
         )
+        # tgtype bit 1 is ROW, 2 is BEFORE, 4 is INSERT; tgenabled 'D' is
+        # disabled. An AFTER or statement-level trigger runs too late to fill
+        # a NOT NULL column, so only an enabled BEFORE INSERT row one counts.
+        trigger_rows = await c.fetch(
+            """
+            SELECT cl.relname AS table_name, t.tgname AS trigger_name
+            FROM pg_trigger t
+            JOIN pg_class cl ON t.tgrelid = cl.oid
+            JOIN pg_namespace n ON n.oid = cl.relnamespace
+            WHERE n.nspname = 'public'
+              AND NOT t.tgisinternal
+              AND t.tgenabled <> 'D'
+              AND t.tgtype & 7 = 7
+            """,
+        )
+        insert_triggers = {(row["table_name"], row["trigger_name"]) for row in trigger_rows}
+        trigger_supplied: dict[str, set[str]] = {
+            table: cols
+            for table, (trigger, cols) in TRIGGER_SUPPLIED_COLUMNS.items()
+            if (table, trigger) in insert_triggers
+        }
+
         unsupplied: dict[str, list[str]] = {}
         for row in required_rows:
             table = row["table_name"]
             col = row["column_name"]
-            if col not in INSERTED_COLUMNS.get(table, set()):
+            supplied = INSERTED_COLUMNS.get(table, set()) | trigger_supplied.get(table, set())
+            if col not in supplied:
                 unsupplied.setdefault(table, []).append(col)
 
         # Check CASCADE DELETE from asset to expected child tables.

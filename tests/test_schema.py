@@ -6,7 +6,7 @@ from src.schema import SchemaValidationError, validate_cluster_group, validate_s
 from tests.conftest import make_cluster_group, make_user
 
 
-async def test_validate_schema_passes_against_real_v3_2_0_schema(conn):
+async def test_validate_schema_passes_against_the_real_fixture_schema(conn):
     await validate_schema(conn)  # must not raise
 
 
@@ -53,4 +53,15 @@ async def test_person_composite_pk_is_a_startup_tripwire(conn):
     await conn.execute("ALTER TABLE person DROP CONSTRAINT person_pkey CASCADE")
 
     with pytest.raises(SchemaValidationError, match="person"):
+        await validate_schema(conn)
+
+
+async def test_trigger_filled_face_columns_need_their_trigger(conn):
+    """asset_face."ownerId" and "assetVisibility" are NOT NULL with no default
+    since v3.3.5. The sidecar leaves them out of its face INSERT because
+    asset_face_set_asset_state fills them from the asset row -- without that
+    trigger, every face copy would fail on the NOT NULL."""
+    await conn.execute("DROP TRIGGER asset_face_set_asset_state ON asset_face")
+
+    with pytest.raises(SchemaValidationError, match="'asset_face'.*assetVisibility, ownerId"):
         await validate_schema(conn)
