@@ -201,12 +201,17 @@ async def test_phase_2_would_have_wedged_on_the_mapping_phase_0_prunes(conn, pai
     violation is provoked directly, to pin the fact that the mapping really is
     a live foreign-key hazard and not a theoretical one, and then the prune is
     shown to remove it.
+
+    Since Immich v3.3.5 the failure arrives as a NOT NULL violation rather
+    than the foreign key: asset_face_set_asset_state copies "ownerId" from an
+    asset row that isn't there, leaving it NULL, and NOT NULL is checked
+    first. Either way the face INSERT aborts, which is the hazard.
     """
     cg, src, tgt = pair
     _, dead_target = await make_synced_pair(conn, src, tgt, target_asset_id=uuid4())
 
     await conn.execute("SAVEPOINT probe")
-    with pytest.raises(asyncpg.ForeignKeyViolationError):
+    with pytest.raises(asyncpg.IntegrityConstraintViolationError):
         await make_face(conn, dead_target)
     await conn.execute("ROLLBACK TO SAVEPOINT probe")
 

@@ -389,6 +389,45 @@ CREATE FUNCTION public.asset_face_audit() RETURNS trigger
 ALTER FUNCTION public.asset_face_audit() OWNER TO postgres;
 
 --
+-- Name: asset_face_set_asset_state(); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.asset_face_set_asset_state() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    BEGIN
+      -- FOR SHARE so a concurrent update of the asset cannot leave this face with stale state
+      SELECT "ownerId", "visibility", "deletedAt"
+      INTO NEW."ownerId", NEW."assetVisibility", NEW."assetDeletedAt"
+      FROM asset
+      WHERE "id" = NEW."assetId"
+      FOR SHARE;
+      RETURN NEW;
+    END
+  $$;
+
+
+ALTER FUNCTION public.asset_face_set_asset_state() OWNER TO postgres;
+
+--
+-- Name: asset_face_update_asset_state(); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.asset_face_update_asset_state() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    BEGIN
+      UPDATE asset_face
+      SET "ownerId" = NEW."ownerId", "assetVisibility" = NEW."visibility", "assetDeletedAt" = NEW."deletedAt"
+      WHERE "assetId" = NEW."id";
+      RETURN NULL;
+    END
+  $$;
+
+
+ALTER FUNCTION public.asset_face_update_asset_state() OWNER TO postgres;
+
+--
 -- Name: asset_metadata_audit(); Type: FUNCTION; Schema: public; Owner: postgres
 --
 
@@ -1037,7 +1076,10 @@ CREATE TABLE public.asset_face (
     "deletedAt" timestamp with time zone,
     "updatedAt" timestamp with time zone DEFAULT now() NOT NULL,
     "updateId" uuid DEFAULT public.immich_uuid_v7() NOT NULL,
-    "isVisible" boolean DEFAULT true NOT NULL
+    "isVisible" boolean DEFAULT true NOT NULL,
+    "ownerId" uuid NOT NULL,
+    "assetVisibility" public.asset_visibility_enum NOT NULL,
+    "assetDeletedAt" timestamp with time zone
 );
 
 
@@ -1470,11 +1512,11 @@ CREATE TABLE public.naturalearth_countries (
 ALTER TABLE public.naturalearth_countries OWNER TO postgres;
 
 --
--- Name: naturalearth_countries_tmp_id_seq1; Type: SEQUENCE; Schema: public; Owner: postgres
+-- Name: naturalearth_countries_tmp_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
 --
 
 ALTER TABLE public.naturalearth_countries ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY (
-    SEQUENCE NAME public.naturalearth_countries_tmp_id_seq1
+    SEQUENCE NAME public.naturalearth_countries_tmp_id_seq
     START WITH 1
     INCREMENT BY 1
     NO MINVALUE
@@ -3179,6 +3221,13 @@ CREATE INDEX "asset_face_personGroupId_assetId_notDeleted_isVisible_idx" ON publ
 
 
 --
+-- Name: asset_face_personGroupId_ownerId_assetId_timeline_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX "asset_face_personGroupId_ownerId_assetId_timeline_idx" ON public.asset_face USING btree ("personGroupId", "ownerId", "assetId") WHERE (("deletedAt" IS NULL) AND ("isVisible" IS TRUE) AND ("assetVisibility" = 'timeline'::public.asset_visibility_enum) AND ("assetDeletedAt" IS NULL));
+
+
+--
 -- Name: asset_fileCreatedAt_idx; Type: INDEX; Schema: public; Owner: postgres
 --
 
@@ -4075,10 +4124,24 @@ CREATE TRIGGER asset_face_audit AFTER DELETE ON public.asset_face REFERENCING OL
 
 
 --
+-- Name: asset_face asset_face_set_asset_state; Type: TRIGGER; Schema: public; Owner: postgres
+--
+
+CREATE TRIGGER asset_face_set_asset_state BEFORE INSERT ON public.asset_face FOR EACH ROW EXECUTE FUNCTION public.asset_face_set_asset_state();
+
+
+--
+-- Name: asset asset_face_update_asset_state; Type: TRIGGER; Schema: public; Owner: postgres
+--
+
+CREATE TRIGGER asset_face_update_asset_state AFTER UPDATE ON public.asset FOR EACH ROW WHEN ((((old."ownerId" IS DISTINCT FROM new."ownerId") OR (old.visibility IS DISTINCT FROM new.visibility)) OR (old."deletedAt" IS DISTINCT FROM new."deletedAt"))) EXECUTE FUNCTION public.asset_face_update_asset_state();
+
+
+--
 -- Name: asset_face asset_face_updatedAt; Type: TRIGGER; Schema: public; Owner: postgres
 --
 
-CREATE TRIGGER "asset_face_updatedAt" BEFORE UPDATE ON public.asset_face FOR EACH ROW EXECUTE FUNCTION public.updated_at();
+CREATE TRIGGER "asset_face_updatedAt" BEFORE UPDATE ON public.asset_face FOR EACH ROW WHEN ((NOT (((old."ownerId" IS DISTINCT FROM new."ownerId") OR (old."assetVisibility" IS DISTINCT FROM new."assetVisibility")) OR (old."assetDeletedAt" IS DISTINCT FROM new."assetDeletedAt")))) EXECUTE FUNCTION public.updated_at();
 
 
 --
