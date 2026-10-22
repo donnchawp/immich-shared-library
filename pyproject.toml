@@ -1,6 +1,6 @@
 [project]
 name = "immich-shared-library"
-version = "0.1.0"
+version = "1.0.0"
 description = "Sidecar service for sharing Immich libraries between users without duplicate ML processing"
 requires-python = ">=3.11"
 dependencies = [
