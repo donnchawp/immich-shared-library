@@ -177,6 +177,75 @@ CREATE TYPE public.assets_status_enum AS ENUM (
 ALTER TYPE public.assets_status_enum OWNER TO postgres;
 
 --
+-- Name: futo_backups_configuration_key_enum; Type: TYPE; Schema: public; Owner: postgres
+--
+
+CREATE TYPE public.futo_backups_configuration_key_enum AS ENUM (
+    'encryption-key',
+    'onboarded-key',
+    'telemetry',
+    'skipped-onboarding-extra-config',
+    'ignored-immich-database-dump-warning',
+    'restic-o-rest-connections',
+    'session-secret',
+    'state-path',
+    'throttle',
+    'support-mode',
+    'restore-awaiting-continue'
+);
+
+
+ALTER TYPE public.futo_backups_configuration_key_enum OWNER TO postgres;
+
+--
+-- Name: futo_backups_job_name_enum; Type: TYPE; Schema: public; Owner: postgres
+--
+
+CREATE TYPE public.futo_backups_job_name_enum AS ENUM (
+    'repository-backup',
+    'repository-prune',
+    'repository-restore',
+    'repository-restore-from-point',
+    'repository-snapshot-forget',
+    'repository-sync-metrics'
+);
+
+
+ALTER TYPE public.futo_backups_job_name_enum OWNER TO postgres;
+
+--
+-- Name: futo_backups_job_status_enum; Type: TYPE; Schema: public; Owner: postgres
+--
+
+CREATE TYPE public.futo_backups_job_status_enum AS ENUM (
+    'queued',
+    'running',
+    'complete',
+    'warn',
+    'failed',
+    'cancelled',
+    'incomplete'
+);
+
+
+ALTER TYPE public.futo_backups_job_status_enum OWNER TO postgres;
+
+--
+-- Name: futo_backups_last_backup_status_enum; Type: TYPE; Schema: public; Owner: postgres
+--
+
+CREATE TYPE public.futo_backups_last_backup_status_enum AS ENUM (
+    'incomplete',
+    'complete',
+    'warn',
+    'failed',
+    'cancelled'
+);
+
+
+ALTER TYPE public.futo_backups_last_backup_status_enum OWNER TO postgres;
+
+--
 -- Name: person_user_role_enum; Type: TYPE; Schema: public; Owner: postgres
 --
 
@@ -1247,6 +1316,22 @@ CREATE TABLE public.asset_video (
 ALTER TABLE public.asset_video OWNER TO postgres;
 
 --
+-- Name: auth_challenge; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.auth_challenge (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    type character varying NOT NULL,
+    challenge character varying NOT NULL,
+    "userId" uuid,
+    "createdAt" timestamp with time zone DEFAULT now() NOT NULL,
+    "expiresAt" timestamp with time zone NOT NULL
+);
+
+
+ALTER TABLE public.auth_challenge OWNER TO postgres;
+
+--
 -- Name: cluster_group; Type: TABLE; Schema: public; Owner: postgres
 --
 
@@ -1286,6 +1371,174 @@ CREATE TABLE public.face_search (
 
 
 ALTER TABLE public.face_search OWNER TO postgres;
+
+--
+-- Name: futo_backups_backends; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.futo_backups_backends (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    configuration jsonb NOT NULL
+);
+
+
+ALTER TABLE public.futo_backups_backends OWNER TO postgres;
+
+--
+-- Name: futo_backups_config; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.futo_backups_config (
+    key public.futo_backups_configuration_key_enum NOT NULL,
+    value jsonb NOT NULL
+);
+
+
+ALTER TABLE public.futo_backups_config OWNER TO postgres;
+
+--
+-- Name: futo_backups_integrations_immich_config; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.futo_backups_integrations_immich_config (
+    "repositoryId" uuid NOT NULL,
+    "scheduleId" uuid NOT NULL,
+    configuration jsonb NOT NULL
+);
+
+
+ALTER TABLE public.futo_backups_integrations_immich_config OWNER TO postgres;
+
+--
+-- Name: futo_backups_jobs; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.futo_backups_jobs (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    sequence bigint NOT NULL,
+    name public.futo_backups_job_name_enum NOT NULL,
+    data jsonb NOT NULL,
+    "repositoryId" text NOT NULL,
+    status public.futo_backups_job_status_enum NOT NULL,
+    outcome jsonb,
+    "logFilePath" text NOT NULL,
+    "queuedAt" timestamp with time zone DEFAULT now() NOT NULL,
+    start timestamp with time zone,
+    "end" timestamp with time zone
+);
+
+
+ALTER TABLE public.futo_backups_jobs OWNER TO postgres;
+
+--
+-- Name: futo_backups_jobs_sequence_seq; Type: SEQUENCE; Schema: public; Owner: postgres
+--
+
+ALTER TABLE public.futo_backups_jobs ALTER COLUMN sequence ADD GENERATED ALWAYS AS IDENTITY (
+    SEQUENCE NAME public.futo_backups_jobs_sequence_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+
+--
+-- Name: futo_backups_kysely_migrations; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.futo_backups_kysely_migrations (
+    name character varying(255) NOT NULL,
+    "timestamp" character varying(255) NOT NULL
+);
+
+
+ALTER TABLE public.futo_backups_kysely_migrations OWNER TO postgres;
+
+--
+-- Name: futo_backups_kysely_migrations_lock; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.futo_backups_kysely_migrations_lock (
+    id character varying(255) NOT NULL,
+    is_locked integer DEFAULT 0 NOT NULL
+);
+
+
+ALTER TABLE public.futo_backups_kysely_migrations_lock OWNER TO postgres;
+
+--
+-- Name: futo_backups_local_metrics; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.futo_backups_local_metrics (
+    "repositoryId" uuid NOT NULL,
+    "sizeBytes" bigint DEFAULT 0 NOT NULL,
+    "lastBackup" timestamp with time zone,
+    "lastBackupStatus" public.futo_backups_last_backup_status_enum,
+    "lastBackupDuration" integer
+);
+
+
+ALTER TABLE public.futo_backups_local_metrics OWNER TO postgres;
+
+--
+-- Name: futo_backups_repositories; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.futo_backups_repositories (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    "remoteId" text NOT NULL,
+    "backendId" uuid NOT NULL,
+    "retentionPolicy" jsonb,
+    "siteCode" text,
+    "storageClusterCode" text
+);
+
+
+ALTER TABLE public.futo_backups_repositories OWNER TO postgres;
+
+--
+-- Name: futo_backups_repository_path; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.futo_backups_repository_path (
+    "repositoryId" uuid NOT NULL,
+    path text NOT NULL
+);
+
+
+ALTER TABLE public.futo_backups_repository_path OWNER TO postgres;
+
+--
+-- Name: futo_backups_repository_schedule; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.futo_backups_repository_schedule (
+    "scheduleId" uuid NOT NULL,
+    "repositoryId" uuid NOT NULL
+);
+
+
+ALTER TABLE public.futo_backups_repository_schedule OWNER TO postgres;
+
+--
+-- Name: futo_backups_schedule; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.futo_backups_schedule (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    name text NOT NULL,
+    paused boolean DEFAULT false NOT NULL,
+    cron text NOT NULL,
+    ordering uuid[] DEFAULT '{}'::uuid[] NOT NULL,
+    "lastRun" timestamp with time zone,
+    "lastFinished" timestamp with time zone
+);
+
+
+ALTER TABLE public.futo_backups_schedule OWNER TO postgres;
 
 --
 -- Name: geodata_places; Type: TABLE; Schema: public; Owner: postgres
@@ -1512,11 +1765,11 @@ CREATE TABLE public.naturalearth_countries (
 ALTER TABLE public.naturalearth_countries OWNER TO postgres;
 
 --
--- Name: naturalearth_countries_tmp_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
+-- Name: naturalearth_countries_tmp_id_seq1; Type: SEQUENCE; Schema: public; Owner: postgres
 --
 
 ALTER TABLE public.naturalearth_countries ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY (
-    SEQUENCE NAME public.naturalearth_countries_tmp_id_seq
+    SEQUENCE NAME public.naturalearth_countries_tmp_id_seq1
     START WITH 1
     INCREMENT BY 1
     NO MINVALUE
@@ -1589,6 +1842,29 @@ CREATE TABLE public.partner_audit (
 
 
 ALTER TABLE public.partner_audit OWNER TO postgres;
+
+--
+-- Name: passkey; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.passkey (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    name character varying,
+    "credentialId" character varying NOT NULL,
+    "publicKey" bytea NOT NULL,
+    counter bigint DEFAULT 0 NOT NULL,
+    transports character varying[] NOT NULL,
+    "backedUp" boolean DEFAULT false NOT NULL,
+    "deviceType" character varying NOT NULL,
+    "userId" uuid NOT NULL,
+    "createdAt" timestamp with time zone DEFAULT now() NOT NULL,
+    "updatedAt" timestamp with time zone DEFAULT now() NOT NULL,
+    "usedAt" timestamp with time zone,
+    "updateId" uuid DEFAULT public.immich_uuid_v7() NOT NULL
+);
+
+
+ALTER TABLE public.passkey OWNER TO postgres;
 
 --
 -- Name: person; Type: TABLE; Schema: public; Owner: postgres
@@ -2350,6 +2626,22 @@ ALTER TABLE ONLY public.asset_video
 
 
 --
+-- Name: auth_challenge auth_challenge_challenge_uq; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.auth_challenge
+    ADD CONSTRAINT auth_challenge_challenge_uq UNIQUE (challenge);
+
+
+--
+-- Name: auth_challenge auth_challenge_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.auth_challenge
+    ADD CONSTRAINT auth_challenge_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: cluster_group cluster_group_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
@@ -2379,6 +2671,102 @@ ALTER TABLE ONLY public.cluster_group_request
 
 ALTER TABLE ONLY public.face_search
     ADD CONSTRAINT face_search_pkey PRIMARY KEY ("faceId");
+
+
+--
+-- Name: futo_backups_backends futo_backups_backends_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.futo_backups_backends
+    ADD CONSTRAINT futo_backups_backends_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: futo_backups_config futo_backups_config_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.futo_backups_config
+    ADD CONSTRAINT futo_backups_config_pkey PRIMARY KEY (key);
+
+
+--
+-- Name: futo_backups_integrations_immich_config futo_backups_integrations_immich_config_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.futo_backups_integrations_immich_config
+    ADD CONSTRAINT futo_backups_integrations_immich_config_pkey PRIMARY KEY ("repositoryId");
+
+
+--
+-- Name: futo_backups_jobs futo_backups_jobs_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.futo_backups_jobs
+    ADD CONSTRAINT futo_backups_jobs_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: futo_backups_jobs futo_backups_jobs_sequence_uq; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.futo_backups_jobs
+    ADD CONSTRAINT futo_backups_jobs_sequence_uq UNIQUE (sequence);
+
+
+--
+-- Name: futo_backups_kysely_migrations_lock futo_backups_kysely_migrations_lock_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.futo_backups_kysely_migrations_lock
+    ADD CONSTRAINT futo_backups_kysely_migrations_lock_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: futo_backups_kysely_migrations futo_backups_kysely_migrations_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.futo_backups_kysely_migrations
+    ADD CONSTRAINT futo_backups_kysely_migrations_pkey PRIMARY KEY (name);
+
+
+--
+-- Name: futo_backups_local_metrics futo_backups_local_metrics_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.futo_backups_local_metrics
+    ADD CONSTRAINT futo_backups_local_metrics_pkey PRIMARY KEY ("repositoryId");
+
+
+--
+-- Name: futo_backups_repositories futo_backups_repositories_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.futo_backups_repositories
+    ADD CONSTRAINT futo_backups_repositories_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: futo_backups_repository_path futo_backups_repository_path_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.futo_backups_repository_path
+    ADD CONSTRAINT futo_backups_repository_path_pkey PRIMARY KEY ("repositoryId", path);
+
+
+--
+-- Name: futo_backups_repository_schedule futo_backups_repository_schedule_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.futo_backups_repository_schedule
+    ADD CONSTRAINT futo_backups_repository_schedule_pkey PRIMARY KEY ("scheduleId", "repositoryId");
+
+
+--
+-- Name: futo_backups_schedule futo_backups_schedule_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.futo_backups_schedule
+    ADD CONSTRAINT futo_backups_schedule_pkey PRIMARY KEY (id);
 
 
 --
@@ -2515,6 +2903,22 @@ ALTER TABLE ONLY public.partner_audit
 
 ALTER TABLE ONLY public.partner
     ADD CONSTRAINT partner_pkey PRIMARY KEY ("sharedById", "sharedWithId");
+
+
+--
+-- Name: passkey passkey_credentialId_uq; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.passkey
+    ADD CONSTRAINT "passkey_credentialId_uq" UNIQUE ("credentialId");
+
+
+--
+-- Name: passkey passkey_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.passkey
+    ADD CONSTRAINT passkey_pkey PRIMARY KEY (id);
 
 
 --
@@ -3228,6 +3632,13 @@ CREATE INDEX "asset_face_personGroupId_ownerId_assetId_timeline_idx" ON public.a
 
 
 --
+-- Name: asset_face_updateId_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX "asset_face_updateId_idx" ON public.asset_face USING btree ("updateId");
+
+
+--
 -- Name: asset_fileCreatedAt_idx; Type: INDEX; Schema: public; Owner: postgres
 --
 
@@ -3389,6 +3800,13 @@ CREATE UNIQUE INDEX "asset_ownerId_libraryId_checksum_idx" ON public.asset USING
 
 
 --
+-- Name: asset_ownerId_updateId_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX "asset_ownerId_updateId_idx" ON public.asset USING btree ("ownerId", "updateId");
+
+
+--
 -- Name: asset_stackId_idx; Type: INDEX; Schema: public; Owner: postgres
 --
 
@@ -3400,6 +3818,13 @@ CREATE INDEX "asset_stackId_idx" ON public.asset USING btree ("stackId");
 --
 
 CREATE INDEX "asset_updateId_idx" ON public.asset USING btree ("updateId");
+
+
+--
+-- Name: auth_challenge_userId_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX "auth_challenge_userId_idx" ON public.auth_challenge USING btree ("userId");
 
 
 --
@@ -3449,6 +3874,62 @@ CREATE INDEX face_index ON public.face_search USING vchordrq (embedding public.v
         build_threads = 4
         sampling_factor = 1024
         ');
+
+
+--
+-- Name: futo_backups_integrations_immich_config_scheduleId_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX "futo_backups_integrations_immich_config_scheduleId_idx" ON public.futo_backups_integrations_immich_config USING btree ("scheduleId");
+
+
+--
+-- Name: futo_backups_jobs_repository_history_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX futo_backups_jobs_repository_history_idx ON public.futo_backups_jobs USING btree ("repositoryId", "queuedAt", sequence);
+
+
+--
+-- Name: futo_backups_jobs_repository_name_history_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX futo_backups_jobs_repository_name_history_idx ON public.futo_backups_jobs USING btree ("repositoryId", name, "queuedAt", sequence);
+
+
+--
+-- Name: futo_backups_jobs_status_sequence_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX futo_backups_jobs_status_sequence_idx ON public.futo_backups_jobs USING btree (status, sequence);
+
+
+--
+-- Name: futo_backups_repositories_backendId_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX "futo_backups_repositories_backendId_idx" ON public.futo_backups_repositories USING btree ("backendId");
+
+
+--
+-- Name: futo_backups_repository_path_repositoryId_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX "futo_backups_repository_path_repositoryId_idx" ON public.futo_backups_repository_path USING btree ("repositoryId");
+
+
+--
+-- Name: futo_backups_repository_schedule_repositoryId_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX "futo_backups_repository_schedule_repositoryId_idx" ON public.futo_backups_repository_schedule USING btree ("repositoryId");
+
+
+--
+-- Name: futo_backups_repository_schedule_scheduleId_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX "futo_backups_repository_schedule_scheduleId_idx" ON public.futo_backups_repository_schedule USING btree ("scheduleId");
 
 
 --
@@ -3652,6 +4133,20 @@ CREATE INDEX "partner_sharedWithId_idx" ON public.partner USING btree ("sharedWi
 --
 
 CREATE INDEX "partner_updateId_idx" ON public.partner USING btree ("updateId");
+
+
+--
+-- Name: passkey_updateId_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX "passkey_updateId_idx" ON public.passkey USING btree ("updateId");
+
+
+--
+-- Name: passkey_userId_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX "passkey_userId_idx" ON public.passkey USING btree ("userId");
 
 
 --
@@ -3879,6 +4374,13 @@ CREATE INDEX "stack_primaryAssetId_idx" ON public.stack USING btree ("primaryAss
 
 
 --
+-- Name: stack_updateId_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX "stack_updateId_idx" ON public.stack USING btree ("updateId");
+
+
+--
 -- Name: tag_asset_assetId_idx; Type: INDEX; Schema: public; Owner: postgres
 --
 
@@ -4009,6 +4511,13 @@ CREATE INDEX "workflow_step_pluginMethodId_idx" ON public.workflow_step USING bt
 --
 
 CREATE INDEX "workflow_step_workflowId_idx" ON public.workflow_step USING btree ("workflowId");
+
+
+--
+-- Name: workflow_updateId_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX "workflow_updateId_idx" ON public.workflow USING btree ("updateId");
 
 
 --
@@ -4247,6 +4756,13 @@ CREATE TRIGGER partner_delete_audit AFTER DELETE ON public.partner REFERENCING O
 --
 
 CREATE TRIGGER "partner_updatedAt" BEFORE UPDATE ON public.partner FOR EACH ROW EXECUTE FUNCTION public.updated_at();
+
+
+--
+-- Name: passkey passkey_updatedAt; Type: TRIGGER; Schema: public; Owner: postgres
+--
+
+CREATE TRIGGER "passkey_updatedAt" BEFORE UPDATE ON public.passkey FOR EACH ROW EXECUTE FUNCTION public.updated_at();
 
 
 --
@@ -4577,6 +5093,14 @@ ALTER TABLE ONLY public.asset_video
 
 
 --
+-- Name: auth_challenge auth_challenge_userId_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.auth_challenge
+    ADD CONSTRAINT "auth_challenge_userId_fkey" FOREIGN KEY ("userId") REFERENCES public."user"(id) ON UPDATE CASCADE ON DELETE CASCADE;
+
+
+--
 -- Name: cluster_group_request cluster_group_request_clusterGroupId_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
 --
 
@@ -4598,6 +5122,62 @@ ALTER TABLE ONLY public.cluster_group_request
 
 ALTER TABLE ONLY public.face_search
     ADD CONSTRAINT "face_search_faceId_fkey" FOREIGN KEY ("faceId") REFERENCES public.asset_face(id) ON DELETE CASCADE;
+
+
+--
+-- Name: futo_backups_integrations_immich_config futo_backups_integrations_immich_config_repositoryId_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.futo_backups_integrations_immich_config
+    ADD CONSTRAINT "futo_backups_integrations_immich_config_repositoryId_fkey" FOREIGN KEY ("repositoryId") REFERENCES public.futo_backups_repositories(id) ON UPDATE CASCADE ON DELETE CASCADE;
+
+
+--
+-- Name: futo_backups_integrations_immich_config futo_backups_integrations_immich_config_scheduleId_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.futo_backups_integrations_immich_config
+    ADD CONSTRAINT "futo_backups_integrations_immich_config_scheduleId_fkey" FOREIGN KEY ("scheduleId") REFERENCES public.futo_backups_schedule(id) ON UPDATE CASCADE ON DELETE RESTRICT;
+
+
+--
+-- Name: futo_backups_local_metrics futo_backups_local_metrics_repositoryId_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.futo_backups_local_metrics
+    ADD CONSTRAINT "futo_backups_local_metrics_repositoryId_fkey" FOREIGN KEY ("repositoryId") REFERENCES public.futo_backups_repositories(id) ON UPDATE CASCADE ON DELETE CASCADE;
+
+
+--
+-- Name: futo_backups_repositories futo_backups_repositories_backendId_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.futo_backups_repositories
+    ADD CONSTRAINT "futo_backups_repositories_backendId_fkey" FOREIGN KEY ("backendId") REFERENCES public.futo_backups_backends(id) ON UPDATE CASCADE ON DELETE RESTRICT;
+
+
+--
+-- Name: futo_backups_repository_path futo_backups_repository_path_repositoryId_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.futo_backups_repository_path
+    ADD CONSTRAINT "futo_backups_repository_path_repositoryId_fkey" FOREIGN KEY ("repositoryId") REFERENCES public.futo_backups_repositories(id) ON UPDATE CASCADE ON DELETE CASCADE;
+
+
+--
+-- Name: futo_backups_repository_schedule futo_backups_repository_schedule_repositoryId_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.futo_backups_repository_schedule
+    ADD CONSTRAINT "futo_backups_repository_schedule_repositoryId_fkey" FOREIGN KEY ("repositoryId") REFERENCES public.futo_backups_repositories(id) ON UPDATE CASCADE ON DELETE CASCADE;
+
+
+--
+-- Name: futo_backups_repository_schedule futo_backups_repository_schedule_scheduleId_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.futo_backups_repository_schedule
+    ADD CONSTRAINT "futo_backups_repository_schedule_scheduleId_fkey" FOREIGN KEY ("scheduleId") REFERENCES public.futo_backups_schedule(id) ON UPDATE CASCADE ON DELETE CASCADE;
 
 
 --
@@ -4686,6 +5266,14 @@ ALTER TABLE ONLY public.partner
 
 ALTER TABLE ONLY public.partner
     ADD CONSTRAINT "partner_sharedWithId_fkey" FOREIGN KEY ("sharedWithId") REFERENCES public."user"(id) ON DELETE CASCADE;
+
+
+--
+-- Name: passkey passkey_userId_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.passkey
+    ADD CONSTRAINT "passkey_userId_fkey" FOREIGN KEY ("userId") REFERENCES public."user"(id) ON UPDATE CASCADE ON DELETE CASCADE;
 
 
 --
